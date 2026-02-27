@@ -1,8 +1,11 @@
 use anyhow::{Context, Result, bail};
-use crossbeam_channel::{RecvTimeoutError, Sender, bounded};
+use crossbeam_channel::RecvTimeoutError;
+use recordit::rt_transport::{PreallocatedProducer, preallocated_spsc};
 use screencapturekit::prelude::*;
 use std::collections::VecDeque;
 use std::env;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone)]
@@ -15,6 +18,26 @@ struct ProbeEvent {
     channels: Option<u32>,
     bits_per_channel: Option<u32>,
     is_float: bool,
+}
+
+#[derive(Debug, Default)]
+struct ProbeCallbackAudit {
+    missing_format_description: AtomicU64,
+}
+
+impl ProbeEvent {
+    fn empty() -> Self {
+        Self {
+            kind: SCStreamOutputType::Audio,
+            pts_seconds: 0.0,
+            duration_seconds: 0.0,
+            num_samples: 0,
+            sample_rate_hz: None,
+            channels: None,
+            bits_per_channel: None,
+            is_float: false,
+        }
+    }
 }
 
 fn sample_to_event(sample: CMSampleBuffer, kind: SCStreamOutputType) -> ProbeEvent {
@@ -49,9 +72,21 @@ fn sample_to_event(sample: CMSampleBuffer, kind: SCStreamOutputType) -> ProbeEve
     }
 }
 
-fn callback(sender: &Sender<ProbeEvent>, sample: CMSampleBuffer, kind: SCStreamOutputType) {
-    let event = sample_to_event(sample, kind);
-    let _ = sender.try_send(event);
+fn callback(
+    producer: &PreallocatedProducer<ProbeEvent>,
+    audit: &ProbeCallbackAudit,
+    sample: CMSampleBuffer,
+    kind: SCStreamOutputType,
+) {
+    if sample.format_description().is_none() {
+        audit
+            .missing_format_description
+            .fetch_add(1, Ordering::Relaxed);
+    }
+    producer.try_push_with(|slot| {
+        *slot = sample_to_event(sample, kind);
+        true
+    });
 }
 
 fn nearest_neighbor_deltas(a: &[f64], b: &[f64]) -> Vec<f64> {
@@ -139,23 +174,27 @@ fn main() -> Result<()> {
         .with_channel_count(2);
 
     let queue = DispatchQueue::new("com.sequoia-capture.probe", DispatchQoS::UserInteractive);
-    let (tx, rx) = bounded::<ProbeEvent>(8_192);
+    let slots = (0..8_192).map(|_| ProbeEvent::empty()).collect();
+    let (producer, consumer) = preallocated_spsc(slots);
+    let callback_audit = Arc::new(ProbeCallbackAudit::default());
 
     let mut stream = SCStream::new(&filter, &config);
 
-    let tx_audio = tx.clone();
+    let audio_producer = producer.clone();
+    let audio_audit = Arc::clone(&callback_audit);
     stream
         .add_output_handler_with_queue(
-            move |sample, kind| callback(&tx_audio, sample, kind),
+            move |sample, kind| callback(&audio_producer, &audio_audit, sample, kind),
             SCStreamOutputType::Audio,
             Some(&queue),
         )
         .ok_or_else(|| anyhow::anyhow!("failed to add audio output handler"))?;
 
-    let tx_mic = tx.clone();
+    let mic_producer = producer.clone();
+    let mic_audit = Arc::clone(&callback_audit);
     stream
         .add_output_handler_with_queue(
-            move |sample, kind| callback(&tx_mic, sample, kind),
+            move |sample, kind| callback(&mic_producer, &mic_audit, sample, kind),
             SCStreamOutputType::Microphone,
             Some(&queue),
         )
@@ -175,7 +214,7 @@ fn main() -> Result<()> {
     let mut order = VecDeque::with_capacity(24);
 
     while Instant::now() < deadline {
-        match rx.recv_timeout(Duration::from_millis(250)) {
+        match consumer.recv_timeout(Duration::from_millis(250)) {
             Ok(ev) => {
                 if order.len() == order.capacity() {
                     let _ = order.pop_front();
@@ -225,6 +264,11 @@ fn main() -> Result<()> {
         }
     }
 
+    let transport_stats = consumer.stats_snapshot();
+    let missing_format_description = callback_audit
+        .missing_format_description
+        .load(Ordering::Relaxed);
+
     stream
         .stop_capture()
         .context("failed to stop stream capture")?;
@@ -233,6 +277,22 @@ fn main() -> Result<()> {
     println!("Probe summary");
     println!("audio buffers: {audio_seen}");
     println!("microphone buffers: {mic_seen}");
+    println!(
+        "transport: capacity={}, high_water={}, in_flight={}, enqueued={}, dequeued={}, slot_miss_drops={}, fill_failures={}, queue_full_drops={}, recycle_failures={}",
+        transport_stats.capacity,
+        transport_stats.ready_depth_high_water,
+        transport_stats.in_flight,
+        transport_stats.enqueued,
+        transport_stats.dequeued,
+        transport_stats.slot_miss_drops,
+        transport_stats.fill_failures,
+        transport_stats.queue_full_drops,
+        transport_stats.recycle_failures
+    );
+    println!(
+        "callback_contract: missing_format_description={}",
+        missing_format_description
+    );
 
     if audio_seen == 0 || mic_seen == 0 {
         println!(

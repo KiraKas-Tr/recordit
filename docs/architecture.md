@@ -61,5 +61,15 @@ Per chunk:
 - Signed app bundle (`make run-app`):
   - runs sandboxed as bundle id `com.recordit.sequoiacapture`
   - relative output paths resolve under `~/Library/Containers/com.recordit.sequoiacapture/Data/`
+- Test binary (`cargo test --bin sequoia_capture -- --nocapture`):
+  - inherits `DYLD_LIBRARY_PATH=/usr/lib/swift` from `.cargo/config.toml`
+  - avoids the `libswift_Concurrency.dylib` loader failure that occurs when the Swift runtime path is absent
+
+## Test Runtime Path Contract
+
+- ScreenCaptureKit-linked test binaries need the Swift runtime loader path at execution time.
+- This repo encodes that path in `.cargo/config.toml`, so contributors and CI can use plain Cargo commands without a manual `export DYLD_LIBRARY_PATH=/usr/lib/swift`.
+- Canonical test command:
+  - `cargo test --bin sequoia_capture -- --nocapture`
 
 Note: current prototype uses bounded channels and owned vectors for delivery speed; production path uses `rtrb` with preallocated chunk pools for stricter real-time behavior.

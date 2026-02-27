@@ -182,6 +182,12 @@ Implemented prototype:
 3. Packaging/build/sign script: **implemented**
 - `Makefile` + `packaging/*`
 
+4. ScreenCaptureKit test runtime path: **implemented**
+- Problem: `cargo test --bin sequoia_capture` aborts without Swift runtime lookup path (`libswift_Concurrency.dylib` not found).
+- Contract: repository-level Cargo env sets `DYLD_LIBRARY_PATH=/usr/lib/swift` in `.cargo/config.toml`.
+- Canonical local/CI command:
+  - `cargo test --bin sequoia_capture -- --nocapture`
+
 ## Sources
 - ScreenCaptureKit captureMicrophone docs:
   - https://developer.apple.com/documentation/screencapturekit/scstreamconfiguration/capturemicrophone

@@ -1,0 +1,46 @@
+# Real-Time Callback Contract and Recovery Matrix
+
+## Callback Contract (Recorder/Probe)
+
+The ScreenCaptureKit callback path must remain deterministic and non-blocking:
+
+1. No disk I/O in callback handlers.
+2. No blocking waits (`recv`, locks, sleeps) in callback handlers.
+3. No unbounded queue growth; all callback handoff uses fixed-capacity preallocated slots.
+4. Any sample-format contract violation is counted and mapped to an explicit recovery action.
+
+Enforcement points:
+- `src/rt_transport.rs` tracks pressure and drops (`slot_miss_drops`, `queue_full_drops`, `ready_depth_high_water`, `in_flight`).
+- `src/bin/sequoia_capture.rs` tracks callback contract violations:
+  - `missing_audio_buffer_list`
+  - `missing_first_audio_buffer`
+  - `missing_format_description`
+  - `missing_sample_rate`
+  - `non_float_pcm`
+  - `chunk_too_large`
+
+## Error to Recovery Matrix
+
+| Error Class | Detection | Recovery Action |
+|---|---|---|
+| Callback slot unavailable | `slot_miss_drops` increment | `DropSampleContinue` |
+| Ready queue full | `queue_full_drops` increment | `DropSampleContinue` |
+| Missing audio buffer list | callback contract counter | `DropSampleContinue` |
+| Missing first audio buffer | callback contract counter | `DropSampleContinue` |
+| Missing format description | callback contract counter | `DropSampleContinue` |
+| Missing sample rate | callback contract counter | `DropSampleContinue` |
+| Non-float PCM | callback contract counter | `FailFastReconfigure` |
+| Chunk exceeds slot capacity | callback contract counter | `DropSampleContinue` |
+| Stream interruption with restarts remaining | idle-gap + restart budget | `RestartStream` |
+| Stream interruption with restart budget exhausted | idle-gap + restart budget | `FailFastReconfigure` |
+| Sample-rate mismatch in `strict` mode | policy check | `FailFastReconfigure` |
+| Sample-rate mismatch in `adapt-stream-rate` mode with equal mic/system rates | policy check | `AdaptOutputRate` |
+| Sample-rate mismatch in `adapt-stream-rate` mode with unequal mic/system rates | policy check | `FailFastReconfigure` |
+
+## Validation
+
+Current contract/recovery logic is validated with:
+- transport unit tests (`cargo test --lib`)
+- recorder policy tests (`DYLD_LIBRARY_PATH=/usr/lib/swift cargo test --bin sequoia_capture -- --nocapture`)
+- transport stress harness (`cargo run --quiet --bin transport_stress -- --iterations 50000 --capacity 128 --payload-bytes 2048 --consumer-delay-micros 20`)
+
