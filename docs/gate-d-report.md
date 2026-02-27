@@ -1,7 +1,7 @@
 # Gate D 60-Minute Soak Report (bd-7cb)
 
 Date: 2026-02-27  
-Status: completed (first full artifact fails gate due invalid direct-binary launch; reusable fixed harness published and smoke-validated)
+Status: completed (invalid direct-binary full run preserved for audit; corrected full rerun passes gate)
 
 ## Scope
 
@@ -62,3 +62,6 @@ column -s, -t "$SOAK_DIR/summary.csv"
 - Fixed regression command: `make gate-d-soak`
   - implementation: `scripts/gate_d_soak.sh` + `scripts/gate_d_summary.py`
   - smoke validation: `artifacts/validation/bd-7cb.make-smoke/summary.csv` shows `gate_pass=true` for a short-duration harness check with the corrected `cargo run` launch path
+- Corrected full-duration rerun artifact: `artifacts/bench/gate_d/20260227T150827Z/`
+  - summary: `failure_count=0`, `soak_seconds_actual=3601`, `threshold_harness_reliability_ok=true`, `threshold_soak_duration_ok=true`, `gate_pass=true`
+  - observed stability envelope: `manifest_wall_ms_p95_p50=666.9248749999999`, `manifest_wall_ms_p95_p95=701.1608188499999`, `max_rss_kb_p50=199016448.0`, `max_rss_kb_p95=199819264.0`

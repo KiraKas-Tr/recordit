@@ -48,6 +48,16 @@ mkdir -p "$OUT_DIR/runs"
 
 echo "run_index,start_utc,end_utc,exit_code,real_ms,max_rss_kb,wall_ms_p95,wall_ms_p50,cleanup_dropped_queue_full,cleanup_failed,cleanup_timed_out,mode_requested,mode_active,degradation_events" >"$OUT_DIR/runs.csv"
 
+(
+  cd "$ROOT"
+  DYLD_LIBRARY_PATH=/usr/lib/swift cargo build --quiet --bin transcribe-live
+)
+BIN="$ROOT/target/debug/transcribe-live"
+if [[ ! -x "$BIN" ]]; then
+  echo "missing executable: $BIN" >&2
+  exit 1
+fi
+
 start_epoch="$(date +%s)"
 end_epoch=$((start_epoch + SOAK_SECONDS))
 run=0
@@ -63,7 +73,7 @@ while [[ "$(date +%s)" -lt "$end_epoch" ]]; do
   set +e
   (
     cd "$ROOT"
-    /usr/bin/time -l env DYLD_LIBRARY_PATH=/usr/lib/swift cargo run --quiet --bin transcribe-live -- \
+    /usr/bin/time -l env DYLD_LIBRARY_PATH=/usr/lib/swift "$BIN" \
       --asr-backend whispercpp \
       --asr-model "$MODEL" \
       --input-wav "$INPUT" \
