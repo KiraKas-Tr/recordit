@@ -18,10 +18,12 @@ Sequoia Capture is a macOS 15+ Rust project that records:
 ## Project Layout
 - `src/main.rs`: probe binary (stream/output/timestamp inspection)
 - `src/bin/sequoia_capture.rs`: WAV recorder binary
+- `src/bin/transcribe_live.rs`: transcription CLI contract and config validation entrypoint
 - `packaging/Info.plist`: bundle metadata and privacy usage descriptions
 - `packaging/entitlements.plist`: sandbox and privacy entitlements
 - `docs/research.md`: API/TCC/platform research
 - `docs/architecture.md`: real-time pipeline and interleave spec
+- `docs/beads-governance.md`: issue decomposition and traceability governance
 
 ## Commands
 
@@ -42,6 +44,34 @@ Runs `src/main.rs` and prints output-type/timestamp metadata.
 make capture CAPTURE_SECS=10 OUT=artifacts/hello-world.wav SAMPLE_RATE=48000
 ```
 Runs the debug recorder binary directly.
+
+### Validate Transcription CLI Contract (debug)
+```bash
+make transcribe-live ASR_MODEL=models/ggml-base.en.bin
+```
+Parses and validates the planned live-transcription flags, then prints the resolved configuration summary.
+The current `transcribe-live` binary defines the CLI contract only; capture, VAD, ASR, and JSONL emission land in follow-up tasks.
+
+### Run Transcription Preflight (debug)
+```bash
+make transcribe-preflight ASR_MODEL=models/ggml-base.en.bin
+```
+Runs structured PASS/WARN/FAIL prerequisite checks before capture/transcription startup and writes a preflight manifest to `--out-manifest`.
+
+### Validate Transcription CLI Contract (signed app mode)
+```bash
+make run-transcribe-app ASR_MODEL=models/ggml-base.en.bin
+```
+Builds/signs `dist/SequoiaTranscribe.app` (signed app mode for `transcribe-live`) and launches it via `open -W`.
+The target prints absolute container-scoped artifact destinations before launch and passes those absolute paths to the CLI.
+
+### Run Transcription Preflight (signed app mode)
+```bash
+make run-transcribe-preflight-app ASR_MODEL=models/ggml-base.en.bin
+```
+Runs the same preflight diagnostics in signed app context and writes results into the configured manifest path.
+Default signed preflight manifest path:
+- `~/Library/Containers/com.recordit.sequoiatranscribe/Data/artifacts/transcribe-live.manifest.json`
 
 ### Bundle + Sign
 ```bash
@@ -84,9 +114,41 @@ cargo run --bin sequoia_capture -- [duration_seconds] [output_path] [sample_rate
 - `output_path` optional, default `artifacts/hello-world.wav`
 - `sample_rate_hz` optional, default `48000`
 
+### Transcription CLI contract (`src/bin/transcribe_live.rs`)
+```bash
+cargo run --bin transcribe-live -- --asr-model <local-model-path> [flags...]
+```
+- key flags currently validated:
+  - `--duration-sec`
+  - `--out-wav`
+  - `--out-jsonl`
+  - `--out-manifest`
+  - `--sample-rate`
+  - `--asr-backend`
+  - `--asr-model`
+  - `--asr-language`
+  - `--asr-threads`
+  - `--asr-profile`
+  - `--vad-backend`
+  - `--vad-threshold`
+  - `--vad-min-speech-ms`
+  - `--vad-min-silence-ms`
+  - `--llm-cleanup`
+  - `--llm-endpoint`
+  - `--llm-model`
+  - `--llm-timeout-ms`
+  - `--llm-max-queue`
+  - `--transcribe-channels`
+  - `--speaker-labels`
+- use `cargo run --bin transcribe-live -- --help` to print the full contract
+
 ## Output Paths
 - `make capture` / direct `cargo run --bin sequoia_capture`: output path is resolved from the current shell working directory.
 - `make run-app`: app is sandboxed, so relative paths resolve inside container storage.
+- `make transcribe-live` and `make run-transcribe-app`: both pass absolute artifact paths and print them before execution.
+- `make transcribe-preflight` and `make run-transcribe-preflight-app`: run deterministic preflight checks and persist checklist outcomes in the manifest output.
+- Signed transcribe targets default to container-scoped absolute destinations under:
+  - `~/Library/Containers/com.recordit.sequoiatranscribe/Data/artifacts/`
 
 Default `run-app` output for `OUT=artifacts/hello-world.wav`:
 - `~/Library/Containers/com.recordit.sequoiacapture/Data/artifacts/hello-world.wav`
