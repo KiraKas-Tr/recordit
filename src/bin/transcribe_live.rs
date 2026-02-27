@@ -530,6 +530,7 @@ struct LiveRunReport {
     vad_boundaries: Vec<VadBoundary>,
     events: Vec<TranscriptEvent>,
     degradation_events: Vec<ModeDegradationEvent>,
+    trust_notices: Vec<TrustNotice>,
     cleanup_queue: CleanupQueueTelemetry,
     benchmark: BenchmarkSummary,
     benchmark_summary_csv: PathBuf,
@@ -658,6 +659,15 @@ struct ChannelInputPlan {
 struct ModeDegradationEvent {
     code: &'static str,
     detail: String,
+}
+
+#[derive(Debug, Clone)]
+struct TrustNotice {
+    code: String,
+    severity: String,
+    cause: String,
+    impact: String,
+    guidance: String,
 }
 
 #[derive(Debug, Clone)]
@@ -828,6 +838,13 @@ fn run_live_pipeline(config: &TranscribeConfig) -> Result<LiveRunReport, CliErro
     events.extend(cleanup_run.llm_events);
     let events = merge_transcript_events(events);
     let cleanup_queue = cleanup_run.telemetry;
+    let degradation_events = channel_plan.degradation_events;
+    let trust_notices = build_trust_notices(
+        config.channel_mode,
+        channel_plan.active_mode,
+        &degradation_events,
+        &cleanup_queue,
+    );
     let transcript_text = reconstruct_transcript(&events);
     let (benchmark_summary_csv, benchmark_runs_csv, benchmark) = write_benchmark_artifact(
         &stamp,
@@ -847,7 +864,8 @@ fn run_live_pipeline(config: &TranscribeConfig) -> Result<LiveRunReport, CliErro
         channel_transcripts: first_channel_transcripts,
         vad_boundaries,
         events,
-        degradation_events: channel_plan.degradation_events,
+        degradation_events,
+        trust_notices,
         cleanup_queue,
         benchmark,
         benchmark_summary_csv,
@@ -1280,6 +1298,87 @@ fn format_timestamp(ms: u64) -> String {
     let seconds = total_seconds % 60;
     let millis = ms % 1_000;
     format!("{minutes:02}:{seconds:02}.{millis:03}")
+}
+
+fn build_trust_notices(
+    requested_mode: ChannelMode,
+    active_mode: ChannelMode,
+    degradation_events: &[ModeDegradationEvent],
+    cleanup_queue: &CleanupQueueTelemetry,
+) -> Vec<TrustNotice> {
+    let mut notices = Vec::new();
+
+    for degradation in degradation_events {
+        notices.push(TrustNotice {
+            code: "mode_degradation".to_string(),
+            severity: "warn".to_string(),
+            cause: degradation.detail.clone(),
+            impact: if requested_mode != active_mode {
+                format!(
+                    "requested channel mode `{requested_mode}` degraded to `{active_mode}`; transcript attribution and separation guarantees are reduced"
+                )
+            } else {
+                "runtime entered degraded channel mode".to_string()
+            },
+            guidance:
+                "Use `--transcribe-channels separate` with a stereo input fixture to restore channel-level attribution."
+                    .to_string(),
+        });
+    }
+
+    if cleanup_queue.enabled {
+        if cleanup_queue.dropped_queue_full > 0 {
+            notices.push(TrustNotice {
+                code: "cleanup_queue_drop".to_string(),
+                severity: "warn".to_string(),
+                cause: format!(
+                    "{} cleanup request(s) dropped due to full queue",
+                    cleanup_queue.dropped_queue_full
+                ),
+                impact:
+                    "some `llm_final` readability refinements are missing; raw `final` transcript remains canonical"
+                        .to_string(),
+                guidance:
+                    "Increase `--llm-max-queue`, reduce cleanup load, or disable cleanup for strict throughput runs."
+                        .to_string(),
+            });
+        }
+
+        if cleanup_queue.timed_out > 0 || cleanup_queue.failed > 0 {
+            notices.push(TrustNotice {
+                code: "cleanup_processing_failure".to_string(),
+                severity: "warn".to_string(),
+                cause: format!(
+                    "cleanup failures detected (timed_out={}, failed={})",
+                    cleanup_queue.timed_out, cleanup_queue.failed
+                ),
+                impact:
+                    "cleanup outputs may be incomplete or absent; rely on `final` events for authoritative transcript text"
+                        .to_string(),
+                guidance:
+                    "Validate cleanup endpoint/model health or run with `--llm-cleanup` disabled for deterministic core transcripts."
+                        .to_string(),
+            });
+        }
+
+        if !cleanup_queue.drain_completed || cleanup_queue.pending > 0 {
+            notices.push(TrustNotice {
+                code: "cleanup_drain_incomplete".to_string(),
+                severity: "warn".to_string(),
+                cause: format!(
+                    "cleanup drain incomplete (pending={}, drain_completed={})",
+                    cleanup_queue.pending, cleanup_queue.drain_completed
+                ),
+                impact:
+                    "session ended before all queued cleanup work finished; readability post-processing is partial"
+                        .to_string(),
+                guidance: "Increase `--llm-timeout-ms` or reduce workload to allow cleanup drain completion."
+                    .to_string(),
+            });
+        }
+    }
+
+    notices
 }
 
 fn run_cleanup_queue(config: &TranscribeConfig, events: &[TranscriptEvent]) -> CleanupRunResult {
@@ -2091,6 +2190,18 @@ fn print_live_report(report: &LiveRunReport) {
     for event in &report.degradation_events {
         println!("    - code={} detail={}", event.code, event.detail);
     }
+    println!("  trust_notices: {}", report.trust_notices.len());
+    if report.trust_notices.is_empty() {
+        println!("    - none (runtime trust posture: nominal)");
+    } else {
+        println!("  degraded_mode_notices:");
+        for notice in &report.trust_notices {
+            println!(
+                "    - [{}] code={} cause={} | impact={} | next={}",
+                notice.severity, notice.code, notice.cause, notice.impact, notice.guidance
+            );
+        }
+    }
     println!(
         "  cleanup_queue: enabled={} submitted={} enqueued={} dropped_queue_full={} processed={} succeeded={} timed_out={} failed={} retry_attempts={} pending={} drain_completed={}",
         report.cleanup_queue.enabled,
@@ -2180,6 +2291,19 @@ fn write_runtime_jsonl(config: &TranscribeConfig, report: &LiveRunReport) -> Res
             json_escape(&report.active_channel_mode.to_string()),
             json_escape(degradation.code),
             json_escape(&degradation.detail)
+        )
+        .map_err(io_to_cli)?;
+    }
+
+    for notice in &report.trust_notices {
+        writeln!(
+            file,
+            "{{\"event_type\":\"trust_notice\",\"channel\":\"control\",\"code\":\"{}\",\"severity\":\"{}\",\"cause\":\"{}\",\"impact\":\"{}\",\"guidance\":\"{}\"}}",
+            json_escape(&notice.code),
+            json_escape(&notice.severity),
+            json_escape(&notice.cause),
+            json_escape(&notice.impact),
+            json_escape(&notice.guidance)
         )
         .map_err(io_to_cli)?;
     }
@@ -2398,6 +2522,31 @@ fn write_runtime_manifest(
         }
     }
     writeln!(file, "  ],").map_err(io_to_cli)?;
+    writeln!(
+        file,
+        "  \"trust\": {{\"degraded_mode_active\":{},\"notice_count\":{},\"notices\": [",
+        !report.trust_notices.is_empty(),
+        report.trust_notices.len()
+    )
+    .map_err(io_to_cli)?;
+    for (idx, notice) in report.trust_notices.iter().enumerate() {
+        writeln!(
+            file,
+            "    {{\"code\":\"{}\",\"severity\":\"{}\",\"cause\":\"{}\",\"impact\":\"{}\",\"guidance\":\"{}\"}}{}",
+            json_escape(&notice.code),
+            json_escape(&notice.severity),
+            json_escape(&notice.cause),
+            json_escape(&notice.impact),
+            json_escape(&notice.guidance),
+            if idx + 1 == report.trust_notices.len() {
+                ""
+            } else {
+                ","
+            }
+        )
+        .map_err(io_to_cli)?;
+    }
+    writeln!(file, "  ]}},").map_err(io_to_cli)?;
     let llm_final_count = report
         .events
         .iter()
@@ -2430,6 +2579,7 @@ fn replay_timeline(path: &Path) -> Result<(), CliError> {
     })?;
 
     let mut events = Vec::new();
+    let mut trust_notices = Vec::new();
     for (line_no, line) in content.lines().enumerate() {
         let trimmed = line.trim();
         if trimmed.is_empty() {
@@ -2438,6 +2588,12 @@ fn replay_timeline(path: &Path) -> Result<(), CliError> {
         let Some(event_type) = extract_json_string_field(trimmed, "event_type") else {
             continue;
         };
+        if event_type == "trust_notice" {
+            if let Some(notice) = parse_trust_notice(trimmed) {
+                trust_notices.push(notice);
+            }
+            continue;
+        }
         if event_type != "partial" && event_type != "final" {
             continue;
         }
@@ -2490,6 +2646,13 @@ fn replay_timeline(path: &Path) -> Result<(), CliError> {
             event.event_type, event.channel, event.start_ms, event.end_ms, event.text
         );
     }
+    println!("  trust_notices: {}", trust_notices.len());
+    for notice in &trust_notices {
+        println!(
+            "    - [{}] {} | impact={} | next={}",
+            notice.severity, notice.cause, notice.impact, notice.guidance
+        );
+    }
 
     let reconstructed = reconstruct_transcript(&events);
     let per_channel = reconstruct_transcript_per_channel(&events);
@@ -2507,6 +2670,16 @@ fn replay_timeline(path: &Path) -> Result<(), CliError> {
         }
     }
     Ok(())
+}
+
+fn parse_trust_notice(line: &str) -> Option<TrustNotice> {
+    Some(TrustNotice {
+        code: extract_json_string_field(line, "code")?,
+        severity: extract_json_string_field(line, "severity")?,
+        cause: extract_json_string_field(line, "cause")?,
+        impact: extract_json_string_field(line, "impact")?,
+        guidance: extract_json_string_field(line, "guidance")?,
+    })
 }
 
 fn extract_json_string_field(line: &str, key: &str) -> Option<String> {
@@ -3266,10 +3439,11 @@ fn command_stdout(program: &str, args: &[&str]) -> Result<String, CliError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        detect_vad_boundaries, merge_transcript_events, prepare_channel_inputs,
-        reconstruct_transcript, reconstruct_transcript_per_channel, resolve_model_path,
-        run_cleanup_queue_with, AsrBackend, ChannelMode, CleanupAttemptOutcome, CleanupTaskStatus,
-        TranscribeConfig, TranscriptEvent,
+        build_trust_notices, detect_vad_boundaries, merge_transcript_events, parse_trust_notice,
+        prepare_channel_inputs, reconstruct_transcript, reconstruct_transcript_per_channel,
+        resolve_model_path, run_cleanup_queue_with, AsrBackend, ChannelMode, CleanupAttemptOutcome,
+        CleanupQueueTelemetry, CleanupTaskStatus, ModeDegradationEvent, TranscribeConfig,
+        TranscriptEvent,
     };
     use hound::{SampleFormat, WavSpec, WavWriter};
     use std::env;
@@ -3312,6 +3486,49 @@ mod tests {
         let payload = "{\"choices\":[{\"message\":{\"content\": \"cleaned local segment\"}}]}";
         let parsed = super::extract_json_string_field(payload, "content");
         assert_eq!(parsed.as_deref(), Some("cleaned local segment"));
+    }
+
+    #[test]
+    fn trust_notice_parser_reads_replay_context() {
+        let line = "{\"event_type\":\"trust_notice\",\"channel\":\"control\",\"code\":\"mode_degradation\",\"severity\":\"warn\",\"cause\":\"requested mixed-fallback but input had 1 channel\",\"impact\":\"channel attribution reduced\",\"guidance\":\"use stereo input\"}";
+        let notice = parse_trust_notice(line).unwrap();
+        assert_eq!(notice.code, "mode_degradation");
+        assert_eq!(notice.severity, "warn");
+        assert_eq!(notice.impact, "channel attribution reduced");
+    }
+
+    #[test]
+    fn trust_notice_builder_emits_mode_and_cleanup_notices() {
+        let config = TranscribeConfig::default();
+        let mut cleanup = CleanupQueueTelemetry::disabled(&config);
+        cleanup.enabled = true;
+        cleanup.dropped_queue_full = 1;
+        cleanup.failed = 1;
+        cleanup.pending = 1;
+        cleanup.drain_completed = false;
+
+        let notices = build_trust_notices(
+            ChannelMode::MixedFallback,
+            ChannelMode::Mixed,
+            &[ModeDegradationEvent {
+                code: "fallback_to_mixed",
+                detail: "requested mixed-fallback but input had 1 channel".to_string(),
+            }],
+            &cleanup,
+        );
+
+        assert!(notices
+            .iter()
+            .any(|notice| notice.code == "mode_degradation"));
+        assert!(notices
+            .iter()
+            .any(|notice| notice.code == "cleanup_queue_drop"));
+        assert!(notices
+            .iter()
+            .any(|notice| notice.code == "cleanup_processing_failure"));
+        assert!(notices
+            .iter()
+            .any(|notice| notice.code == "cleanup_drain_incomplete"));
     }
 
     #[test]

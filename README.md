@@ -163,7 +163,10 @@ cargo run --bin transcribe-live -- [--asr-model <local-model-path>] [flags...]
 - mode/degradation artifact policy:
   - runtime manifest records both `channel_mode_requested` and active `channel_mode`
   - runtime JSONL emits `event_type=mode_degradation` when fallback/degradation occurs
+  - runtime JSONL emits `event_type=trust_notice` with cause/impact/guidance for user-facing trust calibration
   - runtime manifest includes a `degradation_events` array with stable `code` + `detail`
+  - runtime manifest includes a structured `trust` object (`degraded_mode_active`, `notice_count`, `notices`)
+  - replay output prints trust notices so audit reads preserve degraded-mode context
 - readability default contract:
   - merged transcript line format: `[MM:SS.mmm-MM:SS.mmm] <channel>: <text>`
   - per-channel transcript line format: `[MM:SS.mmm-MM:SS.mmm] <text>`
