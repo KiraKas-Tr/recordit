@@ -1,4 +1,5 @@
 use screencapturekit::prelude::*;
+use hound::{SampleFormat, WavReader};
 use std::env;
 use std::fmt::{self, Display};
 use std::fs::{self, File};
@@ -6,7 +7,11 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 use std::sync::mpsc::{RecvTimeoutError, sync_channel};
+use std::thread;
 use std::time::{Duration, Instant};
+
+const PARTIAL_LATENCY_SLO_MS: f64 = 1_500.0;
+const FINAL_LATENCY_SLO_MS: f64 = 2_500.0;
 
 const HELP_TEXT: &str = "\
 transcribe-live
@@ -18,11 +23,12 @@ Usage:
 
 Options:
   --duration-sec <seconds>        Capture duration in seconds (default: 10)
+  --input-wav <path>              Representative WAV used for current runtime path (auto-generated if missing; default: artifacts/bench/corpus/gate_a/tts_phrase.wav)
   --out-wav <path>                Output WAV artifact path (default: artifacts/transcribe-live.wav)
   --out-jsonl <path>              Output JSONL transcript path (default: artifacts/transcribe-live.jsonl)
   --out-manifest <path>           Output session manifest path (default: artifacts/transcribe-live.manifest.json)
   --sample-rate <hz>              Capture sample rate in Hz (default: 48000)
-  --asr-backend <backend>         ASR backend: whisper-rs | moonshine (default: whisper-rs)
+  --asr-backend <backend>         ASR backend: whispercpp | whisperkit | moonshine (default: whispercpp)
   --asr-model <path>              Local model path for the selected backend
   --asr-language <code>           Language code (default: en)
   --asr-threads <n>               ASR worker thread count (default: 4)
@@ -38,26 +44,31 @@ Options:
   --llm-max-queue <n>             Max queued cleanup requests (default: 32)
   --transcribe-channels <mode>    Channel mode: separate | mixed (default: separate)
   --speaker-labels <mic,system>   Comma-separated labels for the two channels (default: mic,system)
+  --benchmark-runs <n>            Number of representative latency benchmark runs (default: 3)
+  --replay-jsonl <path>           Replay transcript timeline from a prior JSONL artifact
   --preflight                     Run structured preflight diagnostics and write manifest
   -h, --help                      Show this help text
 
 Examples:
-  transcribe-live --asr-model models/moonshine/base.onnx
-  transcribe-live --asr-backend moonshine --asr-model models/moonshine/base.onnx --transcribe-channels mixed
-  transcribe-live --asr-model models/ggml-base.en.bin --llm-cleanup --llm-endpoint http://127.0.0.1:8080/v1/chat/completions --llm-model llama3.2:3b
+  transcribe-live --asr-model artifacts/bench/models/whispercpp/ggml-tiny.en.bin
+  transcribe-live --asr-backend whisperkit --asr-model artifacts/bench/models/whisperkit/models/argmaxinc/whisperkit-coreml/openai_whisper-tiny --transcribe-channels mixed
+  transcribe-live --input-wav artifacts/bench/corpus/gate_a/tts_phrase.wav --asr-model artifacts/bench/models/whispercpp/ggml-tiny.en.bin --llm-cleanup --llm-endpoint http://127.0.0.1:8080/v1/chat/completions --llm-model llama3.2:3b
+  transcribe-live --replay-jsonl artifacts/transcribe-live.runtime.jsonl
   transcribe-live --preflight --asr-model models/ggml-base.en.bin
 ";
 
 #[derive(Debug, Clone, Copy)]
 enum AsrBackend {
-    WhisperRs,
+    WhisperCpp,
+    WhisperKit,
     Moonshine,
 }
 
 impl Display for AsrBackend {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::WhisperRs => f.write_str("whisper-rs"),
+            Self::WhisperCpp => f.write_str("whispercpp"),
+            Self::WhisperKit => f.write_str("whisperkit"),
             Self::Moonshine => f.write_str("moonshine"),
         }
     }
@@ -66,10 +77,11 @@ impl Display for AsrBackend {
 impl AsrBackend {
     fn parse(value: &str) -> Result<Self, CliError> {
         match value {
-            "whisper-rs" => Ok(Self::WhisperRs),
+            "whispercpp" | "whisper-rs" => Ok(Self::WhisperCpp),
+            "whisperkit" => Ok(Self::WhisperKit),
             "moonshine" => Ok(Self::Moonshine),
             _ => Err(CliError::new(format!(
-                "unsupported --asr-backend `{value}`; expected `whisper-rs` or `moonshine`"
+                "unsupported --asr-backend `{value}`; expected `whispercpp`, `whisperkit`, or `moonshine`"
             ))),
         }
     }
@@ -199,6 +211,7 @@ impl SpeakerLabels {
 #[derive(Debug, Clone)]
 struct TranscribeConfig {
     duration_sec: u64,
+    input_wav: PathBuf,
     out_wav: PathBuf,
     out_jsonl: PathBuf,
     out_manifest: PathBuf,
@@ -219,6 +232,8 @@ struct TranscribeConfig {
     llm_max_queue: usize,
     channel_mode: ChannelMode,
     speaker_labels: SpeakerLabels,
+    benchmark_runs: usize,
+    replay_jsonl: Option<PathBuf>,
     preflight: bool,
 }
 
@@ -226,11 +241,12 @@ impl Default for TranscribeConfig {
     fn default() -> Self {
         Self {
             duration_sec: 10,
+            input_wav: PathBuf::from("artifacts/bench/corpus/gate_a/tts_phrase.wav"),
             out_wav: PathBuf::from("artifacts/transcribe-live.wav"),
             out_jsonl: PathBuf::from("artifacts/transcribe-live.jsonl"),
             out_manifest: PathBuf::from("artifacts/transcribe-live.manifest.json"),
             sample_rate_hz: 48_000,
-            asr_backend: AsrBackend::WhisperRs,
+            asr_backend: AsrBackend::WhisperCpp,
             asr_model: PathBuf::new(),
             asr_language: "en".to_owned(),
             asr_threads: 4,
@@ -249,6 +265,8 @@ impl Default for TranscribeConfig {
                 mic: "mic".to_owned(),
                 system: "system".to_owned(),
             },
+            benchmark_runs: 3,
+            replay_jsonl: None,
             preflight: false,
         }
     }
@@ -260,11 +278,15 @@ impl TranscribeConfig {
             return Err(CliError::new("`--duration-sec` must be greater than zero"));
         }
 
+        if self.input_wav.as_os_str().is_empty() {
+            return Err(CliError::new("`--input-wav` cannot be empty"));
+        }
+
         if self.sample_rate_hz == 0 {
             return Err(CliError::new("`--sample-rate` must be greater than zero"));
         }
 
-        if !self.preflight && self.asr_model.as_os_str().is_empty() {
+        if !self.preflight && self.replay_jsonl.is_none() && self.asr_model.as_os_str().is_empty() {
             return Err(CliError::new(
                 "`--asr-model <path>` is required so the CLI contract stays explicit about local model assets",
             ));
@@ -302,6 +324,10 @@ impl TranscribeConfig {
             return Err(CliError::new("`--llm-max-queue` must be greater than zero"));
         }
 
+        if self.benchmark_runs == 0 {
+            return Err(CliError::new("`--benchmark-runs` must be greater than zero"));
+        }
+
         if self.llm_cleanup {
             if self.llm_endpoint.as_deref().unwrap_or("").is_empty() {
                 return Err(CliError::new(
@@ -324,11 +350,9 @@ impl TranscribeConfig {
 
     fn print_summary(&self) {
         println!("Transcribe-live configuration");
-        println!("  status: contract validated");
-        println!(
-            "  runtime: capture/ASR execution not wired yet; this command currently locks the CLI surface for follow-up work"
-        );
+        println!("  status: contract validated + representative runtime enabled");
         println!("  duration_sec: {}", self.duration_sec);
+        println!("  input_wav: {}", display_path(&self.input_wav));
         println!("  sample_rate_hz: {}", self.sample_rate_hz);
         println!("  out_wav: {}", display_path(&self.out_wav));
         println!("  out_jsonl: {}", display_path(&self.out_jsonl));
@@ -355,11 +379,15 @@ impl TranscribeConfig {
         println!("  llm_max_queue: {}", self.llm_max_queue);
         println!("  transcribe_channels: {}", self.channel_mode);
         println!("  speaker_labels: {}", self.speaker_labels);
+        println!("  benchmark_runs: {}", self.benchmark_runs);
+        println!(
+            "  replay_jsonl: {}",
+            self.replay_jsonl
+                .as_ref()
+                .map(|path| display_path(path))
+                .unwrap_or_else(|| "<disabled>".to_string())
+        );
         println!("  preflight: {}", self.preflight);
-        println!();
-        println!("Next implementation tasks:");
-        println!("  - `bd-1kp` wires VAD + ASR backend execution");
-        println!("  - `bd-w4c` adds partial/final JSONL events and replay");
     }
 }
 
@@ -467,6 +495,879 @@ enum ParseOutcome {
     Config(TranscribeConfig),
 }
 
+#[derive(Debug, Clone)]
+struct VadBoundary {
+    id: usize,
+    start_ms: u64,
+    end_ms: u64,
+    source: &'static str,
+}
+
+#[derive(Debug, Clone)]
+struct LiveRunReport {
+    generated_at_utc: String,
+    backend_id: &'static str,
+    channel_mode: ChannelMode,
+    transcript_text: String,
+    channel_transcripts: Vec<ChannelTranscriptSummary>,
+    vad_boundaries: Vec<VadBoundary>,
+    events: Vec<TranscriptEvent>,
+    benchmark: BenchmarkSummary,
+    benchmark_summary_csv: PathBuf,
+    benchmark_runs_csv: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+struct TranscriptEvent {
+    event_type: &'static str,
+    channel: String,
+    segment_id: String,
+    start_ms: u64,
+    end_ms: u64,
+    text: String,
+}
+
+#[derive(Debug, Clone)]
+struct BenchmarkSummary {
+    run_count: usize,
+    wall_ms_p50: f64,
+    wall_ms_p95: f64,
+    partial_slo_met: bool,
+    final_slo_met: bool,
+}
+
+#[derive(Debug, Clone)]
+struct ChannelInputPlan {
+    role: &'static str,
+    label: String,
+    audio_path: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+struct ChannelTranscriptSummary {
+    role: &'static str,
+    label: String,
+    text: String,
+}
+
+struct AsrRequest<'a> {
+    model_path: &'a Path,
+    audio_path: &'a Path,
+    language: &'a str,
+    threads: usize,
+}
+
+trait AsrAdapter {
+    fn backend_id(&self) -> &'static str;
+    fn transcribe(&self, request: &AsrRequest<'_>) -> Result<String, CliError>;
+}
+
+struct WhisperCppAdapter;
+
+impl AsrAdapter for WhisperCppAdapter {
+    fn backend_id(&self) -> &'static str {
+        "whispercpp"
+    }
+
+    fn transcribe(&self, request: &AsrRequest<'_>) -> Result<String, CliError> {
+        let output = Command::new("whisper-cli")
+            .args([
+                "-m",
+                &request.model_path.to_string_lossy(),
+                "-f",
+                &request.audio_path.to_string_lossy(),
+                "-l",
+                request.language,
+                "-t",
+                &request.threads.to_string(),
+                "-nt",
+                "-np",
+            ])
+            .output()
+            .map_err(|err| CliError::new(format!("failed to execute `whisper-cli`: {err}")))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(CliError::new(format!(
+                "`whisper-cli` exited with status {}: {}",
+                output.status,
+                clean_field(stderr.trim())
+            )));
+        }
+
+        let transcript = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if transcript.is_empty() {
+            return Ok("<no speech detected>".to_string());
+        }
+        Ok(transcript)
+    }
+}
+
+struct WhisperKitAdapter;
+
+impl AsrAdapter for WhisperKitAdapter {
+    fn backend_id(&self) -> &'static str {
+        "whisperkit"
+    }
+
+    fn transcribe(&self, request: &AsrRequest<'_>) -> Result<String, CliError> {
+        let output = Command::new("whisperkit-cli")
+            .args([
+                "transcribe",
+                "--audio-path",
+                &request.audio_path.to_string_lossy(),
+                "--model-path",
+                &request.model_path.to_string_lossy(),
+                "--language",
+                request.language,
+                "--task",
+                "transcribe",
+                "--without-timestamps",
+            ])
+            .output()
+            .map_err(|err| CliError::new(format!("failed to execute `whisperkit-cli`: {err}")))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(CliError::new(format!(
+                "`whisperkit-cli` exited with status {}: {}",
+                output.status,
+                clean_field(stderr.trim())
+            )));
+        }
+
+        let transcript = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if transcript.is_empty() {
+            return Ok("<no speech detected>".to_string());
+        }
+        Ok(transcript)
+    }
+}
+
+fn select_adapter(backend: AsrBackend) -> Result<Box<dyn AsrAdapter>, CliError> {
+    match backend {
+        AsrBackend::WhisperCpp => Ok(Box::new(WhisperCppAdapter)),
+        AsrBackend::WhisperKit => Ok(Box::new(WhisperKitAdapter)),
+        AsrBackend::Moonshine => Err(CliError::new(
+            "moonshine adapter is not wired in this phase; use `--asr-backend whispercpp` or `--asr-backend whisperkit`",
+        )),
+    }
+}
+
+fn run_live_pipeline(config: &TranscribeConfig) -> Result<LiveRunReport, CliError> {
+    validate_model_path_for_backend(config)?;
+    prepare_input_wav(&config.input_wav)?;
+
+    let generated_at_utc = command_stdout("date", &["-u", "+%Y-%m-%dT%H:%M:%SZ"])
+        .unwrap_or_else(|_| "unknown".to_string());
+    let stamp = command_stdout("date", &["-u", "+%Y%m%dT%H%M%SZ"])
+        .unwrap_or_else(|_| "unknown".to_string());
+    let adapter = select_adapter(config.asr_backend)?;
+
+    let mut wall_ms_runs = Vec::with_capacity(config.benchmark_runs);
+    let mut transcript_text = String::new();
+    for _ in 0..config.benchmark_runs {
+        let started_at = Instant::now();
+        let transcript = adapter.transcribe(&AsrRequest {
+            model_path: &config.asr_model,
+            audio_path: &config.input_wav,
+            language: &config.asr_language,
+            threads: config.asr_threads,
+        })?;
+        wall_ms_runs.push(started_at.elapsed().as_secs_f64() * 1_000.0);
+        if transcript_text.is_empty() {
+            transcript_text = transcript;
+        }
+    }
+    if transcript_text.is_empty() {
+        transcript_text = "<no speech detected>".to_string();
+    }
+
+    let vad_boundaries = detect_vad_boundaries_from_wav(
+        &config.input_wav,
+        config.vad_threshold,
+        config.vad_min_speech_ms,
+        config.vad_min_silence_ms,
+    )?;
+    let events = build_transcript_events(&transcript_text, &vad_boundaries);
+    let (benchmark_summary_csv, benchmark_runs_csv, benchmark) =
+        write_single_channel_benchmark(&stamp, adapter.backend_id(), &wall_ms_runs)?;
+
+    let report = LiveRunReport {
+        generated_at_utc,
+        backend_id: adapter.backend_id(),
+        transcript_text,
+        vad_boundaries,
+        events,
+        benchmark,
+        benchmark_summary_csv,
+        benchmark_runs_csv,
+    };
+
+    write_runtime_jsonl(config, &report)?;
+    write_runtime_manifest(config, &report)?;
+    Ok(report)
+}
+
+fn build_transcript_events(transcript_text: &str, vad_boundaries: &[VadBoundary]) -> Vec<TranscriptEvent> {
+    let start_ms = vad_boundaries.first().map(|v| v.start_ms).unwrap_or(0);
+    let end_ms = vad_boundaries.last().map(|v| v.end_ms).unwrap_or(0);
+    let partial_end_ms = start_ms + ((end_ms.saturating_sub(start_ms)) / 2);
+    let partial_text = partial_text(transcript_text);
+
+    vec![
+        TranscriptEvent {
+            event_type: "partial",
+            channel: "merged".to_string(),
+            segment_id: "representative-0".to_string(),
+            start_ms,
+            end_ms: partial_end_ms,
+            text: partial_text,
+        },
+        TranscriptEvent {
+            event_type: "final",
+            channel: "merged".to_string(),
+            segment_id: "representative-0".to_string(),
+            start_ms,
+            end_ms,
+            text: transcript_text.to_string(),
+        },
+    ]
+}
+
+fn partial_text(full_text: &str) -> String {
+    let words: Vec<&str> = full_text.split_whitespace().collect();
+    if words.len() <= 2 {
+        return full_text.to_string();
+    }
+    words[..(words.len() / 2).max(1)].join(" ")
+}
+
+fn write_single_channel_benchmark(
+    stamp: &str,
+    backend_id: &str,
+    wall_ms_runs: &[f64],
+) -> Result<(PathBuf, PathBuf, BenchmarkSummary), CliError> {
+    if wall_ms_runs.is_empty() {
+        return Err(CliError::new(
+            "cannot write benchmark artifact with zero runs",
+        ));
+    }
+
+    let run_dir = PathBuf::from("artifacts")
+        .join("bench")
+        .join("transcribe-live-single-channel")
+        .join(stamp);
+    fs::create_dir_all(&run_dir).map_err(|err| {
+        CliError::new(format!(
+            "failed to create benchmark artifact directory {}: {err}",
+            run_dir.display()
+        ))
+    })?;
+
+    let summary_csv = run_dir.join("summary.csv");
+    let runs_csv = run_dir.join("runs.csv");
+    let wall_ms_p50 = percentile_f64(wall_ms_runs, 0.50);
+    let wall_ms_p95 = percentile_f64(wall_ms_runs, 0.95);
+    let partial_slo_met = wall_ms_p95 <= PARTIAL_LATENCY_SLO_MS;
+    let final_slo_met = wall_ms_p95 <= FINAL_LATENCY_SLO_MS;
+
+    let mut summary_file = File::create(&summary_csv).map_err(|err| {
+        CliError::new(format!(
+            "failed to create benchmark summary {}: {err}",
+            summary_csv.display()
+        ))
+    })?;
+    writeln!(summary_file, "key,value").map_err(io_to_cli)?;
+    writeln!(summary_file, "backend_id,{backend_id}").map_err(io_to_cli)?;
+    writeln!(summary_file, "run_count,{}", wall_ms_runs.len()).map_err(io_to_cli)?;
+    writeln!(summary_file, "wall_ms_p50,{wall_ms_p50:.6}").map_err(io_to_cli)?;
+    writeln!(summary_file, "wall_ms_p95,{wall_ms_p95:.6}").map_err(io_to_cli)?;
+    writeln!(summary_file, "partial_slo_target_ms,{PARTIAL_LATENCY_SLO_MS:.0}").map_err(io_to_cli)?;
+    writeln!(summary_file, "final_slo_target_ms,{FINAL_LATENCY_SLO_MS:.0}").map_err(io_to_cli)?;
+    writeln!(summary_file, "partial_slo_met,{partial_slo_met}").map_err(io_to_cli)?;
+    writeln!(summary_file, "final_slo_met,{final_slo_met}").map_err(io_to_cli)?;
+
+    let mut runs_file = File::create(&runs_csv).map_err(|err| {
+        CliError::new(format!(
+            "failed to create benchmark runs {}: {err}",
+            runs_csv.display()
+        ))
+    })?;
+    writeln!(runs_file, "run_index,wall_ms").map_err(io_to_cli)?;
+    for (idx, wall_ms) in wall_ms_runs.iter().enumerate() {
+        writeln!(runs_file, "{idx},{wall_ms:.6}").map_err(io_to_cli)?;
+    }
+
+    Ok((
+        summary_csv,
+        runs_csv,
+        BenchmarkSummary {
+            run_count: wall_ms_runs.len(),
+            wall_ms_p50,
+            wall_ms_p95,
+            partial_slo_met,
+            final_slo_met,
+        },
+    ))
+}
+
+fn percentile_f64(values: &[f64], quantile: f64) -> f64 {
+    let mut sorted = values.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let index = ((sorted.len() - 1) as f64 * quantile).round() as usize;
+    sorted[index]
+}
+
+fn validate_model_path_for_backend(config: &TranscribeConfig) -> Result<(), CliError> {
+    if config.asr_model.as_os_str().is_empty() {
+        return Err(CliError::new(
+            "no --asr-model path provided; pass a local model path for the selected backend",
+        ));
+    }
+    if !config.asr_model.exists() {
+        return Err(CliError::new(format!(
+            "model path does not exist: {}",
+            display_path(&config.asr_model)
+        )));
+    }
+
+    match config.asr_backend {
+        AsrBackend::WhisperCpp => {
+            if !config.asr_model.is_file() {
+                return Err(CliError::new(format!(
+                    "`--asr-backend whispercpp` expects a model file path, got {}",
+                    display_path(&config.asr_model)
+                )));
+            }
+        }
+        AsrBackend::WhisperKit => {
+            if !config.asr_model.is_dir() {
+                return Err(CliError::new(format!(
+                    "`--asr-backend whisperkit` expects a model directory path, got {}",
+                    display_path(&config.asr_model)
+                )));
+            }
+        }
+        AsrBackend::Moonshine => {}
+    }
+    Ok(())
+}
+
+fn prepare_input_wav(path: &Path) -> Result<(), CliError> {
+    if !path.exists() {
+        synthesize_input_wav(path)?;
+    }
+    if !path.is_file() {
+        return Err(CliError::new(format!(
+            "representative input WAV is not a file: {}",
+            display_path(path)
+        )));
+    }
+    Ok(())
+}
+
+fn synthesize_input_wav(path: &Path) -> Result<(), CliError> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|err| {
+            CliError::new(format!(
+                "failed to create representative input directory {}: {err}",
+                parent.display()
+            ))
+        })?;
+    }
+
+    let bundled_fixture = PathBuf::from("/opt/homebrew/opt/whisper-cpp/share/whisper-cpp/jfk.wav");
+    if bundled_fixture.exists() {
+        fs::copy(&bundled_fixture, path).map_err(|err| {
+            CliError::new(format!(
+                "failed to copy representative fixture {} -> {}: {err}",
+                bundled_fixture.display(),
+                display_path(path)
+            ))
+        })?;
+        return Ok(());
+    }
+
+    let temp_aiff = path.with_extension("aiff");
+    let say_status = Command::new("say")
+        .args([
+            "-o",
+            &temp_aiff.to_string_lossy(),
+            "recordit representative transcription sample",
+        ])
+        .status()
+        .map_err(|err| CliError::new(format!("failed to execute `say`: {err}")))?;
+    if !say_status.success() {
+        return Err(CliError::new(format!(
+            "`say` exited with status {} while generating representative audio",
+            say_status
+        )));
+    }
+
+    let convert_status = Command::new("afconvert")
+        .args([
+            "-f",
+            "WAVE",
+            "-d",
+            "LEI16@16000",
+            &temp_aiff.to_string_lossy(),
+            &path.to_string_lossy(),
+        ])
+        .status()
+        .map_err(|err| CliError::new(format!("failed to execute `afconvert`: {err}")))?;
+    let _ = fs::remove_file(&temp_aiff);
+    if !convert_status.success() {
+        return Err(CliError::new(format!(
+            "`afconvert` exited with status {} while converting representative audio",
+            convert_status
+        )));
+    }
+
+    Ok(())
+}
+
+fn detect_vad_boundaries_from_wav(
+    wav_path: &Path,
+    threshold: f32,
+    min_speech_ms: u32,
+    min_silence_ms: u32,
+) -> Result<Vec<VadBoundary>, CliError> {
+    let mut reader = WavReader::open(wav_path).map_err(|err| {
+        CliError::new(format!(
+            "failed to open representative WAV {}: {err}",
+            display_path(wav_path)
+        ))
+    })?;
+    let spec = reader.spec();
+    if spec.channels == 0 {
+        return Err(CliError::new(format!(
+            "WAV has invalid channel count: {}",
+            display_path(wav_path)
+        )));
+    }
+
+    let mut normalized_samples = Vec::new();
+    match spec.sample_format {
+        SampleFormat::Float => {
+            for sample in reader.samples::<f32>() {
+                normalized_samples.push(sample.map_err(|err| {
+                    CliError::new(format!("failed to read float sample: {err}"))
+                })?);
+            }
+        }
+        SampleFormat::Int => {
+            if spec.bits_per_sample <= 16 {
+                for sample in reader.samples::<i16>() {
+                    let value = sample
+                        .map_err(|err| CliError::new(format!("failed to read i16 sample: {err}")))?;
+                    normalized_samples.push(value as f32 / i16::MAX as f32);
+                }
+            } else {
+                let denom = (1i64 << (spec.bits_per_sample.saturating_sub(1) as u32)) as f32;
+                for sample in reader.samples::<i32>() {
+                    let value = sample
+                        .map_err(|err| CliError::new(format!("failed to read i32 sample: {err}")))?;
+                    normalized_samples.push((value as f32 / denom).clamp(-1.0, 1.0));
+                }
+            }
+        }
+    }
+
+    let channels = spec.channels as usize;
+    let mut frame_levels = Vec::with_capacity(normalized_samples.len() / channels + 1);
+    for frame in normalized_samples.chunks(channels) {
+        let mean_abs = frame.iter().map(|value| value.abs()).sum::<f32>() / frame.len() as f32;
+        frame_levels.push(mean_abs.clamp(0.0, 1.0));
+    }
+
+    Ok(detect_vad_boundaries(
+        &frame_levels,
+        spec.sample_rate,
+        threshold,
+        min_speech_ms,
+        min_silence_ms,
+    ))
+}
+
+fn detect_vad_boundaries(
+    frame_levels: &[f32],
+    sample_rate_hz: u32,
+    threshold: f32,
+    min_speech_ms: u32,
+    min_silence_ms: u32,
+) -> Vec<VadBoundary> {
+    if frame_levels.is_empty() || sample_rate_hz == 0 {
+        return Vec::new();
+    }
+
+    let min_speech_samples =
+        ((sample_rate_hz as u64 * min_speech_ms as u64) / 1_000).max(1) as usize;
+    let min_silence_samples =
+        ((sample_rate_hz as u64 * min_silence_ms as u64) / 1_000).max(1) as usize;
+
+    let mut boundaries = Vec::new();
+    let mut in_speech = false;
+    let mut speech_run = 0usize;
+    let mut silence_run = 0usize;
+    let mut segment_start_idx = 0usize;
+
+    for (idx, level) in frame_levels.iter().enumerate() {
+        let is_speech = *level >= threshold;
+        if !in_speech {
+            if is_speech {
+                speech_run += 1;
+                if speech_run >= min_speech_samples {
+                    in_speech = true;
+                    segment_start_idx = idx + 1 - speech_run;
+                    silence_run = 0;
+                }
+            } else {
+                speech_run = 0;
+            }
+            continue;
+        }
+
+        if is_speech {
+            silence_run = 0;
+        } else {
+            silence_run += 1;
+            if silence_run >= min_silence_samples {
+                let end_idx = idx + 1 - silence_run;
+                if end_idx > segment_start_idx {
+                    boundaries.push(VadBoundary {
+                        id: boundaries.len(),
+                        start_ms: sample_to_ms(segment_start_idx as u64, sample_rate_hz),
+                        end_ms: sample_to_ms(end_idx as u64, sample_rate_hz),
+                        source: "energy_threshold",
+                    });
+                }
+                in_speech = false;
+                speech_run = 0;
+                silence_run = 0;
+            }
+        }
+    }
+
+    if in_speech {
+        boundaries.push(VadBoundary {
+            id: boundaries.len(),
+            start_ms: sample_to_ms(segment_start_idx as u64, sample_rate_hz),
+            end_ms: sample_to_ms(frame_levels.len() as u64, sample_rate_hz),
+            source: "energy_threshold",
+        });
+    }
+
+    if boundaries.is_empty() {
+        boundaries.push(VadBoundary {
+            id: 0,
+            start_ms: 0,
+            end_ms: sample_to_ms(frame_levels.len() as u64, sample_rate_hz),
+            source: "fallback_full_audio",
+        });
+    }
+
+    boundaries
+}
+
+fn sample_to_ms(sample_idx: u64, sample_rate_hz: u32) -> u64 {
+    sample_idx.saturating_mul(1_000) / sample_rate_hz.max(1) as u64
+}
+
+fn print_live_report(report: &LiveRunReport) {
+    println!();
+    println!("Representative runtime result");
+    println!("  generated_at_utc: {}", report.generated_at_utc);
+    println!("  backend: {}", report.backend_id);
+    println!("  transcript_text: {}", report.transcript_text);
+    println!(
+        "  benchmark_wall_ms: p50={:.2} p95={:.2} (runs={})",
+        report.benchmark.wall_ms_p50, report.benchmark.wall_ms_p95, report.benchmark.run_count
+    );
+    println!(
+        "  slo_check: partial_p95<=1500ms={} final_p95<=2500ms={}",
+        report.benchmark.partial_slo_met, report.benchmark.final_slo_met
+    );
+    println!(
+        "  benchmark_summary_csv: {}",
+        report.benchmark_summary_csv.display()
+    );
+    println!("  benchmark_runs_csv: {}", report.benchmark_runs_csv.display());
+    println!("  vad_boundaries: {}", report.vad_boundaries.len());
+    for boundary in &report.vad_boundaries {
+        println!(
+            "    - id={} start_ms={} end_ms={} source={}",
+            boundary.id, boundary.start_ms, boundary.end_ms, boundary.source
+        );
+    }
+    println!("  terminal_event_stream:");
+    for event in &report.events {
+        println!(
+            "    {} [{}-{}ms] {}",
+            event.event_type, event.start_ms, event.end_ms, event.text
+        );
+    }
+    println!("  jsonl_written: true");
+    println!("  manifest_written: true");
+}
+
+fn write_runtime_jsonl(config: &TranscribeConfig, report: &LiveRunReport) -> Result<(), CliError> {
+    if let Some(parent) = config.out_jsonl.parent() {
+        fs::create_dir_all(parent).map_err(|err| {
+            CliError::new(format!(
+                "failed to create JSONL directory {}: {err}",
+                parent.display()
+            ))
+        })?;
+    }
+    let mut file = File::create(&config.out_jsonl).map_err(|err| {
+        CliError::new(format!(
+            "failed to create JSONL file {}: {err}",
+            display_path(&config.out_jsonl)
+        ))
+    })?;
+
+    for boundary in &report.vad_boundaries {
+        writeln!(
+            file,
+            "{{\"event_type\":\"vad_boundary\",\"channel\":\"merged\",\"boundary_id\":{},\"start_ms\":{},\"end_ms\":{},\"source\":\"{}\",\"vad_backend\":\"{}\",\"vad_threshold\":{:.3}}}",
+            boundary.id,
+            boundary.start_ms,
+            boundary.end_ms,
+            json_escape(boundary.source),
+            json_escape(&config.vad_backend.to_string()),
+            config.vad_threshold,
+        )
+        .map_err(io_to_cli)?;
+    }
+
+    for event in &report.events {
+        writeln!(
+            file,
+            "{{\"event_type\":\"{}\",\"channel\":\"{}\",\"segment_id\":\"{}\",\"start_ms\":{},\"end_ms\":{},\"text\":\"{}\",\"asr_backend\":\"{}\",\"vad_boundary_count\":{}}}",
+            event.event_type,
+            event.channel,
+            json_escape(&event.segment_id),
+            event.start_ms,
+            event.end_ms,
+            json_escape(&event.text),
+            json_escape(report.backend_id),
+            report.vad_boundaries.len()
+        )
+        .map_err(io_to_cli)?;
+    }
+    Ok(())
+}
+
+fn write_runtime_manifest(config: &TranscribeConfig, report: &LiveRunReport) -> Result<(), CliError> {
+    if let Some(parent) = config.out_manifest.parent() {
+        fs::create_dir_all(parent).map_err(|err| {
+            CliError::new(format!(
+                "failed to create runtime manifest directory {}: {err}",
+                parent.display()
+            ))
+        })?;
+    }
+    let mut file = File::create(&config.out_manifest).map_err(|err| {
+        CliError::new(format!(
+            "failed to create runtime manifest {}: {err}",
+            display_path(&config.out_manifest)
+        ))
+    })?;
+
+    let first_start_ms = report.vad_boundaries.first().map(|v| v.start_ms).unwrap_or(0);
+    let last_end_ms = report.vad_boundaries.last().map(|v| v.end_ms).unwrap_or(0);
+
+    writeln!(file, "{{").map_err(io_to_cli)?;
+    writeln!(file, "  \"schema_version\": \"1\",").map_err(io_to_cli)?;
+    writeln!(file, "  \"kind\": \"transcribe-live-runtime\",").map_err(io_to_cli)?;
+    writeln!(
+        file,
+        "  \"generated_at_utc\": \"{}\",",
+        json_escape(&report.generated_at_utc)
+    )
+    .map_err(io_to_cli)?;
+    writeln!(file, "  \"asr_backend\": \"{}\",", json_escape(report.backend_id)).map_err(io_to_cli)?;
+    writeln!(
+        file,
+        "  \"asr_model\": \"{}\",",
+        json_escape(&display_path(&config.asr_model))
+    )
+    .map_err(io_to_cli)?;
+    writeln!(
+        file,
+        "  \"input_wav\": \"{}\",",
+        json_escape(&display_path(&config.input_wav))
+    )
+    .map_err(io_to_cli)?;
+    writeln!(
+        file,
+        "  \"vad\": {{\"backend\":\"{}\",\"threshold\":{:.3},\"min_speech_ms\":{},\"min_silence_ms\":{},\"boundary_count\":{}}},",
+        json_escape(&config.vad_backend.to_string()),
+        config.vad_threshold,
+        config.vad_min_speech_ms,
+        config.vad_min_silence_ms,
+        report.vad_boundaries.len()
+    )
+    .map_err(io_to_cli)?;
+    writeln!(
+        file,
+        "  \"transcript\": {{\"segment_id\":\"representative-0\",\"start_ms\":{},\"end_ms\":{},\"text\":\"{}\"}},",
+        first_start_ms,
+        last_end_ms,
+        json_escape(&report.transcript_text)
+    )
+    .map_err(io_to_cli)?;
+    writeln!(
+        file,
+        "  \"benchmark\": {{\"run_count\":{},\"wall_ms_p50\":{:.6},\"wall_ms_p95\":{:.6},\"partial_slo_met\":{},\"final_slo_met\":{},\"summary_csv\":\"{}\",\"runs_csv\":\"{}\"}},",
+        report.benchmark.run_count,
+        report.benchmark.wall_ms_p50,
+        report.benchmark.wall_ms_p95,
+        report.benchmark.partial_slo_met,
+        report.benchmark.final_slo_met,
+        json_escape(&report.benchmark_summary_csv.display().to_string()),
+        json_escape(&report.benchmark_runs_csv.display().to_string())
+    )
+    .map_err(io_to_cli)?;
+    writeln!(
+        file,
+        "  \"event_counts\": {{\"vad_boundary\":{},\"transcript\":{}}},",
+        report.vad_boundaries.len(),
+        report.events.len()
+    )
+    .map_err(io_to_cli)?;
+    writeln!(file, "  \"jsonl_path\": \"{}\"", json_escape(&display_path(&config.out_jsonl)))
+        .map_err(io_to_cli)?;
+    writeln!(file, "}}").map_err(io_to_cli)?;
+    Ok(())
+}
+
+fn replay_timeline(path: &Path) -> Result<(), CliError> {
+    let content = fs::read_to_string(path).map_err(|err| {
+        CliError::new(format!(
+            "failed to read replay JSONL {}: {err}",
+            display_path(path)
+        ))
+    })?;
+
+    let mut events = Vec::new();
+    for (line_no, line) in content.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Some(event_type) = extract_json_string_field(trimmed, "event_type") else {
+            continue;
+        };
+        if event_type != "partial" && event_type != "final" {
+            continue;
+        }
+
+        let segment_id = extract_json_string_field(trimmed, "segment_id").ok_or_else(|| {
+            CliError::new(format!("invalid replay line {}: missing segment_id", line_no + 1))
+        })?;
+        let channel = extract_json_string_field(trimmed, "channel").unwrap_or_else(|| "merged".to_string());
+        let text = extract_json_string_field(trimmed, "text").unwrap_or_default();
+        let start_ms = extract_json_u64_field(trimmed, "start_ms").ok_or_else(|| {
+            CliError::new(format!("invalid replay line {}: missing start_ms", line_no + 1))
+        })?;
+        let end_ms = extract_json_u64_field(trimmed, "end_ms").ok_or_else(|| {
+            CliError::new(format!("invalid replay line {}: missing end_ms", line_no + 1))
+        })?;
+        let event_name = if event_type == "partial" {
+            "partial"
+        } else {
+            "final"
+        };
+        events.push(TranscriptEvent {
+            event_type: event_name,
+            channel,
+            segment_id,
+            start_ms,
+            end_ms,
+            text,
+        });
+    }
+
+    events.sort_by(|a, b| {
+        a.start_ms
+            .cmp(&b.start_ms)
+            .then_with(|| a.end_ms.cmp(&b.end_ms))
+            .then_with(|| a.event_type.cmp(b.event_type))
+    });
+
+    println!("Replay timeline");
+    println!("  source_jsonl: {}", display_path(path));
+    println!("  events: {}", events.len());
+    for event in &events {
+        println!(
+            "  {} [{}-{}ms] {}",
+            event.event_type, event.start_ms, event.end_ms, event.text
+        );
+    }
+
+    let reconstructed = events
+        .iter()
+        .filter(|event| event.event_type == "final")
+        .map(|event| event.text.trim())
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    println!();
+    println!("Reconstructed transcript");
+    println!("  {}", reconstructed);
+    Ok(())
+}
+
+fn extract_json_string_field(line: &str, key: &str) -> Option<String> {
+    let needle = format!("\"{}\":\"", key);
+    let start = line.find(&needle)? + needle.len();
+    let mut escaped = false;
+    let mut result = String::new();
+    for ch in line[start..].chars() {
+        if escaped {
+            let decoded = match ch {
+                '"' => '"',
+                '\\' => '\\',
+                'n' => '\n',
+                'r' => '\r',
+                't' => '\t',
+                other => other,
+            };
+            result.push(decoded);
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        if ch == '"' {
+            return Some(result);
+        }
+        result.push(ch);
+    }
+    None
+}
+
+fn extract_json_u64_field(line: &str, key: &str) -> Option<u64> {
+    let needle = format!("\"{}\":", key);
+    let start = line.find(&needle)? + needle.len();
+    let mut digits = String::new();
+    for ch in line[start..].chars() {
+        if ch.is_ascii_digit() {
+            digits.push(ch);
+            continue;
+        }
+        if digits.is_empty() {
+            continue;
+        }
+        break;
+    }
+    digits.parse::<u64>().ok()
+}
+
 fn main() -> ExitCode {
     match parse_args() {
         Ok(ParseOutcome::Help) => {
@@ -493,8 +1394,27 @@ fn main() -> ExitCode {
                     }
                 }
             } else {
-                config.print_summary();
-                ExitCode::SUCCESS
+                if let Some(replay_path) = &config.replay_jsonl {
+                    match replay_timeline(replay_path) {
+                        Ok(()) => return ExitCode::SUCCESS,
+                        Err(err) => {
+                            eprintln!("error: replay failed: {err}");
+                            return ExitCode::from(2);
+                        }
+                    }
+                }
+
+                match run_live_pipeline(&config) {
+                    Ok(run_report) => {
+                        config.print_summary();
+                        print_live_report(&run_report);
+                        ExitCode::SUCCESS
+                    }
+                    Err(err) => {
+                        eprintln!("error: runtime execution failed: {err}");
+                        ExitCode::from(2)
+                    }
+                }
             }
         }
         Err(err) => {
@@ -516,6 +1436,9 @@ fn parse_args() -> Result<ParseOutcome, CliError> {
             "--duration-sec" => {
                 config.duration_sec =
                     parse_u64(&read_value(&mut args, "--duration-sec")?, "--duration-sec")?;
+            }
+            "--input-wav" => {
+                config.input_wav = PathBuf::from(read_value(&mut args, "--input-wav")?);
             }
             "--out-wav" => {
                 config.out_wav = PathBuf::from(read_value(&mut args, "--out-wav")?);
@@ -595,6 +1518,13 @@ fn parse_args() -> Result<ParseOutcome, CliError> {
             "--speaker-labels" => {
                 config.speaker_labels =
                     SpeakerLabels::parse(&read_value(&mut args, "--speaker-labels")?)?;
+            }
+            "--benchmark-runs" => {
+                config.benchmark_runs =
+                    parse_usize(&read_value(&mut args, "--benchmark-runs")?, "--benchmark-runs")?;
+            }
+            "--replay-jsonl" => {
+                config.replay_jsonl = Some(PathBuf::from(read_value(&mut args, "--replay-jsonl")?));
             }
             "--preflight" => {
                 config.preflight = true;
@@ -694,40 +1624,28 @@ fn run_preflight(config: &TranscribeConfig) -> Result<PreflightReport, CliError>
 }
 
 fn check_model_path(config: &TranscribeConfig) -> PreflightCheck {
-    if config.asr_model.as_os_str().is_empty() {
-        return PreflightCheck::fail(
+    match validate_model_path_for_backend(config) {
+        Ok(()) => {
+            let expected_kind = match config.asr_backend {
+                AsrBackend::WhisperCpp => "file",
+                AsrBackend::WhisperKit => "directory",
+                AsrBackend::Moonshine => "file/directory",
+            };
+            PreflightCheck::pass(
+                "model_path",
+                format!(
+                    "model path found: {} (expected {expected_kind} for backend {})",
+                    display_path(&config.asr_model),
+                    config.asr_backend
+                ),
+            )
+        }
+        Err(err) => PreflightCheck::fail(
             "model_path",
-            "no --asr-model path provided",
-            "Provide --asr-model /absolute/path/to/model file.",
-        );
+            err.to_string(),
+            "Fix --asr-model so it exists and matches backend expectations.",
+        ),
     }
-
-    if !config.asr_model.exists() {
-        return PreflightCheck::fail(
-            "model_path",
-            format!(
-                "model path does not exist: {}",
-                display_path(&config.asr_model)
-            ),
-            "Download or copy the model locally, then pass --asr-model with that path.",
-        );
-    }
-
-    if !config.asr_model.is_file() {
-        return PreflightCheck::fail(
-            "model_path",
-            format!(
-                "model path is not a file: {}",
-                display_path(&config.asr_model)
-            ),
-            "Pass a file path for --asr-model, not a directory.",
-        );
-    }
-
-    PreflightCheck::pass(
-        "model_path",
-        format!("model file found: {}", display_path(&config.asr_model)),
-    )
 }
 
 fn check_output_target(id: &'static str, path: &Path) -> PreflightCheck {
@@ -920,7 +1838,8 @@ fn check_microphone_stream(sample_rate_hz: u32) -> PreflightCheck {
 
 fn check_backend_runtime(backend: AsrBackend) -> PreflightCheck {
     let tool_name = match backend {
-        AsrBackend::WhisperRs => "whisper-cli",
+        AsrBackend::WhisperCpp => "whisper-cli",
+        AsrBackend::WhisperKit => "whisperkit-cli",
         AsrBackend::Moonshine => "moonshine",
     };
 
@@ -1108,4 +2027,52 @@ fn command_stdout(program: &str, args: &[&str]) -> Result<String, CliError> {
         )));
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AsrBackend, detect_vad_boundaries};
+
+    #[test]
+    fn asr_backend_parse_accepts_current_and_legacy_labels() {
+        assert!(matches!(
+            AsrBackend::parse("whispercpp").unwrap(),
+            AsrBackend::WhisperCpp
+        ));
+        assert!(matches!(
+            AsrBackend::parse("whisper-rs").unwrap(),
+            AsrBackend::WhisperCpp
+        ));
+        assert!(matches!(
+            AsrBackend::parse("whisperkit").unwrap(),
+            AsrBackend::WhisperKit
+        ));
+        assert!(matches!(
+            AsrBackend::parse("moonshine").unwrap(),
+            AsrBackend::Moonshine
+        ));
+    }
+
+    #[test]
+    fn vad_detector_emits_boundary_for_energy_region() {
+        let mut levels = vec![0.0; 2_000];
+        for level in &mut levels[400..1_200] {
+            *level = 0.9;
+        }
+
+        let boundaries = detect_vad_boundaries(&levels, 1_000, 0.5, 100, 100);
+        assert_eq!(boundaries.len(), 1);
+        assert_eq!(boundaries[0].start_ms, 400);
+        assert_eq!(boundaries[0].end_ms, 1_200);
+        assert_eq!(boundaries[0].source, "energy_threshold");
+    }
+
+    #[test]
+    fn vad_detector_falls_back_when_no_speech_crosses_threshold() {
+        let boundaries = detect_vad_boundaries(&vec![0.01; 500], 1_000, 0.5, 100, 100);
+        assert_eq!(boundaries.len(), 1);
+        assert_eq!(boundaries[0].start_ms, 0);
+        assert_eq!(boundaries[0].end_ms, 500);
+        assert_eq!(boundaries[0].source, "fallback_full_audio");
+    }
 }

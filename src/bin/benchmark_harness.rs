@@ -251,6 +251,9 @@ fn parse_generator(value: &str) -> Result<Generator> {
     if trimmed.is_empty() || trimmed == "-" || trimmed.eq_ignore_ascii_case("none") {
         return Ok(Generator::None);
     }
+    if trimmed.to_ascii_lowercase().starts_with("reference:") {
+        return Ok(Generator::None);
+    }
     if trimmed.eq_ignore_ascii_case("silence") {
         return Ok(Generator::Silence);
     }
