@@ -69,6 +69,15 @@ enum RecoveryAction {
     FailFastReconfigure,
 }
 
+fn recovery_action_name(action: RecoveryAction) -> &'static str {
+    match action {
+        RecoveryAction::DropSampleContinue => "DropSampleContinue",
+        RecoveryAction::RestartStream => "RestartStream",
+        RecoveryAction::AdaptOutputRate => "AdaptOutputRate",
+        RecoveryAction::FailFastReconfigure => "FailFastReconfigure",
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 enum CallbackContractViolation {
     MissingAudioBufferList,
@@ -481,11 +490,147 @@ struct RunTelemetry {
     callback_audit: CallbackAuditSnapshot,
 }
 
+fn append_degradation_event(
+    events: &mut Vec<String>,
+    generated_unix: u64,
+    stage: &str,
+    source: &str,
+    count: u64,
+    action: RecoveryAction,
+    detail: &str,
+) {
+    if count == 0 {
+        return;
+    }
+
+    events.push(format!(
+        "    {{\"generated_unix\":{},\"stage\":\"{}\",\"source\":\"{}\",\"count\":{},\"recovery_action\":\"{}\",\"detail\":\"{}\"}}",
+        generated_unix,
+        json_escape(stage),
+        json_escape(source),
+        count,
+        recovery_action_name(action),
+        json_escape(detail)
+    ));
+}
+
+fn build_degradation_events(telemetry: &RunTelemetry, generated_unix: u64) -> Vec<String> {
+    let mut events = Vec::new();
+
+    append_degradation_event(
+        &mut events,
+        generated_unix,
+        "capture",
+        "stream_interruption",
+        telemetry.restart_count as u64,
+        RecoveryAction::RestartStream,
+        "capture stream interruption detected and restart attempted",
+    );
+    append_degradation_event(
+        &mut events,
+        generated_unix,
+        "capture",
+        "slot_miss_drops",
+        telemetry.transport.slot_miss_drops,
+        RecoveryAction::DropSampleContinue,
+        "callback could not acquire a free slot",
+    );
+    append_degradation_event(
+        &mut events,
+        generated_unix,
+        "capture",
+        "fill_failures",
+        telemetry.transport.fill_failures,
+        RecoveryAction::DropSampleContinue,
+        "callback could not fill timed chunk payload",
+    );
+    append_degradation_event(
+        &mut events,
+        generated_unix,
+        "capture",
+        "queue_full_drops",
+        telemetry.transport.queue_full_drops,
+        RecoveryAction::DropSampleContinue,
+        "ready queue full during callback handoff",
+    );
+    append_degradation_event(
+        &mut events,
+        generated_unix,
+        "capture",
+        "recycle_failures",
+        telemetry.transport.recycle_failures,
+        RecoveryAction::DropSampleContinue,
+        "consumer recycle path failed to return slot",
+    );
+    append_degradation_event(
+        &mut events,
+        generated_unix,
+        "capture",
+        "missing_audio_buffer_list",
+        telemetry.callback_audit.missing_audio_buffer_list,
+        recovery_action_for_callback_violation(CallbackContractViolation::MissingAudioBufferList),
+        "audio buffer list was unavailable in callback path",
+    );
+    append_degradation_event(
+        &mut events,
+        generated_unix,
+        "capture",
+        "missing_first_audio_buffer",
+        telemetry.callback_audit.missing_first_audio_buffer,
+        recovery_action_for_callback_violation(CallbackContractViolation::MissingFirstAudioBuffer),
+        "first audio buffer missing in callback path",
+    );
+    append_degradation_event(
+        &mut events,
+        generated_unix,
+        "capture",
+        "missing_format_description",
+        telemetry.callback_audit.missing_format_description,
+        recovery_action_for_callback_violation(CallbackContractViolation::MissingFormatDescription),
+        "format description unavailable for callback sample",
+    );
+    append_degradation_event(
+        &mut events,
+        generated_unix,
+        "capture",
+        "missing_sample_rate",
+        telemetry.callback_audit.missing_sample_rate,
+        recovery_action_for_callback_violation(CallbackContractViolation::MissingSampleRate),
+        "sample rate unavailable in callback sample metadata",
+    );
+    append_degradation_event(
+        &mut events,
+        generated_unix,
+        "capture",
+        "non_float_pcm",
+        telemetry.callback_audit.non_float_pcm,
+        recovery_action_for_callback_violation(CallbackContractViolation::NonFloatPcm),
+        "non-float PCM observed in callback path",
+    );
+    append_degradation_event(
+        &mut events,
+        generated_unix,
+        "capture",
+        "chunk_too_large",
+        telemetry.callback_audit.chunk_too_large,
+        recovery_action_for_callback_violation(CallbackContractViolation::ChunkTooLarge),
+        "callback chunk exceeded preallocated max sample count",
+    );
+
+    events
+}
+
 fn write_run_telemetry(path: &Path, telemetry: &RunTelemetry) -> Result<()> {
     let now_unix = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
+    let degradation_events = build_degradation_events(telemetry, now_unix);
+    let degradation_events_json = if degradation_events.is_empty() {
+        String::new()
+    } else {
+        format!("\n{}\n  ", degradation_events.join(",\n"))
+    };
 
     let json = format!(
         concat!(
@@ -517,7 +662,8 @@ fn write_run_telemetry(path: &Path, telemetry: &RunTelemetry) -> Result<()> {
             "    \"missing_sample_rate\": {},\n",
             "    \"non_float_pcm\": {},\n",
             "    \"chunk_too_large\": {}\n",
-            "  }}\n",
+            "  }},\n",
+            "  \"degradation_events\": [{}]\n",
             "}}\n"
         ),
         now_unix,
@@ -544,6 +690,7 @@ fn write_run_telemetry(path: &Path, telemetry: &RunTelemetry) -> Result<()> {
         telemetry.callback_audit.missing_sample_rate,
         telemetry.callback_audit.non_float_pcm,
         telemetry.callback_audit.chunk_too_large,
+        degradation_events_json,
     );
 
     fs::write(path, json).with_context(|| format!("failed to write telemetry {}", path.display()))
@@ -851,10 +998,10 @@ fn main() -> Result<()> {
 mod tests {
     use super::{
         CallbackAuditSnapshot, CallbackContractMode, CallbackContractViolation, InterruptionPolicy,
-        RecoveryAction, RunTelemetry, SampleRateMismatchPolicy, callback_recovery_breakdown,
-        can_restart_capture, enforce_callback_contract, recovery_action_for_callback_violation,
-        recovery_action_for_interruption, resolve_output_sample_rate, telemetry_path_for_output,
-        write_run_telemetry,
+        RecoveryAction, RunTelemetry, SampleRateMismatchPolicy, build_degradation_events,
+        callback_recovery_breakdown, can_restart_capture, enforce_callback_contract,
+        recovery_action_for_callback_violation, recovery_action_for_interruption,
+        resolve_output_sample_rate, telemetry_path_for_output, write_run_telemetry,
     };
     use recordit::rt_transport::TransportStatsSnapshot;
     use std::fs;
@@ -954,7 +1101,59 @@ mod tests {
             fs::read_to_string(&tmp).expect("telemetry artifact should be readable as UTF-8");
         assert!(contents.contains("\"transport\""));
         assert!(contents.contains("\"callback_contract\""));
+        assert!(contents.contains("\"degradation_events\""));
         let _ = fs::remove_file(tmp);
+    }
+
+    #[test]
+    fn degradation_events_include_timestamped_recovery_records() {
+        let telemetry = RunTelemetry {
+            output_wav_path: PathBuf::from("artifacts/out.wav"),
+            duration_secs: 5,
+            target_rate_hz: 48_000,
+            output_rate_hz: 48_000,
+            mic_chunks: 2,
+            system_chunks: 2,
+            output_frames: 100,
+            restart_count: 1,
+            transport: TransportStatsSnapshot {
+                capacity: 8,
+                ready_depth_high_water: 4,
+                slot_miss_drops: 2,
+                fill_failures: 0,
+                queue_full_drops: 1,
+                recycle_failures: 0,
+                enqueued: 10,
+                dequeued: 9,
+                in_flight: 1,
+            },
+            callback_audit: CallbackAuditSnapshot {
+                missing_audio_buffer_list: 0,
+                missing_first_audio_buffer: 0,
+                missing_format_description: 1,
+                missing_sample_rate: 0,
+                non_float_pcm: 0,
+                chunk_too_large: 0,
+            },
+        };
+
+        let events = build_degradation_events(&telemetry, 1_700_000_000);
+        assert!(!events.is_empty());
+        assert!(
+            events
+                .iter()
+                .any(|event| event.contains("\"generated_unix\":1700000000"))
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| event.contains("\"recovery_action\":\"RestartStream\""))
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| event.contains("\"source\":\"missing_format_description\""))
+        );
     }
 
     #[test]

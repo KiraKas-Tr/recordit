@@ -1,17 +1,20 @@
 use hound::{SampleFormat, WavReader};
 use screencapturekit::prelude::*;
+use std::collections::HashSet;
 use std::env;
 use std::fmt::{self, Display};
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
-use std::sync::mpsc::{RecvTimeoutError, sync_channel};
+use std::sync::mpsc::{self, sync_channel, Receiver, RecvTimeoutError, TrySendError};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
 const PARTIAL_LATENCY_SLO_MS: f64 = 1_500.0;
 const FINAL_LATENCY_SLO_MS: f64 = 2_500.0;
+const OVERLAP_WINDOW_MS: u64 = 120;
 
 const HELP_TEXT: &str = "\
 transcribe-live
@@ -43,7 +46,7 @@ Options:
   --llm-timeout-ms <ms>           Cleanup timeout in milliseconds (default: 1000)
   --llm-max-queue <n>             Max queued cleanup requests (default: 32)
   --llm-retries <n>               Retry count for failed cleanup requests (default: 0)
-  --transcribe-channels <mode>    Channel mode: separate | mixed (default: separate)
+  --transcribe-channels <mode>    Channel mode: separate | mixed | mixed-fallback (default: separate)
   --speaker-labels <mic,system>   Comma-separated labels for the two channels (default: mic,system)
   --benchmark-runs <n>            Number of representative latency benchmark runs (default: 3)
   --replay-jsonl <path>           Replay transcript timeline from a prior JSONL artifact
@@ -145,10 +148,11 @@ impl VadBackend {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ChannelMode {
     Separate,
     Mixed,
+    MixedFallback,
 }
 
 impl Display for ChannelMode {
@@ -156,6 +160,7 @@ impl Display for ChannelMode {
         match self {
             Self::Separate => f.write_str("separate"),
             Self::Mixed => f.write_str("mixed"),
+            Self::MixedFallback => f.write_str("mixed-fallback"),
         }
     }
 }
@@ -165,8 +170,9 @@ impl ChannelMode {
         match value {
             "separate" => Ok(Self::Separate),
             "mixed" => Ok(Self::Mixed),
+            "mixed-fallback" => Ok(Self::MixedFallback),
             _ => Err(CliError::new(format!(
-                "unsupported --transcribe-channels `{value}`; expected `separate` or `mixed`"
+                "unsupported --transcribe-channels `{value}`; expected `separate`, `mixed`, or `mixed-fallback`"
             ))),
         }
     }
@@ -289,12 +295,6 @@ impl TranscribeConfig {
             return Err(CliError::new("`--sample-rate` must be greater than zero"));
         }
 
-        if !self.preflight && self.replay_jsonl.is_none() && self.asr_model.as_os_str().is_empty() {
-            return Err(CliError::new(
-                "`--asr-model <path>` is required so the CLI contract stays explicit about local model assets",
-            ));
-        }
-
         if self.asr_threads == 0 {
             return Err(CliError::new("`--asr-threads` must be greater than zero"));
         }
@@ -363,7 +363,15 @@ impl TranscribeConfig {
         println!("  out_jsonl: {}", display_path(&self.out_jsonl));
         println!("  out_manifest: {}", display_path(&self.out_manifest));
         println!("  asr_backend: {}", self.asr_backend);
-        println!("  asr_model: {}", display_path(&self.asr_model));
+        println!(
+            "  asr_model: {}",
+            if self.asr_model.as_os_str().is_empty() {
+                "<auto-discover>".to_string()
+            } else {
+                display_path(&self.asr_model)
+            }
+        );
+        println!("  asr_model_resolution: --asr-model > RECORDIT_ASR_MODEL > backend defaults");
         println!("  asr_language: {}", self.asr_language);
         println!("  asr_threads: {}", self.asr_threads);
         println!("  asr_profile: {}", self.asr_profile);
@@ -513,14 +521,110 @@ struct VadBoundary {
 struct LiveRunReport {
     generated_at_utc: String,
     backend_id: &'static str,
+    resolved_model_path: PathBuf,
+    resolved_model_source: String,
     channel_mode: ChannelMode,
+    active_channel_mode: ChannelMode,
     transcript_text: String,
     channel_transcripts: Vec<ChannelTranscriptSummary>,
     vad_boundaries: Vec<VadBoundary>,
     events: Vec<TranscriptEvent>,
+    degradation_events: Vec<ModeDegradationEvent>,
+    cleanup_queue: CleanupQueueTelemetry,
     benchmark: BenchmarkSummary,
     benchmark_summary_csv: PathBuf,
     benchmark_runs_csv: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+struct CleanupQueueTelemetry {
+    enabled: bool,
+    max_queue: usize,
+    timeout_ms: u64,
+    retries: usize,
+    submitted: usize,
+    enqueued: usize,
+    dropped_queue_full: usize,
+    processed: usize,
+    succeeded: usize,
+    timed_out: usize,
+    failed: usize,
+    retry_attempts: usize,
+    pending: usize,
+    drain_budget_ms: u64,
+    drain_completed: bool,
+}
+
+impl CleanupQueueTelemetry {
+    fn disabled(config: &TranscribeConfig) -> Self {
+        Self {
+            enabled: false,
+            max_queue: config.llm_max_queue,
+            timeout_ms: config.llm_timeout_ms,
+            retries: config.llm_retries,
+            submitted: 0,
+            enqueued: 0,
+            dropped_queue_full: 0,
+            processed: 0,
+            succeeded: 0,
+            timed_out: 0,
+            failed: 0,
+            retry_attempts: 0,
+            pending: 0,
+            drain_budget_ms: 0,
+            drain_completed: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct CleanupRequest {
+    segment_id: String,
+    channel: String,
+    start_ms: u64,
+    end_ms: u64,
+    text: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CleanupTaskStatus {
+    Succeeded,
+    TimedOut,
+    Failed,
+}
+
+#[derive(Debug, Clone)]
+struct CleanupTaskResult {
+    request: CleanupRequest,
+    status: CleanupTaskStatus,
+    retry_attempts: usize,
+    cleaned_text: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct CleanupClientConfig {
+    endpoint: String,
+    model: String,
+    timeout_ms: u64,
+    retries: usize,
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedModelPath {
+    path: PathBuf,
+    source: String,
+}
+
+#[derive(Debug, Clone)]
+struct CleanupRunResult {
+    telemetry: CleanupQueueTelemetry,
+    llm_events: Vec<TranscriptEvent>,
+}
+
+#[derive(Debug, Clone)]
+struct CleanupAttemptOutcome {
+    status: CleanupTaskStatus,
+    cleaned_text: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -531,6 +635,7 @@ struct TranscriptEvent {
     start_ms: u64,
     end_ms: u64,
     text: String,
+    source_final_segment_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -550,9 +655,28 @@ struct ChannelInputPlan {
 }
 
 #[derive(Debug, Clone)]
+struct ModeDegradationEvent {
+    code: &'static str,
+    detail: String,
+}
+
+#[derive(Debug, Clone)]
+struct ChannelInputPlanResult {
+    inputs: Vec<ChannelInputPlan>,
+    active_mode: ChannelMode,
+    degradation_events: Vec<ModeDegradationEvent>,
+}
+
+#[derive(Debug, Clone)]
 struct ChannelTranscriptSummary {
     role: &'static str,
     label: String,
+    text: String,
+}
+
+#[derive(Debug, Clone)]
+struct ReadableChannelTranscript {
+    channel: String,
     text: String,
 }
 
@@ -661,7 +785,7 @@ fn select_adapter(backend: AsrBackend) -> Result<Box<dyn AsrAdapter>, CliError> 
 }
 
 fn run_live_pipeline(config: &TranscribeConfig) -> Result<LiveRunReport, CliError> {
-    validate_model_path_for_backend(config)?;
+    let resolved_model = validate_model_path_for_backend(config)?;
     prepare_input_wav(&config.input_wav)?;
 
     let generated_at_utc = command_stdout("date", &["-u", "+%Y-%m-%dT%H:%M:%SZ"])
@@ -669,12 +793,13 @@ fn run_live_pipeline(config: &TranscribeConfig) -> Result<LiveRunReport, CliErro
     let stamp = command_stdout("date", &["-u", "+%Y%m%dT%H%M%SZ"])
         .unwrap_or_else(|_| "unknown".to_string());
     let backend_id = select_adapter(config.asr_backend)?.backend_id();
-    let channel_inputs = prepare_channel_inputs(config, &stamp)?;
+    let channel_plan = prepare_channel_inputs(config, &stamp)?;
     let mut wall_ms_runs = Vec::with_capacity(config.benchmark_runs);
     let mut first_channel_transcripts = Vec::new();
     for _ in 0..config.benchmark_runs {
         let started_at = Instant::now();
-        let transcripts = transcribe_channels_once(config, &channel_inputs)?;
+        let transcripts =
+            transcribe_channels_once(config, &resolved_model.path, &channel_plan.inputs)?;
         wall_ms_runs.push(started_at.elapsed().as_secs_f64() * 1_000.0);
         if first_channel_transcripts.is_empty() {
             first_channel_transcripts = transcripts;
@@ -686,7 +811,7 @@ fn run_live_pipeline(config: &TranscribeConfig) -> Result<LiveRunReport, CliErro
         config.vad_min_speech_ms,
         config.vad_min_silence_ms,
     )?;
-    let events = merge_transcript_events(
+    let mut events = merge_transcript_events(
         first_channel_transcripts
             .iter()
             .flat_map(|transcript| {
@@ -699,22 +824,31 @@ fn run_live_pipeline(config: &TranscribeConfig) -> Result<LiveRunReport, CliErro
             })
             .collect(),
     );
+    let cleanup_run = run_cleanup_queue(config, &events);
+    events.extend(cleanup_run.llm_events);
+    let events = merge_transcript_events(events);
+    let cleanup_queue = cleanup_run.telemetry;
     let transcript_text = reconstruct_transcript(&events);
     let (benchmark_summary_csv, benchmark_runs_csv, benchmark) = write_benchmark_artifact(
         &stamp,
         backend_id,
-        benchmark_track(config.channel_mode),
+        benchmark_track(channel_plan.active_mode),
         &wall_ms_runs,
     )?;
 
     let report = LiveRunReport {
         generated_at_utc,
         backend_id,
+        resolved_model_path: resolved_model.path,
+        resolved_model_source: resolved_model.source,
         channel_mode: config.channel_mode,
+        active_channel_mode: channel_plan.active_mode,
         transcript_text,
         channel_transcripts: first_channel_transcripts,
         vad_boundaries,
         events,
+        degradation_events: channel_plan.degradation_events,
+        cleanup_queue,
         benchmark,
         benchmark_summary_csv,
         benchmark_runs_csv,
@@ -728,15 +862,54 @@ fn run_live_pipeline(config: &TranscribeConfig) -> Result<LiveRunReport, CliErro
 fn prepare_channel_inputs(
     config: &TranscribeConfig,
     stamp: &str,
-) -> Result<Vec<ChannelInputPlan>, CliError> {
+) -> Result<ChannelInputPlanResult, CliError> {
     match config.channel_mode {
-        ChannelMode::Mixed => Ok(vec![ChannelInputPlan {
-            role: "mixed",
-            label: "merged".to_string(),
-            audio_path: config.input_wav.clone(),
-        }]),
-        ChannelMode::Separate => {
-            prepare_separate_channel_inputs(&config.input_wav, &config.speaker_labels, stamp)
+        ChannelMode::Mixed => Ok(ChannelInputPlanResult {
+            inputs: vec![ChannelInputPlan {
+                role: "mixed",
+                label: "merged".to_string(),
+                audio_path: config.input_wav.clone(),
+            }],
+            active_mode: ChannelMode::Mixed,
+            degradation_events: Vec::new(),
+        }),
+        ChannelMode::Separate => Ok(ChannelInputPlanResult {
+            inputs: prepare_separate_channel_inputs(
+                &config.input_wav,
+                &config.speaker_labels,
+                stamp,
+            )?,
+            active_mode: ChannelMode::Separate,
+            degradation_events: Vec::new(),
+        }),
+        ChannelMode::MixedFallback => {
+            let channel_count = wav_channel_count(&config.input_wav)?;
+            if channel_count < 2 {
+                Ok(ChannelInputPlanResult {
+                    inputs: vec![ChannelInputPlan {
+                        role: "mixed",
+                        label: "merged".to_string(),
+                        audio_path: config.input_wav.clone(),
+                    }],
+                    active_mode: ChannelMode::Mixed,
+                    degradation_events: vec![ModeDegradationEvent {
+                        code: "fallback_to_mixed",
+                        detail: format!(
+                            "requested mixed-fallback but input had {channel_count} channel(s); using merged mixed mode"
+                        ),
+                    }],
+                })
+            } else {
+                Ok(ChannelInputPlanResult {
+                    inputs: prepare_separate_channel_inputs(
+                        &config.input_wav,
+                        &config.speaker_labels,
+                        stamp,
+                    )?,
+                    active_mode: ChannelMode::Separate,
+                    degradation_events: Vec::new(),
+                })
+            }
         }
     }
 }
@@ -892,12 +1065,13 @@ fn extract_channel_wav(
 
 fn transcribe_channels_once(
     config: &TranscribeConfig,
+    resolved_model_path: &Path,
     channel_inputs: &[ChannelInputPlan],
 ) -> Result<Vec<ChannelTranscriptSummary>, CliError> {
     let mut handles = Vec::with_capacity(channel_inputs.len());
     for input in channel_inputs.iter().cloned() {
         let backend = config.asr_backend;
-        let model_path = config.asr_model.clone();
+        let model_path = resolved_model_path.to_path_buf();
         let language = config.asr_language.clone();
         let threads = config.asr_threads;
         handles.push(thread::spawn(
@@ -952,6 +1126,7 @@ fn build_transcript_events(
             start_ms,
             end_ms: partial_end_ms,
             text: partial_text,
+            source_final_segment_id: None,
         },
         TranscriptEvent {
             event_type: "final",
@@ -960,6 +1135,7 @@ fn build_transcript_events(
             start_ms,
             end_ms,
             text: transcript_text.to_string(),
+            source_final_segment_id: None,
         },
     ]
 }
@@ -978,26 +1154,384 @@ fn merge_transcript_events(mut events: Vec<TranscriptEvent>) -> Vec<TranscriptEv
 }
 
 fn event_type_rank(event_type: &str) -> u8 {
-    if event_type == "partial" { 0 } else { 1 }
+    match event_type {
+        "partial" => 0,
+        "final" => 1,
+        "llm_final" => 2,
+        _ => 3,
+    }
 }
 
 fn reconstruct_transcript(events: &[TranscriptEvent]) -> String {
-    let mut parts = Vec::new();
-    for event in events.iter().filter(|event| event.event_type == "final") {
+    let finals = final_events_for_display(events);
+    let mut lines = Vec::new();
+    let mut previous: Option<&TranscriptEvent> = None;
+    for event in finals {
         let text = event.text.trim();
         if text.is_empty() {
             continue;
         }
-        if event.channel == "merged" {
-            parts.push(text.to_string());
+        let overlap_suffix = if let Some(prev) = previous {
+            if has_near_simultaneous_overlap(prev, event) {
+                format!(" (overlap<={OVERLAP_WINDOW_MS}ms with {})", prev.channel)
+            } else {
+                String::new()
+            }
         } else {
-            parts.push(format!("[{}] {text}", event.channel));
-        }
+            String::new()
+        };
+        lines.push(format!(
+            "[{}-{}] {}: {}{}",
+            format_timestamp(event.start_ms),
+            format_timestamp(event.end_ms),
+            event.channel,
+            text,
+            overlap_suffix
+        ));
+        previous = Some(event);
     }
-    if parts.is_empty() {
+
+    if lines.is_empty() {
         "<no speech detected>".to_string()
     } else {
-        parts.join(" ")
+        lines.join("\n")
+    }
+}
+
+fn reconstruct_transcript_per_channel(
+    events: &[TranscriptEvent],
+) -> Vec<ReadableChannelTranscript> {
+    let finals = final_events_for_display(events);
+    let mut channels = finals
+        .iter()
+        .map(|event| event.channel.clone())
+        .collect::<Vec<_>>();
+    channels.sort_by(|a, b| {
+        channel_display_sort_key(a)
+            .cmp(&channel_display_sort_key(b))
+            .then_with(|| a.cmp(b))
+    });
+    channels.dedup();
+
+    channels
+        .into_iter()
+        .filter_map(|channel| {
+            let mut lines = Vec::new();
+            for event in finals.iter().filter(|event| event.channel == channel) {
+                let text = event.text.trim();
+                if text.is_empty() {
+                    continue;
+                }
+                lines.push(format!(
+                    "[{}-{}] {}",
+                    format_timestamp(event.start_ms),
+                    format_timestamp(event.end_ms),
+                    text
+                ));
+            }
+            if lines.is_empty() {
+                None
+            } else {
+                Some(ReadableChannelTranscript {
+                    channel,
+                    text: lines.join("\n"),
+                })
+            }
+        })
+        .collect()
+}
+
+fn final_events_for_display<'a>(events: &'a [TranscriptEvent]) -> Vec<&'a TranscriptEvent> {
+    let mut finals = events
+        .iter()
+        .filter(|event| event.event_type == "final")
+        .collect::<Vec<_>>();
+    finals.sort_by(|a, b| {
+        a.start_ms
+            .cmp(&b.start_ms)
+            .then_with(|| a.end_ms.cmp(&b.end_ms))
+            .then_with(|| {
+                channel_display_sort_key(&a.channel).cmp(&channel_display_sort_key(&b.channel))
+            })
+            .then_with(|| a.channel.cmp(&b.channel))
+            .then_with(|| a.segment_id.cmp(&b.segment_id))
+            .then_with(|| a.text.cmp(&b.text))
+    });
+    finals
+}
+
+fn has_near_simultaneous_overlap(previous: &TranscriptEvent, current: &TranscriptEvent) -> bool {
+    previous.channel != current.channel
+        && current.start_ms.saturating_sub(previous.start_ms) <= OVERLAP_WINDOW_MS
+}
+
+fn channel_display_sort_key(channel: &str) -> u8 {
+    match channel {
+        "mic" => 0,
+        "system" => 1,
+        "merged" => 2,
+        _ => 3,
+    }
+}
+
+fn format_timestamp(ms: u64) -> String {
+    let total_seconds = ms / 1_000;
+    let minutes = total_seconds / 60;
+    let seconds = total_seconds % 60;
+    let millis = ms % 1_000;
+    format!("{minutes:02}:{seconds:02}.{millis:03}")
+}
+
+fn run_cleanup_queue(config: &TranscribeConfig, events: &[TranscriptEvent]) -> CleanupRunResult {
+    run_cleanup_queue_with(config, events, invoke_cleanup_endpoint)
+}
+
+fn run_cleanup_queue_with<F>(
+    config: &TranscribeConfig,
+    events: &[TranscriptEvent],
+    invoke_cleanup: F,
+) -> CleanupRunResult
+where
+    F: Fn(&CleanupClientConfig, &CleanupRequest) -> CleanupAttemptOutcome + Send + Sync + 'static,
+{
+    if !config.llm_cleanup {
+        return CleanupRunResult {
+            telemetry: CleanupQueueTelemetry::disabled(config),
+            llm_events: Vec::new(),
+        };
+    }
+
+    let mut telemetry = CleanupQueueTelemetry {
+        enabled: true,
+        max_queue: config.llm_max_queue,
+        timeout_ms: config.llm_timeout_ms,
+        retries: config.llm_retries,
+        submitted: 0,
+        enqueued: 0,
+        dropped_queue_full: 0,
+        processed: 0,
+        succeeded: 0,
+        timed_out: 0,
+        failed: 0,
+        retry_attempts: 0,
+        pending: 0,
+        drain_budget_ms: config.llm_timeout_ms,
+        drain_completed: true,
+    };
+    let mut llm_events = Vec::new();
+
+    let Some(endpoint) = config.llm_endpoint.clone() else {
+        return CleanupRunResult {
+            telemetry,
+            llm_events,
+        };
+    };
+    let Some(model) = config.llm_model.clone() else {
+        return CleanupRunResult {
+            telemetry,
+            llm_events,
+        };
+    };
+
+    let requests = cleanup_requests_from_events(events);
+    telemetry.submitted = requests.len();
+    if requests.is_empty() {
+        return CleanupRunResult {
+            telemetry,
+            llm_events,
+        };
+    }
+
+    let client = CleanupClientConfig {
+        endpoint,
+        model,
+        timeout_ms: config.llm_timeout_ms,
+        retries: config.llm_retries,
+    };
+    let (request_tx, request_rx) = sync_channel::<CleanupRequest>(config.llm_max_queue);
+    let (result_tx, result_rx) = mpsc::channel::<CleanupTaskResult>();
+    let invoke_cleanup = Arc::new(invoke_cleanup);
+    let worker_invoke = Arc::clone(&invoke_cleanup);
+    let worker_handle = thread::spawn(move || {
+        cleanup_worker_loop(request_rx, result_tx, client, worker_invoke);
+    });
+
+    for request in requests {
+        match request_tx.try_send(request) {
+            Ok(()) => telemetry.enqueued += 1,
+            Err(TrySendError::Full(_)) => telemetry.dropped_queue_full += 1,
+            Err(TrySendError::Disconnected(_)) => telemetry.failed += 1,
+        }
+    }
+    drop(request_tx);
+
+    let drain_deadline = Instant::now() + Duration::from_millis(config.llm_timeout_ms);
+    while telemetry.processed < telemetry.enqueued {
+        let now = Instant::now();
+        if now >= drain_deadline {
+            break;
+        }
+        let remaining = drain_deadline.saturating_duration_since(now);
+        let wait_for = remaining.min(Duration::from_millis(5));
+        match result_rx.recv_timeout(wait_for) {
+            Ok(result) => {
+                telemetry.processed += 1;
+                telemetry.retry_attempts += result.retry_attempts;
+                match result.status {
+                    CleanupTaskStatus::Succeeded => {
+                        telemetry.succeeded += 1;
+                        if let Some(cleaned_text) = result.cleaned_text {
+                            let source_segment_id = result.request.segment_id.clone();
+                            llm_events.push(TranscriptEvent {
+                                event_type: "llm_final",
+                                channel: result.request.channel.clone(),
+                                segment_id: format!("{source_segment_id}-llm"),
+                                start_ms: result.request.start_ms,
+                                end_ms: result.request.end_ms,
+                                text: cleaned_text,
+                                source_final_segment_id: Some(source_segment_id),
+                            });
+                        }
+                    }
+                    CleanupTaskStatus::TimedOut => telemetry.timed_out += 1,
+                    CleanupTaskStatus::Failed => telemetry.failed += 1,
+                }
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => break,
+        }
+    }
+
+    telemetry.pending = telemetry.enqueued.saturating_sub(telemetry.processed);
+    telemetry.drain_completed = telemetry.pending == 0;
+    if telemetry.drain_completed {
+        let _ = worker_handle.join();
+    }
+    CleanupRunResult {
+        telemetry,
+        llm_events,
+    }
+}
+
+fn cleanup_requests_from_events(events: &[TranscriptEvent]) -> Vec<CleanupRequest> {
+    events
+        .iter()
+        .filter(|event| event.event_type == "final")
+        .map(|event| CleanupRequest {
+            segment_id: event.segment_id.clone(),
+            channel: event.channel.clone(),
+            start_ms: event.start_ms,
+            end_ms: event.end_ms,
+            text: event.text.clone(),
+        })
+        .collect()
+}
+
+fn cleanup_worker_loop<F>(
+    request_rx: Receiver<CleanupRequest>,
+    result_tx: mpsc::Sender<CleanupTaskResult>,
+    client: CleanupClientConfig,
+    invoke_cleanup: Arc<F>,
+) where
+    F: Fn(&CleanupClientConfig, &CleanupRequest) -> CleanupAttemptOutcome + Send + Sync + 'static,
+{
+    while let Ok(request) = request_rx.recv() {
+        let mut status = CleanupTaskStatus::Failed;
+        let mut retry_attempts = 0usize;
+        let mut cleaned_text = None;
+
+        for attempt in 0..=client.retries {
+            let outcome = invoke_cleanup(&client, &request);
+            status = outcome.status;
+            cleaned_text = outcome.cleaned_text;
+            if status == CleanupTaskStatus::Succeeded {
+                break;
+            }
+            if attempt < client.retries {
+                retry_attempts += 1;
+            }
+        }
+
+        if result_tx
+            .send(CleanupTaskResult {
+                request,
+                status,
+                retry_attempts,
+                cleaned_text,
+            })
+            .is_err()
+        {
+            break;
+        }
+    }
+}
+
+fn invoke_cleanup_endpoint(
+    client: &CleanupClientConfig,
+    request: &CleanupRequest,
+) -> CleanupAttemptOutcome {
+    let timeout_secs = format!("{:.3}", (client.timeout_ms as f64 / 1_000.0).max(0.001));
+    let prompt = format!(
+        "Polish this transcript segment for readability without changing meaning. Return only cleaned text.\nsegment_id={}\nchannel={}\ntext={}",
+        request.segment_id, request.channel, request.text
+    );
+    let payload = format!(
+        "{{\"model\":\"{}\",\"messages\":[{{\"role\":\"system\",\"content\":\"{}\"}},{{\"role\":\"user\",\"content\":\"{}\"}}],\"stream\":false}}",
+        json_escape(&client.model),
+        json_escape("You clean transcript text. Do not add content."),
+        json_escape(&prompt)
+    );
+
+    let output = Command::new("curl")
+        .arg("-sS")
+        .arg("--fail-with-body")
+        .arg("--max-time")
+        .arg(&timeout_secs)
+        .arg("-X")
+        .arg("POST")
+        .arg(&client.endpoint)
+        .arg("-H")
+        .arg("Content-Type: application/json")
+        .arg("-d")
+        .arg(&payload)
+        .output();
+
+    match output {
+        Ok(output) if output.status.success() => {
+            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            let cleaned_text = extract_json_string_field(&stdout, "content")
+                .or_else(|| {
+                    if stdout.is_empty() {
+                        None
+                    } else {
+                        Some(stdout.clone())
+                    }
+                })
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty());
+            match cleaned_text {
+                Some(text) => CleanupAttemptOutcome {
+                    status: CleanupTaskStatus::Succeeded,
+                    cleaned_text: Some(text),
+                },
+                None => CleanupAttemptOutcome {
+                    status: CleanupTaskStatus::Failed,
+                    cleaned_text: None,
+                },
+            }
+        }
+        Ok(output) if output.status.code() == Some(28) => CleanupAttemptOutcome {
+            status: CleanupTaskStatus::TimedOut,
+            cleaned_text: None,
+        },
+        Ok(_) => CleanupAttemptOutcome {
+            status: CleanupTaskStatus::Failed,
+            cleaned_text: None,
+        },
+        Err(_) => CleanupAttemptOutcome {
+            status: CleanupTaskStatus::Failed,
+            cleaned_text: None,
+        },
     }
 }
 
@@ -1005,6 +1539,7 @@ fn benchmark_track(channel_mode: ChannelMode) -> &'static str {
     match channel_mode {
         ChannelMode::Separate => "transcribe-live-dual-channel",
         ChannelMode::Mixed => "transcribe-live-single-channel",
+        ChannelMode::MixedFallback => "transcribe-live-dual-channel",
     }
 }
 
@@ -1110,39 +1645,156 @@ fn percentile_f64(values: &[f64], quantile: f64) -> f64 {
     sorted[index]
 }
 
-fn validate_model_path_for_backend(config: &TranscribeConfig) -> Result<(), CliError> {
-    if config.asr_model.as_os_str().is_empty() {
-        return Err(CliError::new(
-            "no --asr-model path provided; pass a local model path for the selected backend",
-        ));
-    }
-    if !config.asr_model.exists() {
-        return Err(CliError::new(format!(
-            "model path does not exist: {}",
-            display_path(&config.asr_model)
-        )));
-    }
-
+fn validate_model_path_for_backend(
+    config: &TranscribeConfig,
+) -> Result<ResolvedModelPath, CliError> {
+    let resolved = resolve_model_path(config)?;
     match config.asr_backend {
         AsrBackend::WhisperCpp => {
-            if !config.asr_model.is_file() {
+            if !resolved.path.is_file() {
                 return Err(CliError::new(format!(
-                    "`--asr-backend whispercpp` expects a model file path, got {}",
-                    display_path(&config.asr_model)
+                    "`--asr-backend whispercpp` expects a model file path, got {} (resolved via {})",
+                    display_path(&resolved.path),
+                    resolved.source
                 )));
             }
         }
         AsrBackend::WhisperKit => {
-            if !config.asr_model.is_dir() {
+            if !resolved.path.is_dir() {
                 return Err(CliError::new(format!(
-                    "`--asr-backend whisperkit` expects a model directory path, got {}",
-                    display_path(&config.asr_model)
+                    "`--asr-backend whisperkit` expects a model directory path, got {} (resolved via {})",
+                    display_path(&resolved.path),
+                    resolved.source
                 )));
             }
         }
         AsrBackend::Moonshine => {}
     }
-    Ok(())
+    Ok(resolved)
+}
+
+fn resolve_model_path(config: &TranscribeConfig) -> Result<ResolvedModelPath, CliError> {
+    let mut candidates: Vec<(PathBuf, String)> = Vec::new();
+    if !config.asr_model.as_os_str().is_empty() {
+        candidates.push((config.asr_model.clone(), "cli --asr-model".to_string()));
+    }
+    if let Ok(env_model) = env::var("RECORDIT_ASR_MODEL") {
+        if !env_model.trim().is_empty() {
+            candidates.push((
+                PathBuf::from(env_model),
+                "env RECORDIT_ASR_MODEL".to_string(),
+            ));
+        }
+    }
+    candidates.extend(default_model_candidates(config.asr_backend));
+
+    let mut seen = HashSet::new();
+    let mut checked = Vec::new();
+    for (candidate, source) in candidates {
+        let resolved = absolutize_candidate(candidate);
+        let normalized = resolved.to_string_lossy().to_string();
+        if !seen.insert(normalized) {
+            continue;
+        }
+        checked.push(display_path(&resolved));
+        if resolved.exists() {
+            return Ok(ResolvedModelPath {
+                path: resolved,
+                source,
+            });
+        }
+    }
+
+    Err(CliError::new(format!(
+        "unable to resolve ASR model for backend `{}`. Precedence: `--asr-model` > `RECORDIT_ASR_MODEL` > backend defaults. Expected {}. Checked: {}. Remediation: pass `--asr-model <path>` or set `RECORDIT_ASR_MODEL` to a valid {} path.",
+        config.asr_backend,
+        expected_model_kind(config.asr_backend),
+        checked.join(" | "),
+        expected_model_kind(config.asr_backend)
+    )))
+}
+
+fn default_model_candidates(backend: AsrBackend) -> Vec<(PathBuf, String)> {
+    let mut candidates = Vec::new();
+    let sandbox_root = sandbox_model_root();
+    match backend {
+        AsrBackend::WhisperCpp => {
+            if let Some(root) = &sandbox_root {
+                candidates.push((
+                    root.join("whispercpp").join("ggml-tiny.en.bin"),
+                    "sandbox default".to_string(),
+                ));
+            }
+            candidates.push((
+                PathBuf::from("artifacts/bench/models/whispercpp/ggml-tiny.en.bin"),
+                "repo benchmark default".to_string(),
+            ));
+            candidates.push((
+                PathBuf::from("models/ggml-tiny.en.bin"),
+                "repo local models default".to_string(),
+            ));
+        }
+        AsrBackend::WhisperKit => {
+            if let Some(root) = &sandbox_root {
+                candidates.push((
+                    root.join("whisperkit")
+                        .join("models/argmaxinc/whisperkit-coreml/openai_whisper-tiny"),
+                    "sandbox default".to_string(),
+                ));
+            }
+            candidates.push((
+                PathBuf::from(
+                    "artifacts/bench/models/whisperkit/models/argmaxinc/whisperkit-coreml/openai_whisper-tiny",
+                ),
+                "repo benchmark default".to_string(),
+            ));
+            candidates.push((
+                PathBuf::from("models/whisperkit/openai_whisper-tiny"),
+                "repo local models default".to_string(),
+            ));
+        }
+        AsrBackend::Moonshine => {
+            if let Some(root) = &sandbox_root {
+                candidates.push((
+                    root.join("moonshine").join("base"),
+                    "sandbox default".to_string(),
+                ));
+            }
+            candidates.push((
+                PathBuf::from("artifacts/bench/models/moonshine/base"),
+                "repo benchmark default".to_string(),
+            ));
+            candidates.push((
+                PathBuf::from("models/moonshine/base"),
+                "repo local models default".to_string(),
+            ));
+        }
+    }
+    candidates
+}
+
+fn sandbox_model_root() -> Option<PathBuf> {
+    env::var("HOME").ok().map(|home| {
+        PathBuf::from(home).join("Library/Containers/com.recordit.sequoiatranscribe/Data/models")
+    })
+}
+
+fn absolutize_candidate(path: PathBuf) -> PathBuf {
+    if path.is_absolute() {
+        return path;
+    }
+    match env::current_dir() {
+        Ok(cwd) => cwd.join(path),
+        Err(_) => path,
+    }
+}
+
+fn expected_model_kind(backend: AsrBackend) -> &'static str {
+    match backend {
+        AsrBackend::WhisperCpp => "file",
+        AsrBackend::WhisperKit => "directory",
+        AsrBackend::Moonshine => "file/directory",
+    }
 }
 
 fn prepare_input_wav(path: &Path) -> Result<(), CliError> {
@@ -1370,12 +2022,34 @@ fn sample_to_ms(sample_idx: u64, sample_rate_hz: u32) -> u64 {
 }
 
 fn print_live_report(report: &LiveRunReport) {
+    let per_channel_defaults = reconstruct_transcript_per_channel(&report.events);
+
     println!();
     println!("Representative runtime result");
     println!("  generated_at_utc: {}", report.generated_at_utc);
     println!("  backend: {}", report.backend_id);
-    println!("  channel_mode: {}", report.channel_mode);
-    println!("  transcript_text: {}", report.transcript_text);
+    println!(
+        "  asr_model_resolved: {}",
+        report.resolved_model_path.display()
+    );
+    println!("  asr_model_source: {}", report.resolved_model_source);
+    println!("  channel_mode_requested: {}", report.channel_mode);
+    println!("  channel_mode_active: {}", report.active_channel_mode);
+    println!("  transcript_default_line_format: [MM:SS.mmm-MM:SS.mmm] <channel>: <text>");
+    println!(
+        "  transcript_overlap_policy: adjacent cross-channel finals within {OVERLAP_WINDOW_MS}ms keep sort order and add overlap annotation"
+    );
+    println!("  transcript_text:");
+    for line in report.transcript_text.lines() {
+        println!("    {line}");
+    }
+    println!("  transcript_per_channel:");
+    for channel in &per_channel_defaults {
+        println!("    - channel={}", channel.channel);
+        for line in channel.text.lines() {
+            println!("      {line}");
+        }
+    }
     println!("  channel_transcripts:");
     for channel in &report.channel_transcripts {
         println!(
@@ -1413,6 +2087,24 @@ fn print_live_report(report: &LiveRunReport) {
             event.event_type, event.channel, event.start_ms, event.end_ms, event.text
         );
     }
+    println!("  degradation_events: {}", report.degradation_events.len());
+    for event in &report.degradation_events {
+        println!("    - code={} detail={}", event.code, event.detail);
+    }
+    println!(
+        "  cleanup_queue: enabled={} submitted={} enqueued={} dropped_queue_full={} processed={} succeeded={} timed_out={} failed={} retry_attempts={} pending={} drain_completed={}",
+        report.cleanup_queue.enabled,
+        report.cleanup_queue.submitted,
+        report.cleanup_queue.enqueued,
+        report.cleanup_queue.dropped_queue_full,
+        report.cleanup_queue.processed,
+        report.cleanup_queue.succeeded,
+        report.cleanup_queue.timed_out,
+        report.cleanup_queue.failed,
+        report.cleanup_queue.retry_attempts,
+        report.cleanup_queue.pending,
+        report.cleanup_queue.drain_completed
+    );
     println!("  jsonl_written: true");
     println!("  manifest_written: true");
 }
@@ -1448,20 +2140,70 @@ fn write_runtime_jsonl(config: &TranscribeConfig, report: &LiveRunReport) -> Res
     }
 
     for event in &report.events {
+        if let Some(source_segment_id) = &event.source_final_segment_id {
+            writeln!(
+                file,
+                "{{\"event_type\":\"{}\",\"channel\":\"{}\",\"segment_id\":\"{}\",\"source_final_segment_id\":\"{}\",\"start_ms\":{},\"end_ms\":{},\"text\":\"{}\",\"asr_backend\":\"{}\",\"vad_boundary_count\":{}}}",
+                event.event_type,
+                event.channel,
+                json_escape(&event.segment_id),
+                json_escape(source_segment_id),
+                event.start_ms,
+                event.end_ms,
+                json_escape(&event.text),
+                json_escape(report.backend_id),
+                report.vad_boundaries.len()
+            )
+            .map_err(io_to_cli)?;
+        } else {
+            writeln!(
+                file,
+                "{{\"event_type\":\"{}\",\"channel\":\"{}\",\"segment_id\":\"{}\",\"start_ms\":{},\"end_ms\":{},\"text\":\"{}\",\"asr_backend\":\"{}\",\"vad_boundary_count\":{}}}",
+                event.event_type,
+                event.channel,
+                json_escape(&event.segment_id),
+                event.start_ms,
+                event.end_ms,
+                json_escape(&event.text),
+                json_escape(report.backend_id),
+                report.vad_boundaries.len()
+            )
+            .map_err(io_to_cli)?;
+        }
+    }
+
+    for degradation in &report.degradation_events {
         writeln!(
             file,
-            "{{\"event_type\":\"{}\",\"channel\":\"{}\",\"segment_id\":\"{}\",\"start_ms\":{},\"end_ms\":{},\"text\":\"{}\",\"asr_backend\":\"{}\",\"vad_boundary_count\":{}}}",
-            event.event_type,
-            event.channel,
-            json_escape(&event.segment_id),
-            event.start_ms,
-            event.end_ms,
-            json_escape(&event.text),
-            json_escape(report.backend_id),
-            report.vad_boundaries.len()
+            "{{\"event_type\":\"mode_degradation\",\"channel\":\"control\",\"requested_mode\":\"{}\",\"active_mode\":\"{}\",\"code\":\"{}\",\"detail\":\"{}\"}}",
+            json_escape(&report.channel_mode.to_string()),
+            json_escape(&report.active_channel_mode.to_string()),
+            json_escape(degradation.code),
+            json_escape(&degradation.detail)
         )
         .map_err(io_to_cli)?;
     }
+
+    writeln!(
+        file,
+        "{{\"event_type\":\"cleanup_queue\",\"channel\":\"control\",\"enabled\":{},\"max_queue\":{},\"timeout_ms\":{},\"retries\":{},\"submitted\":{},\"enqueued\":{},\"dropped_queue_full\":{},\"processed\":{},\"succeeded\":{},\"timed_out\":{},\"failed\":{},\"retry_attempts\":{},\"pending\":{},\"drain_budget_ms\":{},\"drain_completed\":{}}}",
+        report.cleanup_queue.enabled,
+        report.cleanup_queue.max_queue,
+        report.cleanup_queue.timeout_ms,
+        report.cleanup_queue.retries,
+        report.cleanup_queue.submitted,
+        report.cleanup_queue.enqueued,
+        report.cleanup_queue.dropped_queue_full,
+        report.cleanup_queue.processed,
+        report.cleanup_queue.succeeded,
+        report.cleanup_queue.timed_out,
+        report.cleanup_queue.failed,
+        report.cleanup_queue.retry_attempts,
+        report.cleanup_queue.pending,
+        report.cleanup_queue.drain_budget_ms,
+        report.cleanup_queue.drain_completed
+    )
+    .map_err(io_to_cli)?;
     Ok(())
 }
 
@@ -1497,6 +2239,7 @@ fn write_runtime_manifest(
         .collect::<Vec<_>>();
     event_channels.sort();
     event_channels.dedup();
+    let per_channel_defaults = reconstruct_transcript_per_channel(&report.events);
 
     writeln!(file, "{{").map_err(io_to_cli)?;
     writeln!(file, "  \"schema_version\": \"1\",").map_err(io_to_cli)?;
@@ -1516,7 +2259,13 @@ fn write_runtime_manifest(
     writeln!(
         file,
         "  \"asr_model\": \"{}\",",
-        json_escape(&display_path(&config.asr_model))
+        json_escape(&display_path(&report.resolved_model_path))
+    )
+    .map_err(io_to_cli)?;
+    writeln!(
+        file,
+        "  \"asr_model_source\": \"{}\",",
+        json_escape(&report.resolved_model_source)
     )
     .map_err(io_to_cli)?;
     writeln!(
@@ -1528,6 +2277,12 @@ fn write_runtime_manifest(
     writeln!(
         file,
         "  \"channel_mode\": \"{}\",",
+        json_escape(&report.active_channel_mode.to_string())
+    )
+    .map_err(io_to_cli)?;
+    writeln!(
+        file,
+        "  \"channel_mode_requested\": \"{}\",",
         json_escape(&report.channel_mode.to_string())
     )
     .map_err(io_to_cli)?;
@@ -1568,6 +2323,29 @@ fn write_runtime_manifest(
     .map_err(io_to_cli)?;
     writeln!(
         file,
+        "  \"readability_defaults\": {{\"merged_line_format\":\"[MM:SS.mmm-MM:SS.mmm] <channel>: <text>\",\"near_overlap_window_ms\":{},\"near_overlap_annotation\":\"(overlap<={}ms with <channel>)\",\"ordering\":\"start_ms,end_ms,event_type,channel,segment_id,text\"}},",
+        OVERLAP_WINDOW_MS,
+        OVERLAP_WINDOW_MS
+    )
+    .map_err(io_to_cli)?;
+    writeln!(file, "  \"transcript_per_channel\": [").map_err(io_to_cli)?;
+    for (idx, channel) in per_channel_defaults.iter().enumerate() {
+        writeln!(
+            file,
+            "    {{\"channel\":\"{}\",\"text\":\"{}\"}}{}",
+            json_escape(&channel.channel),
+            json_escape(&channel.text),
+            if idx + 1 == per_channel_defaults.len() {
+                ""
+            } else {
+                ","
+            }
+        )
+        .map_err(io_to_cli)?;
+    }
+    writeln!(file, "  ],").map_err(io_to_cli)?;
+    writeln!(
+        file,
         "  \"benchmark\": {{\"run_count\":{},\"wall_ms_p50\":{:.6},\"wall_ms_p95\":{:.6},\"partial_slo_met\":{},\"final_slo_met\":{},\"summary_csv\":\"{}\",\"runs_csv\":\"{}\"}},",
         report.benchmark.run_count,
         report.benchmark.wall_ms_p50,
@@ -1580,9 +2358,57 @@ fn write_runtime_manifest(
     .map_err(io_to_cli)?;
     writeln!(
         file,
-        "  \"event_counts\": {{\"vad_boundary\":{},\"transcript\":{}}},",
+        "  \"cleanup_queue\": {{\"enabled\":{},\"max_queue\":{},\"timeout_ms\":{},\"retries\":{},\"submitted\":{},\"enqueued\":{},\"dropped_queue_full\":{},\"processed\":{},\"succeeded\":{},\"timed_out\":{},\"failed\":{},\"retry_attempts\":{},\"pending\":{},\"drain_budget_ms\":{},\"drain_completed\":{}}},",
+        report.cleanup_queue.enabled,
+        report.cleanup_queue.max_queue,
+        report.cleanup_queue.timeout_ms,
+        report.cleanup_queue.retries,
+        report.cleanup_queue.submitted,
+        report.cleanup_queue.enqueued,
+        report.cleanup_queue.dropped_queue_full,
+        report.cleanup_queue.processed,
+        report.cleanup_queue.succeeded,
+        report.cleanup_queue.timed_out,
+        report.cleanup_queue.failed,
+        report.cleanup_queue.retry_attempts,
+        report.cleanup_queue.pending,
+        report.cleanup_queue.drain_budget_ms,
+        report.cleanup_queue.drain_completed
+    )
+    .map_err(io_to_cli)?;
+    writeln!(file, "  \"degradation_events\": [").map_err(io_to_cli)?;
+    for (idx, degradation) in report.degradation_events.iter().enumerate() {
+        writeln!(file, "    {{").map_err(io_to_cli)?;
+        writeln!(
+            file,
+            "      \"code\": \"{}\",",
+            json_escape(degradation.code)
+        )
+        .map_err(io_to_cli)?;
+        writeln!(
+            file,
+            "      \"detail\": \"{}\"",
+            json_escape(&degradation.detail)
+        )
+        .map_err(io_to_cli)?;
+        if idx + 1 == report.degradation_events.len() {
+            writeln!(file, "    }}").map_err(io_to_cli)?;
+        } else {
+            writeln!(file, "    }},").map_err(io_to_cli)?;
+        }
+    }
+    writeln!(file, "  ],").map_err(io_to_cli)?;
+    let llm_final_count = report
+        .events
+        .iter()
+        .filter(|event| event.event_type == "llm_final")
+        .count();
+    writeln!(
+        file,
+        "  \"event_counts\": {{\"vad_boundary\":{},\"transcript\":{},\"llm_final\":{}}},",
         report.vad_boundaries.len(),
-        report.events.len()
+        report.events.len(),
+        llm_final_count
     )
     .map_err(io_to_cli)?;
     writeln!(
@@ -1649,6 +2475,7 @@ fn replay_timeline(path: &Path) -> Result<(), CliError> {
             start_ms,
             end_ms,
             text,
+            source_final_segment_id: None,
         });
     }
 
@@ -1665,15 +2492,41 @@ fn replay_timeline(path: &Path) -> Result<(), CliError> {
     }
 
     let reconstructed = reconstruct_transcript(&events);
+    let per_channel = reconstruct_transcript_per_channel(&events);
     println!();
-    println!("Reconstructed transcript");
-    println!("  {}", reconstructed);
+    println!("Readable transcript (default merged format)");
+    for line in reconstructed.lines() {
+        println!("  {line}");
+    }
+    println!();
+    println!("Readable transcript (per-channel defaults)");
+    for channel in &per_channel {
+        println!("  [{}]", channel.channel);
+        for line in channel.text.lines() {
+            println!("    {line}");
+        }
+    }
     Ok(())
 }
 
 fn extract_json_string_field(line: &str, key: &str) -> Option<String> {
-    let needle = format!("\"{}\":\"", key);
-    let start = line.find(&needle)? + needle.len();
+    let needle = format!("\"{key}\"");
+    let bytes = line.as_bytes();
+    let mut start = line.find(&needle)? + needle.len();
+    while start < bytes.len() && bytes[start].is_ascii_whitespace() {
+        start += 1;
+    }
+    if start >= bytes.len() || bytes[start] != b':' {
+        return None;
+    }
+    start += 1;
+    while start < bytes.len() && bytes[start].is_ascii_whitespace() {
+        start += 1;
+    }
+    if start >= bytes.len() || bytes[start] != b'"' {
+        return None;
+    }
+    start += 1;
     let mut escaped = false;
     let mut result = String::new();
     for ch in line[start..].chars() {
@@ -1982,25 +2835,22 @@ fn run_preflight(config: &TranscribeConfig) -> Result<PreflightReport, CliError>
 
 fn check_model_path(config: &TranscribeConfig) -> PreflightCheck {
     match validate_model_path_for_backend(config) {
-        Ok(()) => {
-            let expected_kind = match config.asr_backend {
-                AsrBackend::WhisperCpp => "file",
-                AsrBackend::WhisperKit => "directory",
-                AsrBackend::Moonshine => "file/directory",
-            };
+        Ok(resolved) => {
+            let expected_kind = expected_model_kind(config.asr_backend);
             PreflightCheck::pass(
                 "model_path",
                 format!(
-                    "model path found: {} (expected {expected_kind} for backend {})",
-                    display_path(&config.asr_model),
-                    config.asr_backend
+                    "model path resolved: {} via {} (expected {expected_kind} for backend {})",
+                    display_path(&resolved.path),
+                    resolved.source,
+                    config.asr_backend,
                 ),
             )
         }
         Err(err) => PreflightCheck::fail(
             "model_path",
             err.to_string(),
-            "Fix --asr-model so it exists and matches backend expectations.",
+            "Pass --asr-model, set RECORDIT_ASR_MODEL, or install the backend default asset in the documented location.",
         ),
     }
 }
@@ -2253,6 +3103,21 @@ fn write_preflight_manifest(
     config: &TranscribeConfig,
     report: &PreflightReport,
 ) -> Result<(), CliError> {
+    let resolved_model = validate_model_path_for_backend(config).ok();
+    let requested_model = if config.asr_model.as_os_str().is_empty() {
+        "<auto-discover>".to_string()
+    } else {
+        display_path(&config.asr_model)
+    };
+    let resolved_model_path = resolved_model
+        .as_ref()
+        .map(|model| display_path(&model.path))
+        .unwrap_or_else(|| "<unresolved>".to_string());
+    let resolved_model_source = resolved_model
+        .as_ref()
+        .map(|model| model.source.as_str())
+        .unwrap_or("unresolved");
+
     if let Some(parent) = config.out_manifest.parent() {
         fs::create_dir_all(parent).map_err(|err| {
             CliError::new(format!(
@@ -2311,8 +3176,20 @@ fn write_preflight_manifest(
     .map_err(io_to_cli)?;
     writeln!(
         file,
-        "    \"asr_model\": \"{}\",",
-        json_escape(&display_path(&config.asr_model))
+        "    \"asr_model_requested\": \"{}\",",
+        json_escape(&requested_model)
+    )
+    .map_err(io_to_cli)?;
+    writeln!(
+        file,
+        "    \"asr_model_resolved\": \"{}\",",
+        json_escape(&resolved_model_path)
+    )
+    .map_err(io_to_cli)?;
+    writeln!(
+        file,
+        "    \"asr_model_source\": \"{}\",",
+        json_escape(resolved_model_source)
     )
     .map_err(io_to_cli)?;
     writeln!(file, "    \"sample_rate_hz\": {}", config.sample_rate_hz).map_err(io_to_cli)?;
@@ -2389,9 +3266,18 @@ fn command_stdout(program: &str, args: &[&str]) -> Result<String, CliError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AsrBackend, TranscriptEvent, detect_vad_boundaries, merge_transcript_events,
-        reconstruct_transcript,
+        detect_vad_boundaries, merge_transcript_events, prepare_channel_inputs,
+        reconstruct_transcript, reconstruct_transcript_per_channel, resolve_model_path,
+        run_cleanup_queue_with, AsrBackend, ChannelMode, CleanupAttemptOutcome, CleanupTaskStatus,
+        TranscribeConfig, TranscriptEvent,
     };
+    use hound::{SampleFormat, WavSpec, WavWriter};
+    use std::env;
+    use std::fs::{self, File};
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex, OnceLock};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     #[test]
     fn asr_backend_parse_accepts_current_and_legacy_labels() {
@@ -2411,6 +3297,21 @@ mod tests {
             AsrBackend::parse("moonshine").unwrap(),
             AsrBackend::Moonshine
         ));
+    }
+
+    #[test]
+    fn channel_mode_parse_accepts_mixed_fallback() {
+        assert!(matches!(
+            ChannelMode::parse("mixed-fallback").unwrap(),
+            ChannelMode::MixedFallback
+        ));
+    }
+
+    #[test]
+    fn extract_json_string_field_accepts_whitespace_after_colon() {
+        let payload = "{\"choices\":[{\"message\":{\"content\": \"cleaned local segment\"}}]}";
+        let parsed = super::extract_json_string_field(payload, "content");
+        assert_eq!(parsed.as_deref(), Some("cleaned local segment"));
     }
 
     #[test]
@@ -2446,6 +3347,7 @@ mod tests {
                 start_ms: 10,
                 end_ms: 20,
                 text: "sys-final".to_string(),
+                source_final_segment_id: None,
             },
             TranscriptEvent {
                 event_type: "partial",
@@ -2454,6 +3356,7 @@ mod tests {
                 start_ms: 10,
                 end_ms: 20,
                 text: "mic-partial".to_string(),
+                source_final_segment_id: None,
             },
             TranscriptEvent {
                 event_type: "partial",
@@ -2462,6 +3365,7 @@ mod tests {
                 start_ms: 10,
                 end_ms: 20,
                 text: "sys-partial".to_string(),
+                source_final_segment_id: None,
             },
             TranscriptEvent {
                 event_type: "final",
@@ -2470,6 +3374,7 @@ mod tests {
                 start_ms: 10,
                 end_ms: 20,
                 text: "mic-final".to_string(),
+                source_final_segment_id: None,
             },
         ];
         let ordered = merge_transcript_events(events);
@@ -2489,7 +3394,7 @@ mod tests {
     }
 
     #[test]
-    fn reconstructed_transcript_keeps_channel_labels_for_final_events() {
+    fn reconstructed_transcript_uses_timestamped_readability_defaults() {
         let events = vec![
             TranscriptEvent {
                 event_type: "partial",
@@ -2498,6 +3403,7 @@ mod tests {
                 start_ms: 0,
                 end_ms: 50,
                 text: "hello".to_string(),
+                source_final_segment_id: None,
             },
             TranscriptEvent {
                 event_type: "final",
@@ -2506,6 +3412,7 @@ mod tests {
                 start_ms: 0,
                 end_ms: 100,
                 text: "hello from mic".to_string(),
+                source_final_segment_id: None,
             },
             TranscriptEvent {
                 event_type: "final",
@@ -2514,12 +3421,320 @@ mod tests {
                 start_ms: 0,
                 end_ms: 100,
                 text: "hello from system".to_string(),
+                source_final_segment_id: None,
             },
         ];
         let reconstructed = reconstruct_transcript(&events);
         assert_eq!(
             reconstructed,
-            "[mic] hello from mic [system] hello from system"
+            "[00:00.000-00:00.100] mic: hello from mic\n[00:00.000-00:00.100] system: hello from system (overlap<=120ms with mic)"
         );
+    }
+
+    #[test]
+    fn per_channel_readable_transcript_is_deterministic() {
+        let events = vec![
+            TranscriptEvent {
+                event_type: "final",
+                channel: "system".to_string(),
+                segment_id: "system-0".to_string(),
+                start_ms: 0,
+                end_ms: 90,
+                text: "system one".to_string(),
+                source_final_segment_id: None,
+            },
+            TranscriptEvent {
+                event_type: "final",
+                channel: "mic".to_string(),
+                segment_id: "mic-0".to_string(),
+                start_ms: 0,
+                end_ms: 100,
+                text: "mic one".to_string(),
+                source_final_segment_id: None,
+            },
+            TranscriptEvent {
+                event_type: "final",
+                channel: "mic".to_string(),
+                segment_id: "mic-1".to_string(),
+                start_ms: 200,
+                end_ms: 320,
+                text: "mic two".to_string(),
+                source_final_segment_id: None,
+            },
+        ];
+
+        let per_channel = reconstruct_transcript_per_channel(&events);
+        assert_eq!(per_channel.len(), 2);
+        assert_eq!(per_channel[0].channel, "mic");
+        assert_eq!(
+            per_channel[0].text,
+            "[00:00.000-00:00.100] mic one\n[00:00.200-00:00.320] mic two"
+        );
+        assert_eq!(per_channel[1].channel, "system");
+        assert_eq!(per_channel[1].text, "[00:00.000-00:00.090] system one");
+    }
+
+    #[test]
+    fn mixed_fallback_degrades_to_mixed_for_mono_input() {
+        let input_wav = write_test_mono_wav();
+        let mut config = TranscribeConfig::default();
+        config.input_wav = input_wav.clone();
+        config.channel_mode = ChannelMode::MixedFallback;
+
+        let plan = prepare_channel_inputs(&config, "unit-fallback").unwrap();
+        assert_eq!(plan.active_mode, ChannelMode::Mixed);
+        assert_eq!(plan.inputs.len(), 1);
+        assert_eq!(plan.inputs[0].role, "mixed");
+        assert_eq!(plan.inputs[0].label, "merged");
+        assert_eq!(plan.degradation_events.len(), 1);
+        assert_eq!(plan.degradation_events[0].code, "fallback_to_mixed");
+
+        let _ = std::fs::remove_file(input_wav);
+    }
+
+    #[test]
+    fn cleanup_queue_drops_when_full_without_blocking() {
+        let mut config = TranscribeConfig::default();
+        config.llm_cleanup = true;
+        config.llm_endpoint = Some("http://127.0.0.1:9/v1/chat/completions".to_string());
+        config.llm_model = Some("dummy".to_string());
+        config.llm_max_queue = 1;
+        config.llm_timeout_ms = 150;
+        config.llm_retries = 0;
+
+        let events = vec![
+            final_event("mic-0", "mic", "hello"),
+            final_event("system-0", "system", "world"),
+            final_event("mixed-0", "merged", "again"),
+        ];
+
+        let result = run_cleanup_queue_with(&config, &events, |_client, _request| {
+            std::thread::sleep(Duration::from_millis(40));
+            CleanupAttemptOutcome {
+                status: CleanupTaskStatus::Failed,
+                cleaned_text: None,
+            }
+        });
+        let telemetry = result.telemetry;
+
+        assert_eq!(telemetry.submitted, 3);
+        assert!(telemetry.dropped_queue_full >= 1);
+        assert!(telemetry.enqueued <= telemetry.submitted);
+        assert_eq!(telemetry.processed, telemetry.enqueued);
+        assert!(telemetry.failed >= telemetry.processed);
+        assert!(telemetry.drain_completed);
+    }
+
+    #[test]
+    fn cleanup_queue_counts_retry_attempts() {
+        let mut config = TranscribeConfig::default();
+        config.llm_cleanup = true;
+        config.llm_endpoint = Some("http://127.0.0.1:9/v1/chat/completions".to_string());
+        config.llm_model = Some("dummy".to_string());
+        config.llm_max_queue = 2;
+        config.llm_timeout_ms = 200;
+        config.llm_retries = 2;
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempt_counter = Arc::clone(&attempts);
+        let events = vec![final_event("mic-0", "mic", "hello")];
+
+        let result = run_cleanup_queue_with(&config, &events, move |_client, _request| {
+            let attempt = attempt_counter.fetch_add(1, Ordering::Relaxed);
+            if attempt < 2 {
+                CleanupAttemptOutcome {
+                    status: CleanupTaskStatus::Failed,
+                    cleaned_text: None,
+                }
+            } else {
+                CleanupAttemptOutcome {
+                    status: CleanupTaskStatus::Succeeded,
+                    cleaned_text: Some("cleaned".to_string()),
+                }
+            }
+        });
+        let telemetry = result.telemetry;
+
+        assert_eq!(attempts.load(Ordering::Relaxed), 3);
+        assert_eq!(telemetry.retry_attempts, 2);
+        assert_eq!(telemetry.succeeded, 1);
+        assert_eq!(telemetry.failed, 0);
+    }
+
+    #[test]
+    fn cleanup_queue_emits_llm_final_with_lineage() {
+        let mut config = TranscribeConfig::default();
+        config.llm_cleanup = true;
+        config.llm_endpoint = Some("http://127.0.0.1:9/v1/chat/completions".to_string());
+        config.llm_model = Some("dummy".to_string());
+        config.llm_max_queue = 2;
+        config.llm_timeout_ms = 200;
+        config.llm_retries = 0;
+
+        let events = vec![final_event("mic-0", "mic", "hello there")];
+        let result = run_cleanup_queue_with(&config, &events, |_client, _request| {
+            CleanupAttemptOutcome {
+                status: CleanupTaskStatus::Succeeded,
+                cleaned_text: Some("hello there.".to_string()),
+            }
+        });
+
+        assert_eq!(result.llm_events.len(), 1);
+        let llm_event = &result.llm_events[0];
+        assert_eq!(llm_event.event_type, "llm_final");
+        assert_eq!(llm_event.segment_id, "mic-0-llm");
+        assert_eq!(llm_event.source_final_segment_id.as_deref(), Some("mic-0"));
+        assert_eq!(llm_event.text, "hello there.");
+    }
+
+    #[test]
+    fn cleanup_disabled_produces_no_llm_events() {
+        let config = TranscribeConfig::default();
+        let events = vec![final_event("mic-0", "mic", "hello there")];
+        let result = run_cleanup_queue_with(&config, &events, |_client, _request| {
+            panic!("cleanup invoker should not run when llm_cleanup is disabled")
+        });
+
+        assert!(!result.telemetry.enabled);
+        assert_eq!(result.telemetry.submitted, 0);
+        assert!(result.llm_events.is_empty());
+    }
+
+    #[test]
+    fn model_resolution_prefers_cli_override() {
+        let _guard = env_lock().lock().unwrap();
+        let original_cwd = env::current_dir().unwrap();
+        let original_env = env::var("RECORDIT_ASR_MODEL").ok();
+        let temp_dir = write_temp_dir("recordit-model-cli");
+        let cli_model = temp_dir.join("cli-model.bin");
+        let env_model = temp_dir.join("env-model.bin");
+        File::create(&cli_model).unwrap();
+        File::create(&env_model).unwrap();
+
+        env::set_current_dir(&temp_dir).unwrap();
+        unsafe {
+            env::set_var("RECORDIT_ASR_MODEL", &env_model);
+        }
+
+        let mut config = TranscribeConfig::default();
+        config.asr_model = cli_model.clone();
+        let resolved = resolve_model_path(&config).unwrap();
+
+        assert_eq!(resolved.path, cli_model);
+        assert_eq!(resolved.source, "cli --asr-model");
+
+        restore_env_state(original_cwd, original_env);
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn model_resolution_uses_env_override_when_cli_missing() {
+        let _guard = env_lock().lock().unwrap();
+        let original_cwd = env::current_dir().unwrap();
+        let original_env = env::var("RECORDIT_ASR_MODEL").ok();
+        let temp_dir = write_temp_dir("recordit-model-env");
+        let env_model = temp_dir.join("env-model.bin");
+        File::create(&env_model).unwrap();
+
+        env::set_current_dir(&temp_dir).unwrap();
+        unsafe {
+            env::set_var("RECORDIT_ASR_MODEL", &env_model);
+        }
+
+        let config = TranscribeConfig::default();
+        let resolved = resolve_model_path(&config).unwrap();
+
+        assert_eq!(resolved.path, env_model);
+        assert_eq!(resolved.source, "env RECORDIT_ASR_MODEL");
+
+        restore_env_state(original_cwd, original_env);
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn model_resolution_uses_repo_default_when_overrides_missing() {
+        let _guard = env_lock().lock().unwrap();
+        let original_cwd = env::current_dir().unwrap();
+        let original_env = env::var("RECORDIT_ASR_MODEL").ok();
+        let temp_dir = write_temp_dir("recordit-model-default");
+        let default_model = temp_dir.join("artifacts/bench/models/whispercpp/ggml-tiny.en.bin");
+        fs::create_dir_all(default_model.parent().unwrap()).unwrap();
+        File::create(&default_model).unwrap();
+
+        env::set_current_dir(&temp_dir).unwrap();
+        unsafe {
+            env::remove_var("RECORDIT_ASR_MODEL");
+        }
+
+        let config = TranscribeConfig::default();
+        let resolved = resolve_model_path(&config).unwrap();
+
+        assert_eq!(
+            fs::canonicalize(&resolved.path).unwrap(),
+            fs::canonicalize(&default_model).unwrap()
+        );
+        assert_eq!(resolved.source, "repo benchmark default");
+
+        restore_env_state(original_cwd, original_env);
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    fn final_event(segment_id: &str, channel: &str, text: &str) -> TranscriptEvent {
+        TranscriptEvent {
+            event_type: "final",
+            channel: channel.to_string(),
+            segment_id: segment_id.to_string(),
+            start_ms: 0,
+            end_ms: 100,
+            text: text.to_string(),
+            source_final_segment_id: None,
+        }
+    }
+
+    fn write_test_mono_wav() -> PathBuf {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = env::temp_dir().join(format!("recordit-mono-{stamp}.wav"));
+        let spec = WavSpec {
+            channels: 1,
+            sample_rate: 16_000,
+            bits_per_sample: 16,
+            sample_format: SampleFormat::Int,
+        };
+        let mut writer = WavWriter::create(&path, spec).unwrap();
+        for _ in 0..320 {
+            writer.write_sample::<i16>(0).unwrap();
+        }
+        writer.finalize().unwrap();
+        path
+    }
+
+    fn write_temp_dir(prefix: &str) -> PathBuf {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = env::temp_dir().join(format!("{prefix}-{stamp}"));
+        fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    fn restore_env_state(original_cwd: PathBuf, original_env: Option<String>) {
+        env::set_current_dir(original_cwd).unwrap();
+        match original_env {
+            Some(value) => unsafe {
+                env::set_var("RECORDIT_ASR_MODEL", value);
+            },
+            None => unsafe {
+                env::remove_var("RECORDIT_ASR_MODEL");
+            },
+        }
+    }
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
     }
 }
