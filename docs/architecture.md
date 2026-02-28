@@ -100,6 +100,7 @@ Per chunk:
    - deterministic dual-channel merge + replayable JSONL event stream
    - bounded asynchronous cleanup lane with non-blocking enqueue/drop policy
    - explicit mode degradation semantics + `llm_final` lineage
+   - `--live-chunked` runtime path reuses `sequoia_capture` capture session primitives instead of duplicating callback-thread capture logic
    - sandbox-aware model resolution precedence with actionable diagnostics
    - readable transcript defaults with deterministic overlap annotation policy
 3. Gate evidence and policy docs

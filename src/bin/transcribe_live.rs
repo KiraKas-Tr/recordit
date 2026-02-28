@@ -19,6 +19,8 @@ const OUT_WAV_SEMANTICS: &str = "canonical session WAV artifact for the run";
 const DEFAULT_CHUNK_WINDOW_MS: u64 = 4_000;
 const DEFAULT_CHUNK_STRIDE_MS: u64 = 1_000;
 const DEFAULT_CHUNK_QUEUE_CAP: usize = 4;
+const LIVE_CAPTURE_SAMPLE_RATE_POLICY: &str = "adapt-stream-rate";
+const LIVE_CAPTURE_CALLBACK_MODE: &str = "warn";
 
 const HELP_TEXT: &str = "\
 transcribe-live
@@ -30,7 +32,7 @@ Usage:
 
 Options:
   --duration-sec <seconds>        Capture duration in seconds (default: 10)
-  --input-wav <path>              Representative WAV used for current runtime path (auto-generated if missing; default: artifacts/bench/corpus/gate_a/tts_phrase.wav)
+  --input-wav <path>              Runtime WAV path (offline: representative fixture path; live-chunked: capture destination; default: artifacts/bench/corpus/gate_a/tts_phrase.wav)
   --out-wav <path>                Canonical session WAV artifact path (always materialized on success; default: artifacts/transcribe-live.wav)
   --out-jsonl <path>              Output JSONL transcript path (default: artifacts/transcribe-live.jsonl)
   --out-manifest <path>           Output session manifest path (default: artifacts/transcribe-live.manifest.json)
@@ -910,14 +912,8 @@ fn select_adapter(backend: AsrBackend) -> Result<Box<dyn AsrAdapter>, CliError> 
 }
 
 fn run_live_pipeline(config: &TranscribeConfig) -> Result<LiveRunReport, CliError> {
-    if config.live_chunked {
-        return Err(CliError::new(
-            "`--live-chunked` now has a locked CLI contract, but the near-live runtime path is not implemented yet; omit `--live-chunked` for representative offline runs until the follow-up live pipeline tasks land",
-        ));
-    }
-
     let resolved_model = validate_model_path_for_backend(config)?;
-    prepare_input_wav(&config.input_wav)?;
+    prepare_runtime_input_wav(config)?;
     materialize_out_wav(&config.input_wav, &config.out_wav)?;
 
     let generated_at_utc = command_stdout("date", &["-u", "+%Y-%m-%dT%H:%M:%SZ"])
@@ -2042,6 +2038,101 @@ fn expected_model_kind(backend: AsrBackend) -> &'static str {
     }
 }
 
+fn prepare_runtime_input_wav(config: &TranscribeConfig) -> Result<(), CliError> {
+    if config.live_chunked {
+        run_live_capture_session(config)
+    } else {
+        prepare_input_wav(&config.input_wav)
+    }
+}
+
+fn run_live_capture_session(config: &TranscribeConfig) -> Result<(), CliError> {
+    if let Some(parent) = config.input_wav.parent() {
+        fs::create_dir_all(parent).map_err(|err| {
+            CliError::new(format!(
+                "failed to create live capture output directory {}: {err}",
+                parent.display()
+            ))
+        })?;
+    }
+
+    let launcher_paths = sequoia_capture_binary_candidates();
+    for path in launcher_paths {
+        if path.is_file() {
+            let mut command = Command::new(&path);
+            command.args(live_capture_cli_args(config));
+            execute_live_capture_command(command, &format!("binary `{}`", path.display()))?;
+            return ensure_live_capture_output_exists(&config.input_wav);
+        }
+    }
+
+    let mut fallback = Command::new("cargo");
+    fallback.args(["run", "--quiet", "--bin", "sequoia_capture", "--"]);
+    fallback.args(live_capture_cli_args(config));
+    execute_live_capture_command(fallback, "cargo-run fallback")?;
+    ensure_live_capture_output_exists(&config.input_wav)
+}
+
+fn live_capture_cli_args(config: &TranscribeConfig) -> Vec<String> {
+    vec![
+        config.duration_sec.to_string(),
+        config.input_wav.to_string_lossy().to_string(),
+        config.sample_rate_hz.to_string(),
+        LIVE_CAPTURE_SAMPLE_RATE_POLICY.to_string(),
+        LIVE_CAPTURE_CALLBACK_MODE.to_string(),
+    ]
+}
+
+fn sequoia_capture_binary_candidates() -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Ok(current_exe) = env::current_exe() {
+        if let Some(dir) = current_exe.parent() {
+            candidates.push(dir.join("sequoia_capture"));
+        }
+    }
+    candidates.push(PathBuf::from("target/debug/sequoia_capture"));
+    candidates.push(PathBuf::from("target/release/sequoia_capture"));
+    candidates
+}
+
+fn execute_live_capture_command(
+    mut command: Command,
+    launcher_label: &str,
+) -> Result<(), CliError> {
+    if env::var_os("DYLD_LIBRARY_PATH").is_none() {
+        command.env("DYLD_LIBRARY_PATH", "/usr/lib/swift");
+    }
+
+    let output = command.output().map_err(|err| {
+        CliError::new(format!(
+            "failed to start live capture session via {launcher_label}: {err}"
+        ))
+    })?;
+
+    if !output.status.success() {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(CliError::new(format!(
+            "live capture session failed via {launcher_label} with status {}. stdout=`{}` stderr=`{}`",
+            output.status,
+            clean_field(stdout.trim()),
+            clean_field(stderr.trim()),
+        )));
+    }
+
+    Ok(())
+}
+
+fn ensure_live_capture_output_exists(path: &Path) -> Result<(), CliError> {
+    if !path.is_file() {
+        return Err(CliError::new(format!(
+            "live capture session completed but output WAV was not materialized at {}",
+            display_path(path)
+        )));
+    }
+    Ok(())
+}
+
 fn prepare_input_wav(path: &Path) -> Result<(), CliError> {
     if !path.exists() {
         synthesize_input_wav(path)?;
@@ -2976,6 +3067,22 @@ fn main() -> ExitCode {
                     }
                 }
             } else {
+                if config.model_doctor {
+                    match run_model_doctor(&config) {
+                        Ok(report) => {
+                            print_model_doctor_report(&report);
+                            return match report.overall_status() {
+                                CheckStatus::Fail => ExitCode::from(2),
+                                _ => ExitCode::SUCCESS,
+                            };
+                        }
+                        Err(err) => {
+                            eprintln!("error: model doctor failed unexpectedly: {err}");
+                            return ExitCode::from(2);
+                        }
+                    }
+                }
+
                 if let Some(replay_path) = &config.replay_jsonl {
                     match replay_timeline(replay_path) {
                         Ok(()) => return ExitCode::SUCCESS,
@@ -3136,6 +3243,9 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Result<ParseOutcome, C
                     "--benchmark-runs",
                 )?;
             }
+            "--model-doctor" => {
+                config.model_doctor = true;
+            }
             "--replay-jsonl" => {
                 config.replay_jsonl = Some(PathBuf::from(read_value(&mut args, "--replay-jsonl")?));
             }
@@ -3214,6 +3324,92 @@ fn display_path(path: &Path) -> String {
         Ok(cwd) => cwd.join(path).display().to_string(),
         Err(_) => path.display().to_string(),
     }
+}
+
+fn run_model_doctor(config: &TranscribeConfig) -> Result<PreflightReport, CliError> {
+    let mut checks = Vec::new();
+    checks.push(check_backend_runtime(config.asr_backend));
+
+    match validate_model_path_for_backend(config) {
+        Ok(resolved) => {
+            let expected_kind = expected_model_kind(config.asr_backend);
+            checks.push(PreflightCheck::pass(
+                "model_path",
+                format!(
+                    "model path resolved: {} via {} (expected {expected_kind} for backend {})",
+                    display_path(&resolved.path),
+                    resolved.source,
+                    config.asr_backend,
+                ),
+            ));
+            checks.push(check_model_asset_readability(&resolved));
+        }
+        Err(err) => {
+            checks.push(PreflightCheck::fail(
+                "model_path",
+                err.to_string(),
+                "Pass --asr-model, set RECORDIT_ASR_MODEL, or install the backend default asset in the documented location.",
+            ));
+            checks.push(PreflightCheck::fail(
+                "model_readability",
+                "skipped because model_path did not validate".to_string(),
+                "Fix model_path first, then rerun --model-doctor.",
+            ));
+        }
+    }
+
+    let generated_at_utc = command_stdout("date", &["-u", "+%Y-%m-%dT%H:%M:%SZ"])
+        .unwrap_or_else(|_| "unknown".to_string());
+
+    Ok(PreflightReport {
+        generated_at_utc,
+        checks,
+    })
+}
+
+fn check_model_asset_readability(resolved: &ResolvedModelPath) -> PreflightCheck {
+    if resolved.path.is_file() {
+        return match File::open(&resolved.path) {
+            Ok(_) => PreflightCheck::pass(
+                "model_readability",
+                format!("model file is readable: {}", display_path(&resolved.path)),
+            ),
+            Err(err) => PreflightCheck::fail(
+                "model_readability",
+                format!("cannot read model file {}: {err}", display_path(&resolved.path)),
+                "Fix file permissions or pass a different readable model path.",
+            ),
+        };
+    }
+
+    if resolved.path.is_dir() {
+        return match fs::read_dir(&resolved.path) {
+            Ok(_) => PreflightCheck::pass(
+                "model_readability",
+                format!(
+                    "model directory is readable: {}",
+                    display_path(&resolved.path)
+                ),
+            ),
+            Err(err) => PreflightCheck::fail(
+                "model_readability",
+                format!(
+                    "cannot read model directory {}: {err}",
+                    display_path(&resolved.path)
+                ),
+                "Fix directory permissions or pass a different readable model path.",
+            ),
+        };
+    }
+
+    PreflightCheck::fail(
+        "model_readability",
+        format!(
+            "model path is neither a file nor directory: {}",
+            display_path(&resolved.path)
+        ),
+        "Use a readable file/directory path matching backend expectations.",
+    )
 }
 
 fn run_preflight(config: &TranscribeConfig) -> Result<PreflightReport, CliError> {
@@ -3502,6 +3698,42 @@ fn print_preflight_report(report: &PreflightReport) {
     );
 }
 
+fn print_model_doctor_report(report: &PreflightReport) {
+    let mut pass_count = 0usize;
+    let mut warn_count = 0usize;
+    let mut fail_count = 0usize;
+
+    println!("Transcribe-live model doctor");
+    println!("  generated_at_utc: {}", report.generated_at_utc);
+    println!("  overall_status: {}", report.overall_status());
+    println!();
+    println!("id\tstatus\tdetail\tremediation");
+
+    for check in &report.checks {
+        match check.status {
+            CheckStatus::Pass => pass_count += 1,
+            CheckStatus::Warn => warn_count += 1,
+            CheckStatus::Fail => fail_count += 1,
+        }
+        println!(
+            "{}\t{}\t{}\t{}",
+            check.id,
+            check.status,
+            clean_field(&check.detail),
+            clean_field(check.remediation.as_deref().unwrap_or("-")),
+        );
+    }
+
+    println!();
+    println!(
+        "summary\t{}\tpass={}\twarn={}\tfail={}",
+        report.overall_status(),
+        pass_count,
+        warn_count,
+        fail_count
+    );
+}
+
 fn write_preflight_manifest(
     config: &TranscribeConfig,
     report: &PreflightReport,
@@ -3686,10 +3918,11 @@ fn command_stdout(program: &str, args: &[&str]) -> Result<String, CliError> {
 mod tests {
     use super::{
         build_trust_notices, detect_vad_boundaries, materialize_out_wav, merge_transcript_events,
-        parse_args_from, parse_trust_notice, prepare_channel_inputs, reconstruct_transcript,
-        reconstruct_transcript_per_channel, resolve_model_path, run_cleanup_queue_with, AsrBackend,
-        ChannelMode, CleanupAttemptOutcome, CleanupQueueTelemetry, CleanupTaskStatus,
-        ModeDegradationEvent, ParseOutcome, TranscribeConfig, TranscriptEvent, HELP_TEXT,
+        live_capture_cli_args, parse_args_from, parse_trust_notice, prepare_channel_inputs,
+        reconstruct_transcript, reconstruct_transcript_per_channel, resolve_model_path,
+        run_cleanup_queue_with, sequoia_capture_binary_candidates, AsrBackend, ChannelMode,
+        CleanupAttemptOutcome, CleanupQueueTelemetry, CleanupTaskStatus, ModeDegradationEvent,
+        ParseOutcome, TranscribeConfig, TranscriptEvent, HELP_TEXT,
     };
     use hound::{SampleFormat, WavSpec, WavWriter};
     use std::env;
@@ -3733,6 +3966,33 @@ mod tests {
         assert!(HELP_TEXT.contains("--chunk-window-ms"));
         assert!(HELP_TEXT.contains("--chunk-stride-ms"));
         assert!(HELP_TEXT.contains("--chunk-queue-cap"));
+    }
+
+    #[test]
+    fn live_capture_cli_args_follow_transcribe_config() {
+        let mut config = TranscribeConfig::default();
+        config.duration_sec = 42;
+        config.input_wav = PathBuf::from("artifacts/live-input.wav");
+        config.sample_rate_hz = 44_100;
+
+        let args = live_capture_cli_args(&config);
+        assert_eq!(
+            args,
+            vec![
+                "42".to_string(),
+                "artifacts/live-input.wav".to_string(),
+                "44100".to_string(),
+                "adapt-stream-rate".to_string(),
+                "warn".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn capture_binary_candidates_include_standard_local_paths() {
+        let candidates = sequoia_capture_binary_candidates();
+        assert!(candidates.contains(&PathBuf::from("target/debug/sequoia_capture")));
+        assert!(candidates.contains(&PathBuf::from("target/release/sequoia_capture")));
     }
 
     #[test]
@@ -3784,6 +4044,32 @@ mod tests {
                 assert_eq!(config.chunk_queue_cap, 4);
                 assert_eq!(config.runtime_mode_label(), "live-chunked");
             }
+        }
+    }
+
+    #[test]
+    fn parse_rejects_model_doctor_with_replay() {
+        let args = vec![
+            "--model-doctor".to_string(),
+            "--replay-jsonl".to_string(),
+            "artifacts/transcribe-live.runtime.jsonl".to_string(),
+        ];
+        match parse_args_from(args.into_iter()) {
+            Ok(_) => panic!("expected parse failure"),
+            Err(err) => assert!(err
+                .to_string()
+                .contains("`--model-doctor` cannot be combined with `--replay-jsonl`")),
+        }
+    }
+
+    #[test]
+    fn parse_rejects_model_doctor_with_preflight() {
+        let args = vec!["--model-doctor".to_string(), "--preflight".to_string()];
+        match parse_args_from(args.into_iter()) {
+            Ok(_) => panic!("expected parse failure"),
+            Err(err) => assert!(err
+                .to_string()
+                .contains("`--model-doctor` cannot be combined with `--preflight`")),
         }
     }
 
