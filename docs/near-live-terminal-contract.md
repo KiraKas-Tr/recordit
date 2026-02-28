@@ -89,6 +89,7 @@ Terminal summary fields must map directly to existing or planned JSONL/manifest 
 
 - `channel_mode_*` -> manifest `channel_mode_requested`, `channel_mode`
 - transcript counts -> JSONL event type counts (`partial`, `final`, `llm_final`)
+- transcript event timeline -> manifest `events[]` and JSONL transcript events (replay-safe ordering)
 - trust/degradation counts -> JSONL `trust_notice` and `mode_degradation`
 - queue counters -> manifest/JSONL cleanup and near-live queue telemetry
 - artifact paths -> runtime output destinations

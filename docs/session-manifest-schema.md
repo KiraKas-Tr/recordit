@@ -47,6 +47,7 @@ Top-level required fields:
   - `transcript`
   - `readability_defaults` (line-format and overlap policy contract)
   - `transcript_per_channel`
+  - `events` (ordered transcript event timeline: `partial`, `final`, `llm_final`, `reconciled_final`)
 - performance/reliability:
   - `benchmark` (`wall_ms_p50/p95`, SLO booleans, summary/runs artifact paths)
   - `chunk_queue` (near-live chunk queue pressure + drop-oldest semantics)

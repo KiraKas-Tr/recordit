@@ -217,6 +217,7 @@ cargo run --bin transcribe-live -- [--asr-model <local-model-path>] [flags...]
   - `--live-chunked` prepares runtime input by launching a live capture session (`sequoia_capture`) and then runs a rolling near-live scheduler over the captured WAV
   - rolling scheduler semantics: `4s` default window, `1s` default stride, deterministic chunk segment IDs, and tail-aligned final window coverage
   - near-live ASR work is routed through a bounded queue; when saturated, oldest queued chunk work is dropped to preserve non-blocking producer behavior
+  - if chunk backlog caused drops, a post-session reconciliation pass emits `reconciled_final` events from canonical session audio to improve final completeness without hiding live-path degradation
   - `--chunk-window-ms` default `4000`
   - `--chunk-stride-ms` default `1000`
   - `--chunk-queue-cap` default `4`
@@ -236,6 +237,7 @@ cargo run --bin transcribe-live -- [--asr-model <local-model-path>] [flags...]
   - merged transcript line format: `[MM:SS.mmm-MM:SS.mmm] <channel>: <text>`
   - per-channel transcript line format: `[MM:SS.mmm-MM:SS.mmm] <text>`
   - near-simultaneous cross-channel finals are deterministic: keep canonical sort order and annotate the later line with `(overlap<=120ms with <channel>)`
+  - runtime manifest persists ordered transcript events (`partial`, `final`, `llm_final`, `reconciled_final`) under `events`
   - runtime manifest includes `readability_defaults` + `transcript_per_channel` entries
 - use `cargo run --bin transcribe-live -- --help` to print the full contract
 - cleanup isolation policy:

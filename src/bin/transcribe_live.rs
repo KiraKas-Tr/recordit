@@ -25,6 +25,7 @@ const LIVE_CAPTURE_CALLBACK_MODE: &str = "warn";
 const LIVE_CAPTURE_INTERRUPTION_RECOVERED_CODE: &str = "live_capture_interruption_recovered";
 const LIVE_CAPTURE_CONTINUITY_UNVERIFIED_CODE: &str = "live_capture_continuity_unverified";
 const LIVE_CHUNK_QUEUE_DROP_OLDEST_CODE: &str = "live_chunk_queue_drop_oldest";
+const RECONCILIATION_APPLIED_CODE: &str = "reconciliation_applied_after_backpressure";
 
 const HELP_TEXT: &str = "\
 transcribe-live
@@ -1062,6 +1063,19 @@ fn run_live_pipeline(config: &TranscribeConfig) -> Result<LiveRunReport, CliErro
     };
     let cleanup_run = run_cleanup_queue(config, &events);
     events.extend(cleanup_run.llm_events);
+    if config.live_chunked && chunk_queue.dropped_oldest > 0 {
+        events.extend(build_reconciliation_events(
+            &first_channel_transcripts,
+            &vad_boundaries,
+        ));
+        degradation_events.push(ModeDegradationEvent {
+            code: RECONCILIATION_APPLIED_CODE,
+            detail: format!(
+                "post-session reconciliation emitted `reconciled_final` events from canonical session audio after {} dropped chunk task(s)",
+                chunk_queue.dropped_oldest
+            ),
+        });
+    }
     let events = merge_transcript_events(events);
     let cleanup_queue = cleanup_run.telemetry;
     degradation_events.extend(collect_live_capture_continuity_events(config));
@@ -1485,6 +1499,40 @@ fn build_live_chunked_events_with_queue(
     run_live_chunk_queue(tasks, chunk_queue_cap)
 }
 
+fn build_reconciliation_events(
+    channel_transcripts: &[ChannelTranscriptSummary],
+    vad_boundaries: &[VadBoundary],
+) -> Vec<TranscriptEvent> {
+    channel_transcripts
+        .iter()
+        .flat_map(|transcript| {
+            build_transcript_events(
+                &transcript.text,
+                vad_boundaries,
+                &transcript.label,
+                transcript.role,
+                false,
+                DEFAULT_CHUNK_WINDOW_MS,
+                DEFAULT_CHUNK_STRIDE_MS,
+            )
+        })
+        .filter_map(|event| {
+            if event.event_type != "final" {
+                return None;
+            }
+            Some(TranscriptEvent {
+                event_type: "reconciled_final",
+                channel: event.channel,
+                segment_id: format!("{}-reconciled", event.segment_id),
+                start_ms: event.start_ms,
+                end_ms: event.end_ms,
+                text: event.text,
+                source_final_segment_id: None,
+            })
+        })
+        .collect()
+}
+
 fn run_live_chunk_queue(tasks: Vec<LiveChunkTask>, chunk_queue_cap: usize) -> LiveChunkBuildResult {
     let mut telemetry = LiveChunkQueueTelemetry::enabled(chunk_queue_cap);
     let mut events = Vec::with_capacity(tasks.len() * 2);
@@ -1645,8 +1693,9 @@ fn event_type_rank(event_type: &str) -> u8 {
     match event_type {
         "partial" => 0,
         "final" => 1,
-        "llm_final" => 2,
-        _ => 3,
+        "reconciled_final" => 2,
+        "llm_final" => 3,
+        _ => 4,
     }
 }
 
@@ -1730,9 +1779,17 @@ fn reconstruct_transcript_per_channel(
 }
 
 fn final_events_for_display<'a>(events: &'a [TranscriptEvent]) -> Vec<&'a TranscriptEvent> {
+    let has_reconciled = events
+        .iter()
+        .any(|event| event.event_type == "reconciled_final");
+    let display_event_type = if has_reconciled {
+        "reconciled_final"
+    } else {
+        "final"
+    };
     let mut finals = events
         .iter()
-        .filter(|event| event.event_type == "final")
+        .filter(|event| event.event_type == display_event_type)
         .collect::<Vec<_>>();
     finals.sort_by(|a, b| {
         a.start_ms
@@ -1829,6 +1886,17 @@ fn build_trust_notices(
                         "Increase `--chunk-queue-cap` (current={}) or reduce near-live load to lower backlog pressure.",
                         chunk_queue.max_queue
                     ),
+                });
+            }
+            RECONCILIATION_APPLIED_CODE => {
+                notices.push(TrustNotice {
+                    code: "reconciliation_applied".to_string(),
+                    severity: "warn".to_string(),
+                    cause: degradation.detail.clone(),
+                    impact:
+                        "final transcript completeness was improved after capture via reconciliation; live event stream may have dropped backlog chunks under pressure".to_string(),
+                    guidance:
+                        "Use `reconciled_final` events for canonical post-session completeness and keep near-live events for real-time provenance.".to_string(),
                 });
             }
             _ => {
@@ -2966,12 +3034,38 @@ fn print_live_report(report: &LiveRunReport) {
             boundary.id, boundary.start_ms, boundary.end_ms, boundary.source
         );
     }
-    println!("  terminal_event_stream:");
-    for event in &report.events {
+    println!("  terminal_transcript_stream:");
+    let mut emitted_terminal_lines = 0usize;
+    for event in report
+        .events
+        .iter()
+        .filter(|event| {
+            event.event_type == "final"
+                || event.event_type == "llm_final"
+                || event.event_type == "reconciled_final"
+        })
+    {
+        let cleaned = event.text.trim();
+        if cleaned.is_empty() {
+            continue;
+        }
+        let suffix = match event.event_type {
+            "llm_final" => " [llm_final]",
+            "reconciled_final" => " [reconciled_final]",
+            _ => "",
+        };
+        emitted_terminal_lines += 1;
         println!(
-            "    {} channel={} [{}-{}ms] {}",
-            event.event_type, event.channel, event.start_ms, event.end_ms, event.text
+            "    [{}-{}] {}: {}{}",
+            format_timestamp(event.start_ms),
+            format_timestamp(event.end_ms),
+            event.channel,
+            cleaned,
+            suffix
         );
+    }
+    if emitted_terminal_lines == 0 {
+        println!("    <no stable transcript events>");
     }
     println!("  degradation_events: {}", report.degradation_events.len());
     for event in &report.degradation_events {
@@ -3325,6 +3419,38 @@ fn write_runtime_manifest(
         .map_err(io_to_cli)?;
     }
     writeln!(file, "  ],").map_err(io_to_cli)?;
+    writeln!(file, "  \"events\": [").map_err(io_to_cli)?;
+    for (idx, event) in report.events.iter().enumerate() {
+        if let Some(source_segment_id) = &event.source_final_segment_id {
+            writeln!(
+                file,
+                "    {{\"event_type\":\"{}\",\"channel\":\"{}\",\"segment_id\":\"{}\",\"source_final_segment_id\":\"{}\",\"start_ms\":{},\"end_ms\":{},\"text\":\"{}\"}}{}",
+                json_escape(event.event_type),
+                json_escape(&event.channel),
+                json_escape(&event.segment_id),
+                json_escape(source_segment_id),
+                event.start_ms,
+                event.end_ms,
+                json_escape(&event.text),
+                if idx + 1 == report.events.len() { "" } else { "," }
+            )
+            .map_err(io_to_cli)?;
+        } else {
+            writeln!(
+                file,
+                "    {{\"event_type\":\"{}\",\"channel\":\"{}\",\"segment_id\":\"{}\",\"start_ms\":{},\"end_ms\":{},\"text\":\"{}\"}}{}",
+                json_escape(event.event_type),
+                json_escape(&event.channel),
+                json_escape(&event.segment_id),
+                event.start_ms,
+                event.end_ms,
+                json_escape(&event.text),
+                if idx + 1 == report.events.len() { "" } else { "," }
+            )
+            .map_err(io_to_cli)?;
+        }
+    }
+    writeln!(file, "  ],").map_err(io_to_cli)?;
     writeln!(
         file,
         "  \"benchmark\": {{\"run_count\":{},\"wall_ms_p50\":{:.6},\"wall_ms_p95\":{:.6},\"partial_slo_met\":{},\"final_slo_met\":{},\"summary_csv\":\"{}\",\"runs_csv\":\"{}\"}},",
@@ -3465,7 +3591,11 @@ fn replay_timeline(path: &Path) -> Result<(), CliError> {
             }
             continue;
         }
-        if event_type != "partial" && event_type != "final" {
+        if event_type != "partial"
+            && event_type != "final"
+            && event_type != "llm_final"
+            && event_type != "reconciled_final"
+        {
             continue;
         }
 
@@ -3490,10 +3620,11 @@ fn replay_timeline(path: &Path) -> Result<(), CliError> {
                 line_no + 1
             ))
         })?;
-        let event_name = if event_type == "partial" {
-            "partial"
-        } else {
-            "final"
+        let event_name = match event_type.as_str() {
+            "partial" => "partial",
+            "llm_final" => "llm_final",
+            "reconciled_final" => "reconciled_final",
+            _ => "final",
         };
         events.push(TranscriptEvent {
             event_type: event_name,
@@ -4510,10 +4641,11 @@ mod tests {
         materialize_out_wav, merge_transcript_events, model_checksum_info, parse_args_from,
         parse_trust_notice, prepare_channel_inputs, reconstruct_transcript,
         reconstruct_transcript_per_channel, resolve_model_path, run_cleanup_queue_with,
-        run_live_chunk_queue, sequoia_capture_binary_candidates, AsrBackend, ChannelMode,
-        CleanupAttemptOutcome, CleanupQueueTelemetry, CleanupTaskStatus, LiveChunkQueueTelemetry,
-        LiveChunkTask, ModeDegradationEvent, ParseOutcome, ResolvedModelPath, TranscribeConfig,
-        TranscriptEvent, VadBoundary, HELP_TEXT, LIVE_CHUNK_QUEUE_DROP_OLDEST_CODE,
+        run_live_chunk_queue, sequoia_capture_binary_candidates, write_runtime_manifest,
+        AsrBackend, BenchmarkSummary, ChannelMode, CleanupAttemptOutcome, CleanupQueueTelemetry,
+        CleanupTaskStatus, LiveChunkQueueTelemetry, LiveChunkTask, LiveRunReport,
+        ModeDegradationEvent, ParseOutcome, ResolvedModelPath, TranscribeConfig, TranscriptEvent,
+        VadBoundary, HELP_TEXT, LIVE_CHUNK_QUEUE_DROP_OLDEST_CODE, RECONCILIATION_APPLIED_CODE,
     };
     use hound::{SampleFormat, WavSpec, WavWriter};
     use std::env;
@@ -4840,6 +4972,26 @@ mod tests {
     }
 
     #[test]
+    fn trust_notice_builder_emits_reconciliation_notice() {
+        let config = TranscribeConfig::default();
+        let cleanup = CleanupQueueTelemetry::disabled(&config);
+        let chunk_queue = LiveChunkQueueTelemetry::disabled(&config);
+        let notices = build_trust_notices(
+            ChannelMode::Separate,
+            ChannelMode::Separate,
+            &[ModeDegradationEvent {
+                code: RECONCILIATION_APPLIED_CODE,
+                detail: "post-session reconciliation emitted reconciled_final events".to_string(),
+            }],
+            &cleanup,
+            &chunk_queue,
+        );
+        assert!(notices
+            .iter()
+            .any(|notice| notice.code == "reconciliation_applied"));
+    }
+
+    #[test]
     fn live_chunk_queue_drops_oldest_queued_tasks_under_pressure() {
         let result = run_live_chunk_queue(
             vec![
@@ -5036,6 +5188,33 @@ mod tests {
                 ("final", "system"),
             ]
         );
+    }
+
+    #[test]
+    fn reconstructed_transcript_prefers_reconciled_final_events_when_present() {
+        let events = vec![
+            TranscriptEvent {
+                event_type: "final",
+                channel: "mic".to_string(),
+                segment_id: "mic-chunk-0000".to_string(),
+                start_ms: 0,
+                end_ms: 2_000,
+                text: "incomplete".to_string(),
+                source_final_segment_id: None,
+            },
+            TranscriptEvent {
+                event_type: "reconciled_final",
+                channel: "mic".to_string(),
+                segment_id: "mic-reconciled".to_string(),
+                start_ms: 0,
+                end_ms: 2_000,
+                text: "complete transcript".to_string(),
+                source_final_segment_id: None,
+            },
+        ];
+        let transcript = reconstruct_transcript(&events);
+        assert!(transcript.contains("complete transcript"));
+        assert!(!transcript.contains("incomplete"));
     }
 
     #[test]
@@ -5383,6 +5562,66 @@ mod tests {
         let checksum = model_checksum_info(None);
         assert_eq!(checksum.status, "unavailable_unresolved");
         assert_eq!(checksum.sha256, "<unavailable>");
+    }
+
+    #[test]
+    fn runtime_manifest_includes_ordered_event_timeline() {
+        let temp_dir = write_temp_dir("recordit-runtime-manifest-events");
+        let input_wav = temp_dir.join("input.wav");
+        let out_wav = temp_dir.join("session.wav");
+        let out_jsonl = temp_dir.join("session.jsonl");
+        let out_manifest = temp_dir.join("session.manifest.json");
+        File::create(&input_wav).unwrap();
+        File::create(&out_wav).unwrap();
+
+        let mut config = TranscribeConfig::default();
+        config.input_wav = input_wav.clone();
+        config.out_wav = out_wav.clone();
+        config.out_jsonl = out_jsonl.clone();
+        config.out_manifest = out_manifest.clone();
+
+        let report = LiveRunReport {
+            generated_at_utc: "2026-02-28T00:00:00Z".to_string(),
+            backend_id: "whispercpp",
+            resolved_model_path: temp_dir.join("model.bin"),
+            resolved_model_source: "test".to_string(),
+            channel_mode: ChannelMode::Separate,
+            active_channel_mode: ChannelMode::Separate,
+            transcript_text: "hello".to_string(),
+            channel_transcripts: vec![super::ChannelTranscriptSummary {
+                role: "mic",
+                label: "mic".to_string(),
+                text: "hello".to_string(),
+            }],
+            vad_boundaries: vec![VadBoundary {
+                id: 0,
+                start_ms: 0,
+                end_ms: 100,
+                source: "energy_threshold",
+            }],
+            events: vec![final_event("mic-0", "mic", "hello world")],
+            degradation_events: Vec::new(),
+            trust_notices: Vec::new(),
+            chunk_queue: LiveChunkQueueTelemetry::disabled(&config),
+            cleanup_queue: CleanupQueueTelemetry::disabled(&config),
+            benchmark: BenchmarkSummary {
+                run_count: 1,
+                wall_ms_p50: 1.0,
+                wall_ms_p95: 1.0,
+                partial_slo_met: true,
+                final_slo_met: true,
+            },
+            benchmark_summary_csv: temp_dir.join("summary.csv"),
+            benchmark_runs_csv: temp_dir.join("runs.csv"),
+        };
+
+        write_runtime_manifest(&config, &report).unwrap();
+        let manifest = fs::read_to_string(&out_manifest).unwrap();
+        assert!(manifest.contains("\"events\": ["));
+        assert!(manifest.contains("\"event_type\":\"final\""));
+        assert!(manifest.contains("\"segment_id\":\"mic-0\""));
+
+        let _ = fs::remove_dir_all(temp_dir);
     }
 
     #[test]
