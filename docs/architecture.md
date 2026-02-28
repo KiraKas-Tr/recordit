@@ -121,6 +121,11 @@ Per chunk:
 - `docs/adr-002-lock-free-transport.md`: callback transport decision and tradeoffs
 - `docs/adr-003-cleanup-boundary-policy.md`: cleanup isolation boundary and auto-disable policy
 
+## Contract Index
+
+- `docs/realtime-contracts.md`: callback, cleanup queue, and recovery matrix contracts
+- `docs/near-live-terminal-contract.md`: near-live terminal concise/verbose profile and deterministic summary contract
+
 ## Evidence Index
 
 - lock-free transport stress evidence:

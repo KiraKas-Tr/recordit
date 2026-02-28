@@ -1,7 +1,7 @@
 # Transcribe Operator Runbook (bd-1yp)
 
 Date: 2026-02-27  
-Scope: signing/entitlements verification, TCC reset workflow, preflight troubleshooting
+Scope: model bootstrap, signing/entitlements verification, TCC reset workflow, preflight troubleshooting
 
 ## Bundle IDs and Paths
 
@@ -11,7 +11,31 @@ Scope: signing/entitlements verification, TCC reset workflow, preflight troubles
 - Evidence artifacts from this runbook validation:
   - `artifacts/ops/bd-1yp/`
 
-## 1) Verify Signing and Entitlements
+## 1) Bootstrap the Default whispercpp Model
+
+Canonical setup command:
+
+```bash
+make setup-whispercpp-model
+```
+
+Default destination path:
+
+- `artifacts/bench/models/whispercpp/ggml-tiny.en.bin`
+
+Expected output includes:
+
+- absolute destination path
+- sha256 digest
+- file size in bytes
+
+If you need a custom destination:
+
+```bash
+scripts/setup_whispercpp_model.sh --dest /absolute/path/to/ggml-tiny.en.bin
+```
+
+## 2) Verify Signing and Entitlements
 
 Build and sign:
 
@@ -48,7 +72,7 @@ Validated outputs:
 - `artifacts/ops/bd-1yp/codesign-entitlements.plist`
 - `artifacts/ops/bd-1yp/transcribe-info-plist.txt`
 
-## 2) Permission Reset and Prompt Workflow
+## 3) Permission Reset and Prompt Workflow
 
 Reset TCC grants for transcribe bundle id:
 
@@ -76,11 +100,12 @@ Expected first-run prompts:
 
 If prompts do not appear after reset, quit the app, rerun the `tccutil reset` commands, and relaunch.
 
-## 3) Preflight Command for Operator Checks
+## 4) Preflight Command for Operator Checks
 
 Debug preflight command:
 
 ```bash
+make setup-whispercpp-model
 make transcribe-preflight ASR_MODEL=artifacts/bench/models/whispercpp/ggml-tiny.en.bin
 ```
 
@@ -93,7 +118,7 @@ Preflight checks include:
 - `microphone_access`
 - `backend_runtime`
 
-## 4) Tested Failure Signatures and Fixes
+## 5) Tested Failure Signatures and Fixes
 
 ### A) Unwritable output path
 
@@ -150,7 +175,7 @@ Evidence:
 - `artifacts/ops/bd-1yp/preflight-moonshine.log`
 - `artifacts/ops/bd-1yp/preflight-moonshine.manifest.json`
 
-## 5) Important Model-Resolution Behavior
+## 6) Important Model-Resolution Behavior
 
 `--asr-model` does not always produce a hard failure if the provided path is missing. The resolver can fall through to backend defaults (for example repo benchmark defaults), so operators should verify the resolved source in preflight detail:
 
@@ -161,10 +186,11 @@ This behavior was observed in:
 - `artifacts/ops/bd-1yp/preflight-missing-model.log`
 - `artifacts/ops/bd-1yp/preflight-missing-model.manifest.json`
 
-## 6) Escalation Checklist
+## 7) Escalation Checklist
 
 1. Re-run preflight and capture manifest/log path.
-2. Confirm `model_path` source and resolved absolute path.
-3. Confirm output paths are writable in current execution context (debug vs signed app).
-4. Reset TCC for `com.recordit.sequoiatranscribe` and relaunch signed preflight.
-5. Re-verify app signature + entitlements if behavior changed after rebuild.
+2. Confirm model bootstrap completed (`make setup-whispercpp-model`).
+3. Confirm `model_path` source and resolved absolute path.
+4. Confirm output paths are writable in current execution context (debug vs signed app).
+5. Reset TCC for `com.recordit.sequoiatranscribe` and relaunch signed preflight.
+6. Re-verify app signature + entitlements if behavior changed after rebuild.

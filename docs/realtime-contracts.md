@@ -43,6 +43,17 @@ Telemetry/artifact surface:
 - runtime JSONL emits a terminal `cleanup_queue` control event
 - runtime manifest persists the same cleanup queue summary under `cleanup_queue`
 
+## Near-Live Terminal UX Contract
+
+Near-live terminal behavior is governed by `docs/near-live-terminal-contract.md`.
+
+Key guarantees from that contract:
+
+1. Concise default output optimized for long-running operator sessions.
+2. Verbose diagnostics is opt-in and must not change runtime semantics.
+3. End-of-session summary fields are deterministic and ordered for consistent human and automated review.
+4. Trust/degradation notices are user-actionable and mapped to machine artifacts.
+
 ## Error to Recovery Matrix
 
 | Error Class | Detection | Recovery Action |

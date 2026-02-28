@@ -21,7 +21,8 @@ TRANSCRIBE_OUT_MANIFEST ?= artifacts/transcribe-live.manifest.json
 TRANSCRIBE_APP_OUT_WAV ?= $(HOME)/Library/Containers/com.recordit.sequoiatranscribe/Data/$(TRANSCRIBE_OUT_WAV)
 TRANSCRIBE_APP_OUT_JSONL ?= $(HOME)/Library/Containers/com.recordit.sequoiatranscribe/Data/$(TRANSCRIBE_OUT_JSONL)
 TRANSCRIBE_APP_OUT_MANIFEST ?= $(HOME)/Library/Containers/com.recordit.sequoiatranscribe/Data/$(TRANSCRIBE_OUT_MANIFEST)
-ASR_MODEL ?= models/ggml-base.en.bin
+WHISPERCPP_MODEL_DEFAULT ?= artifacts/bench/models/whispercpp/ggml-tiny.en.bin
+ASR_MODEL ?= $(WHISPERCPP_MODEL_DEFAULT)
 TRANSCRIBE_ARGS ?=
 PIPELINE_SECS ?= 10
 PIPELINE_CAPTURE_WAV ?= artifacts/capture-transcribe.input.wav
@@ -37,7 +38,7 @@ BENCH_BACKEND ?= noop-cat
 BENCH_CMD ?= cat {input} > /dev/null
 GATE_D_SECONDS ?= 3600
 
-.PHONY: help build build-release probe capture transcribe-live capture-transcribe transcribe-preflight run-transcribe-app run-transcribe-preflight-app bench-harness gate-d-soak bundle bundle-transcribe sign sign-transcribe verify run-app reset-perms clean
+.PHONY: help build build-release probe capture transcribe-live capture-transcribe transcribe-preflight setup-whispercpp-model run-transcribe-app run-transcribe-preflight-app bench-harness gate-d-soak bundle bundle-transcribe sign sign-transcribe verify run-app reset-perms clean
 
 help:
 	@echo "Targets:"
@@ -48,6 +49,7 @@ help:
 	@echo "  transcribe-live   - Validate transcribe-live CLI contract (debug)"
 	@echo "  capture-transcribe - One-command capture then transcription workflow (debug)"
 	@echo "  transcribe-preflight - Run transcribe-live preflight diagnostics (debug)"
+	@echo "  setup-whispercpp-model - Bootstrap default local whispercpp model asset"
 	@echo "  run-transcribe-app - Run signed transcribe-live app bundle"
 	@echo "  run-transcribe-preflight-app - Run signed transcribe-live preflight diagnostics"
 	@echo "  bench-harness - Run benchmark harness and emit machine-readable artifacts"
@@ -89,6 +91,9 @@ capture-transcribe: build
 
 transcribe-preflight: TRANSCRIBE_ARGS += --preflight
 transcribe-preflight: transcribe-live
+
+setup-whispercpp-model:
+	scripts/setup_whispercpp_model.sh --dest "$(abspath $(WHISPERCPP_MODEL_DEFAULT))"
 
 bench-harness: build
 	cargo run --bin benchmark_harness -- --corpus "$(BENCH_CORPUS)" --out-dir "$(BENCH_OUT)" --backend-id "$(BENCH_BACKEND)" --cmd "$(BENCH_CMD)"
