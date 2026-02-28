@@ -161,16 +161,25 @@ cargo run --bin transcribe-live -- [--asr-model <local-model-path>] [flags...]
   - `--llm-timeout-ms`
   - `--llm-max-queue`
   - `--llm-retries`
+  - `--live-chunked`
+  - `--chunk-window-ms`
+  - `--chunk-stride-ms`
+  - `--chunk-queue-cap`
   - `--transcribe-channels`
   - `--speaker-labels`
   - `--benchmark-runs`
   - `--replay-jsonl`
+- `--out-wav` contract:
+  - canonical session WAV artifact path for the run
+  - always materialized on successful runtime execution
+  - in the current representative-runtime phase, materialized from `--input-wav`
 - backend values:
   - `whispercpp` (primary)
   - `whisperkit` (fallback)
   - `moonshine` (placeholder; adapter not wired yet)
 - model resolution precedence:
   - `--asr-model <path>` (explicit override, highest priority)
+  - explicit `--asr-model` is fail-fast: missing/invalid explicit paths do not fall through to defaults
   - `RECORDIT_ASR_MODEL` environment variable
   - backend defaults (sandbox container model path, then repo-local model defaults)
   - whispercpp expects a **file** path; whisperkit expects a **directory** path
@@ -179,6 +188,16 @@ cargo run --bin transcribe-live -- [--asr-model <local-model-path>] [flags...]
   - `separate`
   - `mixed`
   - `mixed-fallback` (prefers separate but falls back to mixed when dual-channel inputs are unavailable)
+- near-live runtime contract:
+  - default runtime mode is `representative-offline`
+  - enable near-live contract with `--live-chunked` (downstream implementation path)
+  - current behavior for `--live-chunked`: fail fast with explicit remediation until near-live runtime tasks land
+  - `--chunk-window-ms` default `4000`
+  - `--chunk-stride-ms` default `1000`
+  - `--chunk-queue-cap` default `4`
+  - `--chunk-stride-ms` must be `<= --chunk-window-ms`
+  - chunk tuning flags require `--live-chunked`
+  - `--live-chunked` is incompatible with `--replay-jsonl` and `--preflight`
 - mode/degradation artifact policy:
   - runtime manifest records both `channel_mode_requested` and active `channel_mode`
   - runtime JSONL emits `event_type=mode_degradation` when fallback/degradation occurs

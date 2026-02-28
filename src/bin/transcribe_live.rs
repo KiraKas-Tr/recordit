@@ -15,6 +15,10 @@ use std::time::{Duration, Instant};
 const PARTIAL_LATENCY_SLO_MS: f64 = 1_500.0;
 const FINAL_LATENCY_SLO_MS: f64 = 2_500.0;
 const OVERLAP_WINDOW_MS: u64 = 120;
+const OUT_WAV_SEMANTICS: &str = "canonical session WAV artifact for the run";
+const DEFAULT_CHUNK_WINDOW_MS: u64 = 4_000;
+const DEFAULT_CHUNK_STRIDE_MS: u64 = 1_000;
+const DEFAULT_CHUNK_QUEUE_CAP: usize = 4;
 
 const HELP_TEXT: &str = "\
 transcribe-live
@@ -27,7 +31,7 @@ Usage:
 Options:
   --duration-sec <seconds>        Capture duration in seconds (default: 10)
   --input-wav <path>              Representative WAV used for current runtime path (auto-generated if missing; default: artifacts/bench/corpus/gate_a/tts_phrase.wav)
-  --out-wav <path>                Output WAV artifact path (default: artifacts/transcribe-live.wav)
+  --out-wav <path>                Canonical session WAV artifact path (always materialized on success; default: artifacts/transcribe-live.wav)
   --out-jsonl <path>              Output JSONL transcript path (default: artifacts/transcribe-live.jsonl)
   --out-manifest <path>           Output session manifest path (default: artifacts/transcribe-live.manifest.json)
   --sample-rate <hz>              Capture sample rate in Hz (default: 48000)
@@ -46,9 +50,14 @@ Options:
   --llm-timeout-ms <ms>           Cleanup timeout in milliseconds (default: 1000)
   --llm-max-queue <n>             Max queued cleanup requests (default: 32)
   --llm-retries <n>               Retry count for failed cleanup requests (default: 0)
+  --live-chunked                  Select the near-live chunk pipeline contract
+  --chunk-window-ms <ms>          Near-live chunk window in milliseconds (default: 4000; requires --live-chunked)
+  --chunk-stride-ms <ms>          Near-live chunk stride in milliseconds (default: 1000; requires --live-chunked)
+  --chunk-queue-cap <n>           Bounded near-live ASR work queue capacity (default: 4; requires --live-chunked)
   --transcribe-channels <mode>    Channel mode: separate | mixed | mixed-fallback (default: separate)
   --speaker-labels <mic,system>   Comma-separated labels for the two channels (default: mic,system)
   --benchmark-runs <n>            Number of representative latency benchmark runs (default: 3)
+  --model-doctor                  Run model/backend diagnostics and exit
   --replay-jsonl <path>           Replay transcript timeline from a prior JSONL artifact
   --preflight                     Run structured preflight diagnostics and write manifest
   -h, --help                      Show this help text
@@ -57,6 +66,8 @@ Examples:
   transcribe-live --asr-model artifacts/bench/models/whispercpp/ggml-tiny.en.bin
   transcribe-live --asr-backend whisperkit --asr-model artifacts/bench/models/whisperkit/models/argmaxinc/whisperkit-coreml/openai_whisper-tiny --transcribe-channels mixed
   transcribe-live --input-wav artifacts/bench/corpus/gate_a/tts_phrase.wav --asr-model artifacts/bench/models/whispercpp/ggml-tiny.en.bin --llm-cleanup --llm-endpoint http://127.0.0.1:8080/v1/chat/completions --llm-model llama3.2:3b
+  transcribe-live --live-chunked --chunk-window-ms 4000 --chunk-stride-ms 1000 --chunk-queue-cap 4 --asr-model artifacts/bench/models/whispercpp/ggml-tiny.en.bin
+  transcribe-live --model-doctor --asr-backend whispercpp
   transcribe-live --replay-jsonl artifacts/transcribe-live.runtime.jsonl
   transcribe-live --preflight --asr-model models/ggml-base.en.bin
 ";
@@ -238,9 +249,14 @@ struct TranscribeConfig {
     llm_timeout_ms: u64,
     llm_max_queue: usize,
     llm_retries: usize,
+    live_chunked: bool,
+    chunk_window_ms: u64,
+    chunk_stride_ms: u64,
+    chunk_queue_cap: usize,
     channel_mode: ChannelMode,
     speaker_labels: SpeakerLabels,
     benchmark_runs: usize,
+    model_doctor: bool,
     replay_jsonl: Option<PathBuf>,
     preflight: bool,
 }
@@ -269,12 +285,17 @@ impl Default for TranscribeConfig {
             llm_timeout_ms: 1_000,
             llm_max_queue: 32,
             llm_retries: 0,
+            live_chunked: false,
+            chunk_window_ms: DEFAULT_CHUNK_WINDOW_MS,
+            chunk_stride_ms: DEFAULT_CHUNK_STRIDE_MS,
+            chunk_queue_cap: DEFAULT_CHUNK_QUEUE_CAP,
             channel_mode: ChannelMode::Separate,
             speaker_labels: SpeakerLabels {
                 mic: "mic".to_owned(),
                 system: "system".to_owned(),
             },
             benchmark_runs: 3,
+            model_doctor: false,
             replay_jsonl: None,
             preflight: false,
         }
@@ -327,6 +348,30 @@ impl TranscribeConfig {
             return Err(CliError::new("`--llm-max-queue` must be greater than zero"));
         }
 
+        if self.chunk_window_ms == 0 {
+            return Err(CliError::new(
+                "`--chunk-window-ms` must be greater than zero",
+            ));
+        }
+
+        if self.chunk_stride_ms == 0 {
+            return Err(CliError::new(
+                "`--chunk-stride-ms` must be greater than zero",
+            ));
+        }
+
+        if self.chunk_stride_ms > self.chunk_window_ms {
+            return Err(CliError::new(
+                "`--chunk-stride-ms` must be less than or equal to `--chunk-window-ms`; keep the stride inside the rolling window",
+            ));
+        }
+
+        if self.chunk_queue_cap == 0 {
+            return Err(CliError::new(
+                "`--chunk-queue-cap` must be greater than zero",
+            ));
+        }
+
         if self.benchmark_runs == 0 {
             return Err(CliError::new(
                 "`--benchmark-runs` must be greater than zero",
@@ -346,11 +391,77 @@ impl TranscribeConfig {
             }
         }
 
+        if !self.live_chunked
+            && (self.chunk_window_ms != DEFAULT_CHUNK_WINDOW_MS
+                || self.chunk_stride_ms != DEFAULT_CHUNK_STRIDE_MS
+                || self.chunk_queue_cap != DEFAULT_CHUNK_QUEUE_CAP)
+        {
+            return Err(CliError::new(
+                "`--chunk-window-ms`, `--chunk-stride-ms`, and `--chunk-queue-cap` require `--live-chunked`; omit them for representative offline runs",
+            ));
+        }
+
+        if self.live_chunked && self.replay_jsonl.is_some() {
+            return Err(CliError::new(
+                "`--live-chunked` cannot be combined with `--replay-jsonl`; replay reads a completed artifact instead of configuring a live runtime",
+            ));
+        }
+
+        if self.live_chunked && self.preflight {
+            return Err(CliError::new(
+                "`--live-chunked` cannot be combined with `--preflight`; run preflight first, then start the near-live runtime separately",
+            ));
+        }
+
+        if self.model_doctor && self.replay_jsonl.is_some() {
+            return Err(CliError::new(
+                "`--model-doctor` cannot be combined with `--replay-jsonl`; doctor validates runtime prerequisites while replay consumes existing artifacts",
+            ));
+        }
+
+        if self.model_doctor && self.preflight {
+            return Err(CliError::new(
+                "`--model-doctor` cannot be combined with `--preflight`; run either diagnostics mode separately",
+            ));
+        }
+
         validate_output_path("--out-wav", &self.out_wav)?;
         validate_output_path("--out-jsonl", &self.out_jsonl)?;
         validate_output_path("--out-manifest", &self.out_manifest)?;
 
         Ok(())
+    }
+
+    fn runtime_mode_label(&self) -> &'static str {
+        if self.live_chunked {
+            "live-chunked"
+        } else {
+            "representative-offline"
+        }
+    }
+
+    fn live_mode_summary_lines(&self) -> [String; 5] {
+        let inactive_suffix = if self.live_chunked {
+            ""
+        } else {
+            " (inactive; enable with --live-chunked)"
+        };
+        [
+            format!("  runtime_mode: {}", self.runtime_mode_label()),
+            format!("  live_chunked: {}", self.live_chunked),
+            format!(
+                "  chunk_window_ms: {}{}",
+                self.chunk_window_ms, inactive_suffix
+            ),
+            format!(
+                "  chunk_stride_ms: {}{}",
+                self.chunk_stride_ms, inactive_suffix
+            ),
+            format!(
+                "  chunk_queue_cap: {}{}",
+                self.chunk_queue_cap, inactive_suffix
+            ),
+        ]
     }
 
     fn print_summary(&self) {
@@ -391,9 +502,13 @@ impl TranscribeConfig {
         println!("  llm_timeout_ms: {}", self.llm_timeout_ms);
         println!("  llm_max_queue: {}", self.llm_max_queue);
         println!("  llm_retries: {}", self.llm_retries);
+        for line in self.live_mode_summary_lines() {
+            println!("{line}");
+        }
         println!("  transcribe_channels: {}", self.channel_mode);
         println!("  speaker_labels: {}", self.speaker_labels);
         println!("  benchmark_runs: {}", self.benchmark_runs);
+        println!("  model_doctor: {}", self.model_doctor);
         println!(
             "  replay_jsonl: {}",
             self.replay_jsonl
@@ -795,8 +910,15 @@ fn select_adapter(backend: AsrBackend) -> Result<Box<dyn AsrAdapter>, CliError> 
 }
 
 fn run_live_pipeline(config: &TranscribeConfig) -> Result<LiveRunReport, CliError> {
+    if config.live_chunked {
+        return Err(CliError::new(
+            "`--live-chunked` now has a locked CLI contract, but the near-live runtime path is not implemented yet; omit `--live-chunked` for representative offline runs until the follow-up live pipeline tasks land",
+        ));
+    }
+
     let resolved_model = validate_model_path_for_backend(config)?;
     prepare_input_wav(&config.input_wav)?;
+    materialize_out_wav(&config.input_wav, &config.out_wav)?;
 
     let generated_at_utc = command_stdout("date", &["-u", "+%Y-%m-%dT%H:%M:%SZ"])
         .unwrap_or_else(|_| "unknown".to_string());
@@ -1752,18 +1874,28 @@ fn validate_model_path_for_backend(
         AsrBackend::WhisperCpp => {
             if !resolved.path.is_file() {
                 return Err(CliError::new(format!(
-                    "`--asr-backend whispercpp` expects a model file path, got {} (resolved via {})",
+                    "`--asr-backend whispercpp` expects a model file path, got {} (resolved via {}). Remediation: pass a valid file path{}",
                     display_path(&resolved.path),
-                    resolved.source
+                    resolved.source,
+                    if resolved.source == "cli --asr-model" {
+                        " or omit `--asr-model` to allow default resolution"
+                    } else {
+                        ""
+                    }
                 )));
             }
         }
         AsrBackend::WhisperKit => {
             if !resolved.path.is_dir() {
                 return Err(CliError::new(format!(
-                    "`--asr-backend whisperkit` expects a model directory path, got {} (resolved via {})",
+                    "`--asr-backend whisperkit` expects a model directory path, got {} (resolved via {}). Remediation: pass a valid directory path{}",
                     display_path(&resolved.path),
-                    resolved.source
+                    resolved.source,
+                    if resolved.source == "cli --asr-model" {
+                        " or omit `--asr-model` to allow default resolution"
+                    } else {
+                        ""
+                    }
                 )));
             }
         }
@@ -1773,10 +1905,24 @@ fn validate_model_path_for_backend(
 }
 
 fn resolve_model_path(config: &TranscribeConfig) -> Result<ResolvedModelPath, CliError> {
-    let mut candidates: Vec<(PathBuf, String)> = Vec::new();
     if !config.asr_model.as_os_str().is_empty() {
-        candidates.push((config.asr_model.clone(), "cli --asr-model".to_string()));
+        let resolved = absolutize_candidate(config.asr_model.clone());
+        if !resolved.exists() {
+            return Err(CliError::new(format!(
+                "explicit `--asr-model` path does not exist: {}. Expected {} for backend `{}`. Remediation: pass a valid {} path or omit `--asr-model` to allow default resolution.",
+                display_path(&resolved),
+                expected_model_kind(config.asr_backend),
+                config.asr_backend,
+                expected_model_kind(config.asr_backend)
+            )));
+        }
+        return Ok(ResolvedModelPath {
+            path: resolved,
+            source: "cli --asr-model".to_string(),
+        });
     }
+
+    let mut candidates: Vec<(PathBuf, String)> = Vec::new();
     if let Ok(env_model) = env::var("RECORDIT_ASR_MODEL") {
         if !env_model.trim().is_empty() {
             candidates.push((
@@ -1906,6 +2052,37 @@ fn prepare_input_wav(path: &Path) -> Result<(), CliError> {
             display_path(path)
         )));
     }
+    Ok(())
+}
+
+fn materialize_out_wav(input_wav: &Path, out_wav: &Path) -> Result<(), CliError> {
+    let same_output = match (fs::canonicalize(input_wav), fs::canonicalize(out_wav)) {
+        (Ok(lhs), Ok(rhs)) => lhs == rhs,
+        _ => {
+            absolutize_candidate(input_wav.to_path_buf())
+                == absolutize_candidate(out_wav.to_path_buf())
+        }
+    };
+    if same_output {
+        return Ok(());
+    }
+
+    if let Some(parent) = out_wav.parent() {
+        fs::create_dir_all(parent).map_err(|err| {
+            CliError::new(format!(
+                "failed to create out-wav directory {}: {err}",
+                parent.display()
+            ))
+        })?;
+    }
+
+    fs::copy(input_wav, out_wav).map_err(|err| {
+        CliError::new(format!(
+            "failed to materialize canonical out-wav {} from input {}: {err}",
+            display_path(out_wav),
+            display_path(input_wav)
+        ))
+    })?;
     Ok(())
 }
 
@@ -2172,6 +2349,7 @@ fn print_live_report(report: &LiveRunReport) {
         "  benchmark_runs_csv: {}",
         report.benchmark_runs_csv.display()
     );
+    println!("  out_wav_semantics: {OUT_WAV_SEMANTICS}");
     println!("  vad_boundaries: {}", report.vad_boundaries.len());
     for boundary in &report.vad_boundaries {
         println!(
@@ -2400,6 +2578,18 @@ fn write_runtime_manifest(
     .map_err(io_to_cli)?;
     writeln!(
         file,
+        "  \"out_wav\": \"{}\",",
+        json_escape(&display_path(&config.out_wav))
+    )
+    .map_err(io_to_cli)?;
+    writeln!(
+        file,
+        "  \"out_wav_semantics\": \"{}\",",
+        json_escape(OUT_WAV_SEMANTICS)
+    )
+    .map_err(io_to_cli)?;
+    writeln!(
+        file,
         "  \"channel_mode\": \"{}\",",
         json_escape(&report.active_channel_mode.to_string())
     )
@@ -2408,6 +2598,21 @@ fn write_runtime_manifest(
         file,
         "  \"channel_mode_requested\": \"{}\",",
         json_escape(&report.channel_mode.to_string())
+    )
+    .map_err(io_to_cli)?;
+    writeln!(
+        file,
+        "  \"runtime_mode\": \"{}\",",
+        json_escape(config.runtime_mode_label())
+    )
+    .map_err(io_to_cli)?;
+    writeln!(
+        file,
+        "  \"live_config\": {{\"live_chunked\":{},\"chunk_window_ms\":{},\"chunk_stride_ms\":{},\"chunk_queue_cap\":{}}},",
+        config.live_chunked,
+        config.chunk_window_ms,
+        config.chunk_stride_ms,
+        config.chunk_queue_cap
     )
     .map_err(io_to_cli)?;
     writeln!(
@@ -2781,9 +2986,9 @@ fn main() -> ExitCode {
                     }
                 }
 
+                config.print_summary();
                 match run_live_pipeline(&config) {
                     Ok(run_report) => {
-                        config.print_summary();
                         print_live_report(&run_report);
                         ExitCode::SUCCESS
                     }
@@ -2804,8 +3009,12 @@ fn main() -> ExitCode {
 }
 
 fn parse_args() -> Result<ParseOutcome, CliError> {
+    parse_args_from(env::args().skip(1))
+}
+
+fn parse_args_from(args: impl Iterator<Item = String>) -> Result<ParseOutcome, CliError> {
     let mut config = TranscribeConfig::default();
-    let mut args = env::args().skip(1);
+    let mut args = args;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -2891,6 +3100,27 @@ fn parse_args() -> Result<ParseOutcome, CliError> {
             "--llm-retries" => {
                 config.llm_retries =
                     parse_usize(&read_value(&mut args, "--llm-retries")?, "--llm-retries")?;
+            }
+            "--live-chunked" => {
+                config.live_chunked = true;
+            }
+            "--chunk-window-ms" => {
+                config.chunk_window_ms = parse_u64(
+                    &read_value(&mut args, "--chunk-window-ms")?,
+                    "--chunk-window-ms",
+                )?;
+            }
+            "--chunk-stride-ms" => {
+                config.chunk_stride_ms = parse_u64(
+                    &read_value(&mut args, "--chunk-stride-ms")?,
+                    "--chunk-stride-ms",
+                )?;
+            }
+            "--chunk-queue-cap" => {
+                config.chunk_queue_cap = parse_usize(
+                    &read_value(&mut args, "--chunk-queue-cap")?,
+                    "--chunk-queue-cap",
+                )?;
             }
             "--transcribe-channels" => {
                 config.channel_mode =
@@ -3331,6 +3561,12 @@ fn write_preflight_manifest(
     .map_err(io_to_cli)?;
     writeln!(
         file,
+        "    \"out_wav_semantics\": \"{}\",",
+        json_escape(OUT_WAV_SEMANTICS)
+    )
+    .map_err(io_to_cli)?;
+    writeln!(
+        file,
         "    \"out_jsonl\": \"{}\",",
         json_escape(&display_path(&config.out_jsonl))
     )
@@ -3365,6 +3601,16 @@ fn write_preflight_manifest(
         json_escape(resolved_model_source)
     )
     .map_err(io_to_cli)?;
+    writeln!(
+        file,
+        "    \"runtime_mode\": \"{}\",",
+        json_escape(config.runtime_mode_label())
+    )
+    .map_err(io_to_cli)?;
+    writeln!(file, "    \"live_chunked\": {},", config.live_chunked).map_err(io_to_cli)?;
+    writeln!(file, "    \"chunk_window_ms\": {},", config.chunk_window_ms).map_err(io_to_cli)?;
+    writeln!(file, "    \"chunk_stride_ms\": {},", config.chunk_stride_ms).map_err(io_to_cli)?;
+    writeln!(file, "    \"chunk_queue_cap\": {},", config.chunk_queue_cap).map_err(io_to_cli)?;
     writeln!(file, "    \"sample_rate_hz\": {}", config.sample_rate_hz).map_err(io_to_cli)?;
     writeln!(file, "  }},").map_err(io_to_cli)?;
     writeln!(file, "  \"checks\": [").map_err(io_to_cli)?;
@@ -3439,11 +3685,11 @@ fn command_stdout(program: &str, args: &[&str]) -> Result<String, CliError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_trust_notices, detect_vad_boundaries, merge_transcript_events, parse_trust_notice,
-        prepare_channel_inputs, reconstruct_transcript, reconstruct_transcript_per_channel,
-        resolve_model_path, run_cleanup_queue_with, AsrBackend, ChannelMode, CleanupAttemptOutcome,
-        CleanupQueueTelemetry, CleanupTaskStatus, ModeDegradationEvent, TranscribeConfig,
-        TranscriptEvent,
+        build_trust_notices, detect_vad_boundaries, materialize_out_wav, merge_transcript_events,
+        parse_args_from, parse_trust_notice, prepare_channel_inputs, reconstruct_transcript,
+        reconstruct_transcript_per_channel, resolve_model_path, run_cleanup_queue_with, AsrBackend,
+        ChannelMode, CleanupAttemptOutcome, CleanupQueueTelemetry, CleanupTaskStatus,
+        ModeDegradationEvent, ParseOutcome, TranscribeConfig, TranscriptEvent, HELP_TEXT,
     };
     use hound::{SampleFormat, WavSpec, WavWriter};
     use std::env;
@@ -3479,6 +3725,66 @@ mod tests {
             ChannelMode::parse("mixed-fallback").unwrap(),
             ChannelMode::MixedFallback
         ));
+    }
+
+    #[test]
+    fn help_text_documents_live_chunk_contract_flags() {
+        assert!(HELP_TEXT.contains("--live-chunked"));
+        assert!(HELP_TEXT.contains("--chunk-window-ms"));
+        assert!(HELP_TEXT.contains("--chunk-stride-ms"));
+        assert!(HELP_TEXT.contains("--chunk-queue-cap"));
+    }
+
+    #[test]
+    fn parse_rejects_chunk_overrides_without_live_chunked() {
+        let args = vec![
+            "--chunk-window-ms".to_string(),
+            "5000".to_string(),
+            "--asr-model".to_string(),
+            "artifacts/bench/models/whispercpp/ggml-tiny.en.bin".to_string(),
+        ];
+        match parse_args_from(args.into_iter()) {
+            Ok(_) => panic!("expected parse failure"),
+            Err(err) => assert!(err.to_string().contains("require `--live-chunked`")),
+        }
+    }
+
+    #[test]
+    fn parse_rejects_live_chunked_with_replay() {
+        let args = vec![
+            "--live-chunked".to_string(),
+            "--replay-jsonl".to_string(),
+            "artifacts/transcribe-live.runtime.jsonl".to_string(),
+        ];
+        match parse_args_from(args.into_iter()) {
+            Ok(_) => panic!("expected parse failure"),
+            Err(err) => assert!(err
+                .to_string()
+                .contains("cannot be combined with `--replay-jsonl`")),
+        }
+    }
+
+    #[test]
+    fn parse_accepts_live_chunked_contract_values() {
+        let args = vec![
+            "--live-chunked".to_string(),
+            "--chunk-window-ms".to_string(),
+            "4000".to_string(),
+            "--chunk-stride-ms".to_string(),
+            "1000".to_string(),
+            "--chunk-queue-cap".to_string(),
+            "4".to_string(),
+        ];
+        match parse_args_from(args.into_iter()).unwrap() {
+            ParseOutcome::Help => panic!("expected config parse outcome"),
+            ParseOutcome::Config(config) => {
+                assert!(config.live_chunked);
+                assert_eq!(config.chunk_window_ms, 4000);
+                assert_eq!(config.chunk_stride_ms, 1000);
+                assert_eq!(config.chunk_queue_cap, 4);
+                assert_eq!(config.runtime_mode_label(), "live-chunked");
+            }
+        }
     }
 
     #[test]
@@ -3710,6 +4016,29 @@ mod tests {
     }
 
     #[test]
+    fn out_wav_is_materialized_when_output_differs_from_input() {
+        let input_wav = write_test_mono_wav();
+        let temp_dir = write_temp_dir("recordit-out-wav-copy");
+        let out_wav = temp_dir.join("nested").join("session.wav");
+
+        materialize_out_wav(&input_wav, &out_wav).unwrap();
+
+        assert!(out_wav.exists());
+        assert_eq!(fs::read(&input_wav).unwrap(), fs::read(&out_wav).unwrap());
+
+        let _ = fs::remove_file(input_wav);
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn out_wav_materialization_is_noop_for_same_path() {
+        let input_wav = write_test_mono_wav();
+        materialize_out_wav(&input_wav, &input_wav).unwrap();
+        assert!(input_wav.exists());
+        let _ = fs::remove_file(input_wav);
+    }
+
+    #[test]
     fn cleanup_queue_drops_when_full_without_blocking() {
         let mut config = TranscribeConfig::default();
         config.llm_cleanup = true;
@@ -3891,6 +4220,32 @@ mod tests {
             fs::canonicalize(&default_model).unwrap()
         );
         assert_eq!(resolved.source, "repo benchmark default");
+
+        restore_env_state(original_cwd, original_env);
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn model_resolution_fails_fast_for_missing_explicit_cli_model() {
+        let _guard = env_lock().lock().unwrap();
+        let original_cwd = env::current_dir().unwrap();
+        let original_env = env::var("RECORDIT_ASR_MODEL").ok();
+        let temp_dir = write_temp_dir("recordit-model-explicit-missing");
+        let default_model = temp_dir.join("artifacts/bench/models/whispercpp/ggml-tiny.en.bin");
+        fs::create_dir_all(default_model.parent().unwrap()).unwrap();
+        File::create(&default_model).unwrap();
+
+        env::set_current_dir(&temp_dir).unwrap();
+        unsafe {
+            env::remove_var("RECORDIT_ASR_MODEL");
+        }
+
+        let mut config = TranscribeConfig::default();
+        config.asr_model = temp_dir.join("does-not-exist.bin");
+        let err = resolve_model_path(&config).unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("explicit `--asr-model` path does not exist"));
+        assert!(message.contains("omit `--asr-model` to allow default resolution"));
 
         restore_env_state(original_cwd, original_env);
         let _ = fs::remove_dir_all(temp_dir);

@@ -36,6 +36,8 @@ Top-level required fields:
   - `schema_version`, `kind`, `generated_at_utc`
   - `asr_backend`, `asr_model`, `asr_model_source`
   - `input_wav`
+  - `out_wav`
+  - `out_wav_semantics` (`"canonical session WAV artifact for the run"`)
 - channel/mode:
   - `channel_mode_requested`, `channel_mode`
   - `speaker_labels`, `event_channels`
@@ -77,7 +79,7 @@ Top-level required fields:
 - `generated_at_utc`
 - `overall_status` (`PASS|WARN|FAIL`)
 - `config`:
-  - `out_wav`, `out_jsonl`, `out_manifest`
+  - `out_wav`, `out_wav_semantics`, `out_jsonl`, `out_manifest`
   - `asr_backend`
   - `asr_model_requested`, `asr_model_resolved`, `asr_model_source`
   - `sample_rate_hz`
@@ -142,4 +144,3 @@ For cross-run comparisons, prefer:
 - Cleanup benchmark:
   - `artifacts/bench/cleanup/20260227T124016Z/cleanup_summary.csv`
   - `artifacts/bench/cleanup/20260227T124016Z/threshold_evaluation.csv`
-
