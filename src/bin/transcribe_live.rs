@@ -671,6 +671,10 @@ struct LiveChunkQueueTelemetry {
     pending: usize,
     high_water: usize,
     drain_completed: bool,
+    lag_sample_count: usize,
+    lag_p50_ms: u64,
+    lag_p95_ms: u64,
+    lag_max_ms: u64,
 }
 
 impl LiveChunkQueueTelemetry {
@@ -685,6 +689,10 @@ impl LiveChunkQueueTelemetry {
             pending: 0,
             high_water: 0,
             drain_completed: true,
+            lag_sample_count: 0,
+            lag_p50_ms: 0,
+            lag_p95_ms: 0,
+            lag_max_ms: 0,
         }
     }
 
@@ -699,8 +707,36 @@ impl LiveChunkQueueTelemetry {
             pending: 0,
             high_water: 0,
             drain_completed: true,
+            lag_sample_count: 0,
+            lag_p50_ms: 0,
+            lag_p95_ms: 0,
+            lag_max_ms: 0,
         }
     }
+}
+
+fn update_chunk_lag_telemetry(telemetry: &mut LiveChunkQueueTelemetry, lag_samples_ms: &[u64]) {
+    telemetry.lag_sample_count = lag_samples_ms.len();
+    if lag_samples_ms.is_empty() {
+        telemetry.lag_p50_ms = 0;
+        telemetry.lag_p95_ms = 0;
+        telemetry.lag_max_ms = 0;
+        return;
+    }
+    let mut sorted = lag_samples_ms.to_vec();
+    sorted.sort_unstable();
+    telemetry.lag_p50_ms = percentile_nearest_rank_ms(&sorted, 50);
+    telemetry.lag_p95_ms = percentile_nearest_rank_ms(&sorted, 95);
+    telemetry.lag_max_ms = *sorted.last().unwrap_or(&0);
+}
+
+fn percentile_nearest_rank_ms(sorted_samples: &[u64], percentile: usize) -> u64 {
+    if sorted_samples.is_empty() {
+        return 0;
+    }
+    let rank = ((sorted_samples.len() * percentile).saturating_add(99)) / 100;
+    let idx = rank.saturating_sub(1).min(sorted_samples.len() - 1);
+    sorted_samples[idx]
 }
 
 #[derive(Debug, Clone)]
@@ -1496,7 +1532,7 @@ fn build_live_chunked_events_with_queue(
             .then_with(|| a.segment_id.cmp(&b.segment_id))
     });
 
-    run_live_chunk_queue(tasks, chunk_queue_cap)
+    run_live_chunk_queue(tasks, chunk_queue_cap, chunk_stride_ms)
 }
 
 fn build_reconciliation_events(
@@ -1533,26 +1569,48 @@ fn build_reconciliation_events(
         .collect()
 }
 
-fn run_live_chunk_queue(tasks: Vec<LiveChunkTask>, chunk_queue_cap: usize) -> LiveChunkBuildResult {
+fn run_live_chunk_queue(
+    tasks: Vec<LiveChunkTask>,
+    chunk_queue_cap: usize,
+    chunk_stride_ms: u64,
+) -> LiveChunkBuildResult {
     let mut telemetry = LiveChunkQueueTelemetry::enabled(chunk_queue_cap);
     let mut events = Vec::with_capacity(tasks.len() * 2);
     let mut queue = VecDeque::new();
     let mut last_tick_index: Option<usize> = None;
+    let mut lag_samples_ms = Vec::new();
 
     for task in tasks {
         telemetry.submitted += 1;
         if last_tick_index != Some(task.tick_index) {
-            process_next_live_chunk_task(&mut queue, &mut events, &mut telemetry);
+            process_next_live_chunk_task(
+                &mut queue,
+                &mut events,
+                &mut telemetry,
+                task.tick_index,
+                chunk_stride_ms,
+                &mut lag_samples_ms,
+            );
             last_tick_index = Some(task.tick_index);
         }
         enqueue_live_chunk_task(&mut queue, task, &mut telemetry);
     }
+    let mut drain_tick_index = last_tick_index.unwrap_or(0);
     while !queue.is_empty() {
-        process_next_live_chunk_task(&mut queue, &mut events, &mut telemetry);
+        drain_tick_index = drain_tick_index.saturating_add(1);
+        process_next_live_chunk_task(
+            &mut queue,
+            &mut events,
+            &mut telemetry,
+            drain_tick_index,
+            chunk_stride_ms,
+            &mut lag_samples_ms,
+        );
     }
 
     telemetry.pending = queue.len();
     telemetry.drain_completed = telemetry.pending == 0;
+    update_chunk_lag_telemetry(&mut telemetry, &lag_samples_ms);
     LiveChunkBuildResult { events, telemetry }
 }
 
@@ -1578,12 +1636,17 @@ fn process_next_live_chunk_task(
     queue: &mut VecDeque<LiveChunkTask>,
     events: &mut Vec<TranscriptEvent>,
     telemetry: &mut LiveChunkQueueTelemetry,
+    processing_tick_index: usize,
+    chunk_stride_ms: u64,
+    lag_samples_ms: &mut Vec<u64>,
 ) {
     let Some(task) = queue.pop_front() else {
         return;
     };
 
     telemetry.processed += 1;
+    let lag_ticks = processing_tick_index.saturating_sub(task.tick_index);
+    lag_samples_ms.push((lag_ticks as u64).saturating_mul(chunk_stride_ms));
     let partial_end_ms = task.start_ms + ((task.end_ms.saturating_sub(task.start_ms)) / 2);
     events.push(TranscriptEvent {
         event_type: "partial",
@@ -3084,7 +3147,7 @@ fn print_live_report(report: &LiveRunReport) {
         }
     }
     println!(
-        "  chunk_queue: enabled={} max_queue={} submitted={} enqueued={} dropped_oldest={} processed={} pending={} high_water={} drain_completed={}",
+        "  chunk_queue: enabled={} max_queue={} submitted={} enqueued={} dropped_oldest={} processed={} pending={} high_water={} drain_completed={} lag_sample_count={} lag_p50_ms={} lag_p95_ms={} lag_max_ms={}",
         report.chunk_queue.enabled,
         report.chunk_queue.max_queue,
         report.chunk_queue.submitted,
@@ -3093,7 +3156,11 @@ fn print_live_report(report: &LiveRunReport) {
         report.chunk_queue.processed,
         report.chunk_queue.pending,
         report.chunk_queue.high_water,
-        report.chunk_queue.drain_completed
+        report.chunk_queue.drain_completed,
+        report.chunk_queue.lag_sample_count,
+        report.chunk_queue.lag_p50_ms,
+        report.chunk_queue.lag_p95_ms,
+        report.chunk_queue.lag_max_ms
     );
     println!(
         "  cleanup_queue: enabled={} submitted={} enqueued={} dropped_queue_full={} processed={} succeeded={} timed_out={} failed={} retry_attempts={} pending={} drain_completed={}",
@@ -3203,7 +3270,7 @@ fn write_runtime_jsonl(config: &TranscribeConfig, report: &LiveRunReport) -> Res
 
     writeln!(
         file,
-        "{{\"event_type\":\"chunk_queue\",\"channel\":\"control\",\"enabled\":{},\"max_queue\":{},\"submitted\":{},\"enqueued\":{},\"dropped_oldest\":{},\"processed\":{},\"pending\":{},\"high_water\":{},\"drain_completed\":{}}}",
+        "{{\"event_type\":\"chunk_queue\",\"channel\":\"control\",\"enabled\":{},\"max_queue\":{},\"submitted\":{},\"enqueued\":{},\"dropped_oldest\":{},\"processed\":{},\"pending\":{},\"high_water\":{},\"drain_completed\":{},\"lag_sample_count\":{},\"lag_p50_ms\":{},\"lag_p95_ms\":{},\"lag_max_ms\":{}}}",
         report.chunk_queue.enabled,
         report.chunk_queue.max_queue,
         report.chunk_queue.submitted,
@@ -3212,7 +3279,11 @@ fn write_runtime_jsonl(config: &TranscribeConfig, report: &LiveRunReport) -> Res
         report.chunk_queue.processed,
         report.chunk_queue.pending,
         report.chunk_queue.high_water,
-        report.chunk_queue.drain_completed
+        report.chunk_queue.drain_completed,
+        report.chunk_queue.lag_sample_count,
+        report.chunk_queue.lag_p50_ms,
+        report.chunk_queue.lag_p95_ms,
+        report.chunk_queue.lag_max_ms
     )
     .map_err(io_to_cli)?;
 
@@ -3276,6 +3347,12 @@ fn write_runtime_manifest(
         path: report.resolved_model_path.clone(),
         source: report.resolved_model_source.clone(),
     }));
+    let out_wav_metadata = fs::metadata(&config.out_wav).ok();
+    let out_wav_materialized = out_wav_metadata
+        .as_ref()
+        .map(|metadata| metadata.is_file())
+        .unwrap_or(false);
+    let out_wav_bytes = out_wav_metadata.map(|metadata| metadata.len()).unwrap_or(0);
 
     writeln!(file, "{{").map_err(io_to_cli)?;
     writeln!(file, "  \"schema_version\": \"1\",").map_err(io_to_cli)?;
@@ -3334,6 +3411,13 @@ fn write_runtime_manifest(
         json_escape(OUT_WAV_SEMANTICS)
     )
     .map_err(io_to_cli)?;
+    writeln!(
+        file,
+        "  \"out_wav_materialized\": {},",
+        out_wav_materialized
+    )
+    .map_err(io_to_cli)?;
+    writeln!(file, "  \"out_wav_bytes\": {},", out_wav_bytes).map_err(io_to_cli)?;
     writeln!(
         file,
         "  \"channel_mode\": \"{}\",",
@@ -3465,7 +3549,7 @@ fn write_runtime_manifest(
     .map_err(io_to_cli)?;
     writeln!(
         file,
-        "  \"chunk_queue\": {{\"enabled\":{},\"max_queue\":{},\"submitted\":{},\"enqueued\":{},\"dropped_oldest\":{},\"processed\":{},\"pending\":{},\"high_water\":{},\"drain_completed\":{}}},",
+        "  \"chunk_queue\": {{\"enabled\":{},\"max_queue\":{},\"submitted\":{},\"enqueued\":{},\"dropped_oldest\":{},\"processed\":{},\"pending\":{},\"high_water\":{},\"drain_completed\":{},\"lag_sample_count\":{},\"lag_p50_ms\":{},\"lag_p95_ms\":{},\"lag_max_ms\":{}}},",
         report.chunk_queue.enabled,
         report.chunk_queue.max_queue,
         report.chunk_queue.submitted,
@@ -3474,7 +3558,11 @@ fn write_runtime_manifest(
         report.chunk_queue.processed,
         report.chunk_queue.pending,
         report.chunk_queue.high_water,
-        report.chunk_queue.drain_completed
+        report.chunk_queue.drain_completed,
+        report.chunk_queue.lag_sample_count,
+        report.chunk_queue.lag_p50_ms,
+        report.chunk_queue.lag_p95_ms,
+        report.chunk_queue.lag_max_ms
     )
     .map_err(io_to_cli)?;
     writeln!(
@@ -4636,16 +4724,19 @@ fn command_stdout(program: &str, args: &[&str]) -> Result<String, CliError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_rolling_chunk_windows, build_transcript_events, build_trust_notices,
+        build_reconciliation_events, build_rolling_chunk_windows, build_transcript_events,
+        build_trust_notices,
         collect_live_capture_continuity_events, detect_vad_boundaries, live_capture_cli_args,
         materialize_out_wav, merge_transcript_events, model_checksum_info, parse_args_from,
         parse_trust_notice, prepare_channel_inputs, reconstruct_transcript,
-        reconstruct_transcript_per_channel, resolve_model_path, run_cleanup_queue_with,
-        run_live_chunk_queue, sequoia_capture_binary_candidates, write_runtime_manifest,
-        AsrBackend, BenchmarkSummary, ChannelMode, CleanupAttemptOutcome, CleanupQueueTelemetry,
-        CleanupTaskStatus, LiveChunkQueueTelemetry, LiveChunkTask, LiveRunReport,
-        ModeDegradationEvent, ParseOutcome, ResolvedModelPath, TranscribeConfig, TranscriptEvent,
-        VadBoundary, HELP_TEXT, LIVE_CHUNK_QUEUE_DROP_OLDEST_CODE, RECONCILIATION_APPLIED_CODE,
+        reconstruct_transcript_per_channel, replay_timeline, resolve_model_path,
+        run_cleanup_queue_with,
+        run_live_chunk_queue, sequoia_capture_binary_candidates, write_runtime_jsonl,
+        write_runtime_manifest, AsrBackend, BenchmarkSummary, ChannelMode, CleanupAttemptOutcome,
+        CleanupQueueTelemetry, CleanupTaskStatus, LiveChunkQueueTelemetry, LiveChunkTask,
+        LiveRunReport, ModeDegradationEvent, ParseOutcome, ResolvedModelPath, TranscribeConfig,
+        TranscriptEvent, VadBoundary, HELP_TEXT, LIVE_CHUNK_QUEUE_DROP_OLDEST_CODE,
+        RECONCILIATION_APPLIED_CODE,
     };
     use hound::{SampleFormat, WavSpec, WavWriter};
     use std::env;
@@ -5045,6 +5136,7 @@ mod tests {
                 },
             ],
             2,
+            1_000,
         );
 
         assert_eq!(result.telemetry.submitted, 6);
@@ -5053,6 +5145,10 @@ mod tests {
         assert_eq!(result.telemetry.max_queue, 2);
         assert_eq!(result.telemetry.high_water, 2);
         assert!(result.telemetry.drain_completed);
+        assert_eq!(result.telemetry.lag_sample_count, 4);
+        assert_eq!(result.telemetry.lag_p50_ms, 1_000);
+        assert_eq!(result.telemetry.lag_p95_ms, 2_000);
+        assert_eq!(result.telemetry.lag_max_ms, 2_000);
         let final_ids = result
             .events
             .iter()
@@ -5215,6 +5311,159 @@ mod tests {
         let transcript = reconstruct_transcript(&events);
         assert!(transcript.contains("complete transcript"));
         assert!(!transcript.contains("incomplete"));
+    }
+
+    #[test]
+    fn backlog_drop_scenarios_emit_reconciled_final_events() {
+        let live = run_live_chunk_queue(
+            vec![
+                LiveChunkTask {
+                    tick_index: 0,
+                    channel: "mic".to_string(),
+                    segment_id: "mic-0".to_string(),
+                    start_ms: 0,
+                    end_ms: 4_000,
+                    text: "mic-live-0".to_string(),
+                },
+                LiveChunkTask {
+                    tick_index: 0,
+                    channel: "system".to_string(),
+                    segment_id: "system-0".to_string(),
+                    start_ms: 0,
+                    end_ms: 4_000,
+                    text: "system-live-0".to_string(),
+                },
+                LiveChunkTask {
+                    tick_index: 1,
+                    channel: "mic".to_string(),
+                    segment_id: "mic-1".to_string(),
+                    start_ms: 1_000,
+                    end_ms: 5_000,
+                    text: "mic-live-1".to_string(),
+                },
+                LiveChunkTask {
+                    tick_index: 1,
+                    channel: "system".to_string(),
+                    segment_id: "system-1".to_string(),
+                    start_ms: 1_000,
+                    end_ms: 5_000,
+                    text: "system-live-1".to_string(),
+                },
+            ],
+            1,
+            1_000,
+        );
+        assert!(live.telemetry.dropped_oldest > 0);
+
+        let reconciliation = build_reconciliation_events(
+            &[
+                super::ChannelTranscriptSummary {
+                    role: "mic",
+                    label: "mic".to_string(),
+                    text: "mic complete transcript".to_string(),
+                },
+                super::ChannelTranscriptSummary {
+                    role: "system",
+                    label: "system".to_string(),
+                    text: "system complete transcript".to_string(),
+                },
+            ],
+            &[VadBoundary {
+                id: 0,
+                start_ms: 0,
+                end_ms: 5_000,
+                source: "energy_threshold",
+            }],
+        );
+
+        assert!(!reconciliation.is_empty());
+        assert!(reconciliation
+            .iter()
+            .all(|event| event.event_type == "reconciled_final"));
+        assert!(reconciliation
+            .iter()
+            .all(|event| event.segment_id.ends_with("-reconciled")));
+    }
+
+    #[test]
+    fn reconciliation_preserves_live_provenance_and_improves_or_preserves_completeness() {
+        let live = run_live_chunk_queue(
+            vec![
+                LiveChunkTask {
+                    tick_index: 0,
+                    channel: "mic".to_string(),
+                    segment_id: "mic-0".to_string(),
+                    start_ms: 0,
+                    end_ms: 4_000,
+                    text: "mic-live-0".to_string(),
+                },
+                LiveChunkTask {
+                    tick_index: 0,
+                    channel: "system".to_string(),
+                    segment_id: "system-0".to_string(),
+                    start_ms: 0,
+                    end_ms: 4_000,
+                    text: "system-live-0".to_string(),
+                },
+                LiveChunkTask {
+                    tick_index: 1,
+                    channel: "mic".to_string(),
+                    segment_id: "mic-1".to_string(),
+                    start_ms: 1_000,
+                    end_ms: 5_000,
+                    text: "mic-live-1".to_string(),
+                },
+                LiveChunkTask {
+                    tick_index: 1,
+                    channel: "system".to_string(),
+                    segment_id: "system-1".to_string(),
+                    start_ms: 1_000,
+                    end_ms: 5_000,
+                    text: "system-live-1".to_string(),
+                },
+            ],
+            1,
+            1_000,
+        );
+        assert!(live.telemetry.dropped_oldest > 0);
+        assert!(live.events.iter().any(|event| event.event_type == "final"));
+
+        let baseline_text = reconstruct_transcript(&live.events);
+        let mut merged = live.events.clone();
+        merged.extend(build_reconciliation_events(
+            &[
+                super::ChannelTranscriptSummary {
+                    role: "mic",
+                    label: "mic".to_string(),
+                    text: "mic complete transcript".to_string(),
+                },
+                super::ChannelTranscriptSummary {
+                    role: "system",
+                    label: "system".to_string(),
+                    text: "system complete transcript".to_string(),
+                },
+            ],
+            &[VadBoundary {
+                id: 0,
+                start_ms: 0,
+                end_ms: 5_000,
+                source: "energy_threshold",
+            }],
+        ));
+        let merged = merge_transcript_events(merged);
+        let reconciled_text = reconstruct_transcript(&merged);
+
+        assert!(merged
+            .iter()
+            .any(|event| event.event_type == "reconciled_final"));
+        assert!(merged.iter().any(|event| event.event_type == "final"));
+        assert!(merged
+            .iter()
+            .filter(|event| event.event_type == "reconciled_final")
+            .all(|event| event.source_final_segment_id.is_none()));
+        assert!(reconciled_text.len() >= baseline_text.len());
+        assert!(reconciled_text.contains("mic complete transcript"));
+        assert!(reconciled_text.contains("system complete transcript"));
     }
 
     #[test]
@@ -5579,6 +5828,17 @@ mod tests {
         config.out_wav = out_wav.clone();
         config.out_jsonl = out_jsonl.clone();
         config.out_manifest = out_manifest.clone();
+        let mut chunk_queue = LiveChunkQueueTelemetry::disabled(&config);
+        chunk_queue.enabled = true;
+        chunk_queue.max_queue = 2;
+        chunk_queue.submitted = 4;
+        chunk_queue.enqueued = 4;
+        chunk_queue.processed = 4;
+        chunk_queue.high_water = 2;
+        chunk_queue.lag_sample_count = 4;
+        chunk_queue.lag_p50_ms = 1_000;
+        chunk_queue.lag_p95_ms = 2_000;
+        chunk_queue.lag_max_ms = 2_000;
 
         let report = LiveRunReport {
             generated_at_utc: "2026-02-28T00:00:00Z".to_string(),
@@ -5602,7 +5862,7 @@ mod tests {
             events: vec![final_event("mic-0", "mic", "hello world")],
             degradation_events: Vec::new(),
             trust_notices: Vec::new(),
-            chunk_queue: LiveChunkQueueTelemetry::disabled(&config),
+            chunk_queue,
             cleanup_queue: CleanupQueueTelemetry::disabled(&config),
             benchmark: BenchmarkSummary {
                 run_count: 1,
@@ -5620,6 +5880,210 @@ mod tests {
         assert!(manifest.contains("\"events\": ["));
         assert!(manifest.contains("\"event_type\":\"final\""));
         assert!(manifest.contains("\"segment_id\":\"mic-0\""));
+        assert!(manifest.contains("\"out_wav_materialized\": true"));
+        assert!(manifest.contains("\"out_wav_bytes\": 0"));
+        assert!(manifest.contains("\"lag_sample_count\":4"));
+        assert!(manifest.contains("\"lag_p50_ms\":1000"));
+        assert!(manifest.contains("\"lag_p95_ms\":2000"));
+        assert!(manifest.contains("\"lag_max_ms\":2000"));
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn runtime_jsonl_chunk_queue_event_includes_lag_metrics() {
+        let temp_dir = write_temp_dir("recordit-runtime-jsonl-chunk-lag");
+        let input_wav = temp_dir.join("input.wav");
+        let out_wav = temp_dir.join("session.wav");
+        let out_jsonl = temp_dir.join("session.jsonl");
+        File::create(&input_wav).unwrap();
+        File::create(&out_wav).unwrap();
+
+        let mut config = TranscribeConfig::default();
+        config.input_wav = input_wav.clone();
+        config.out_wav = out_wav.clone();
+        config.out_jsonl = out_jsonl.clone();
+
+        let mut chunk_queue = LiveChunkQueueTelemetry::disabled(&config);
+        chunk_queue.enabled = true;
+        chunk_queue.max_queue = 2;
+        chunk_queue.submitted = 4;
+        chunk_queue.enqueued = 4;
+        chunk_queue.processed = 4;
+        chunk_queue.high_water = 2;
+        chunk_queue.lag_sample_count = 4;
+        chunk_queue.lag_p50_ms = 1_000;
+        chunk_queue.lag_p95_ms = 2_000;
+        chunk_queue.lag_max_ms = 2_000;
+
+        let report = LiveRunReport {
+            generated_at_utc: "2026-02-28T00:00:00Z".to_string(),
+            backend_id: "whispercpp",
+            resolved_model_path: temp_dir.join("model.bin"),
+            resolved_model_source: "test".to_string(),
+            channel_mode: ChannelMode::Separate,
+            active_channel_mode: ChannelMode::Separate,
+            transcript_text: "hello".to_string(),
+            channel_transcripts: vec![super::ChannelTranscriptSummary {
+                role: "mic",
+                label: "mic".to_string(),
+                text: "hello".to_string(),
+            }],
+            vad_boundaries: vec![VadBoundary {
+                id: 0,
+                start_ms: 0,
+                end_ms: 100,
+                source: "energy_threshold",
+            }],
+            events: vec![final_event("mic-0", "mic", "hello world")],
+            degradation_events: Vec::new(),
+            trust_notices: Vec::new(),
+            chunk_queue,
+            cleanup_queue: CleanupQueueTelemetry::disabled(&config),
+            benchmark: BenchmarkSummary {
+                run_count: 1,
+                wall_ms_p50: 1.0,
+                wall_ms_p95: 1.0,
+                partial_slo_met: true,
+                final_slo_met: true,
+            },
+            benchmark_summary_csv: temp_dir.join("summary.csv"),
+            benchmark_runs_csv: temp_dir.join("runs.csv"),
+        };
+
+        write_runtime_jsonl(&config, &report).unwrap();
+        let jsonl = fs::read_to_string(&out_jsonl).unwrap();
+        let chunk_queue_line = jsonl
+            .lines()
+            .find(|line| line.contains("\"event_type\":\"chunk_queue\""))
+            .unwrap();
+        assert!(chunk_queue_line.contains("\"lag_sample_count\":4"));
+        assert!(chunk_queue_line.contains("\"lag_p50_ms\":1000"));
+        assert!(chunk_queue_line.contains("\"lag_p95_ms\":2000"));
+        assert!(chunk_queue_line.contains("\"lag_max_ms\":2000"));
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn near_live_artifacts_remain_schema_compatible_for_replay() {
+        let temp_dir = write_temp_dir("recordit-near-live-schema-replay");
+        let input_wav = temp_dir.join("input.wav");
+        let out_wav = temp_dir.join("session.wav");
+        let out_jsonl = temp_dir.join("session.jsonl");
+        let out_manifest = temp_dir.join("session.manifest.json");
+        File::create(&input_wav).unwrap();
+        File::create(&out_wav).unwrap();
+
+        let mut config = TranscribeConfig::default();
+        config.input_wav = input_wav.clone();
+        config.out_wav = out_wav.clone();
+        config.out_jsonl = out_jsonl.clone();
+        config.out_manifest = out_manifest.clone();
+
+        let mut chunk_queue = LiveChunkQueueTelemetry::disabled(&config);
+        chunk_queue.enabled = true;
+        chunk_queue.max_queue = 2;
+        chunk_queue.submitted = 3;
+        chunk_queue.enqueued = 3;
+        chunk_queue.processed = 3;
+        chunk_queue.high_water = 2;
+        chunk_queue.lag_sample_count = 3;
+        chunk_queue.lag_p50_ms = 1_000;
+        chunk_queue.lag_p95_ms = 2_000;
+        chunk_queue.lag_max_ms = 2_000;
+
+        let report = LiveRunReport {
+            generated_at_utc: "2026-02-28T00:00:00Z".to_string(),
+            backend_id: "whispercpp",
+            resolved_model_path: temp_dir.join("model.bin"),
+            resolved_model_source: "test".to_string(),
+            channel_mode: ChannelMode::Separate,
+            active_channel_mode: ChannelMode::Separate,
+            transcript_text: "hello world".to_string(),
+            channel_transcripts: vec![super::ChannelTranscriptSummary {
+                role: "mic",
+                label: "mic".to_string(),
+                text: "hello world".to_string(),
+            }],
+            vad_boundaries: vec![VadBoundary {
+                id: 0,
+                start_ms: 0,
+                end_ms: 2_000,
+                source: "energy_threshold",
+            }],
+            events: vec![
+                TranscriptEvent {
+                    event_type: "partial",
+                    channel: "mic".to_string(),
+                    segment_id: "mic-chunk-0000-0-4000".to_string(),
+                    start_ms: 0,
+                    end_ms: 1_000,
+                    text: "hello".to_string(),
+                    source_final_segment_id: None,
+                },
+                TranscriptEvent {
+                    event_type: "final",
+                    channel: "mic".to_string(),
+                    segment_id: "mic-chunk-0000-0-4000".to_string(),
+                    start_ms: 0,
+                    end_ms: 2_000,
+                    text: "hello world".to_string(),
+                    source_final_segment_id: None,
+                },
+                TranscriptEvent {
+                    event_type: "reconciled_final",
+                    channel: "mic".to_string(),
+                    segment_id: "mic-reconciled-0000".to_string(),
+                    start_ms: 0,
+                    end_ms: 2_000,
+                    text: "hello world reconciled".to_string(),
+                    source_final_segment_id: Some("mic-chunk-0000-0-4000".to_string()),
+                },
+            ],
+            degradation_events: Vec::new(),
+            trust_notices: Vec::new(),
+            chunk_queue,
+            cleanup_queue: CleanupQueueTelemetry::disabled(&config),
+            benchmark: BenchmarkSummary {
+                run_count: 1,
+                wall_ms_p50: 1.0,
+                wall_ms_p95: 1.0,
+                partial_slo_met: true,
+                final_slo_met: true,
+            },
+            benchmark_summary_csv: temp_dir.join("summary.csv"),
+            benchmark_runs_csv: temp_dir.join("runs.csv"),
+        };
+
+        write_runtime_jsonl(&config, &report).unwrap();
+        write_runtime_manifest(&config, &report).unwrap();
+
+        let jsonl = fs::read_to_string(&out_jsonl).unwrap();
+        assert!(jsonl.lines().any(|line| {
+            line.contains("\"event_type\":\"partial\"")
+                && line.contains("\"segment_id\":\"mic-chunk-0000-0-4000\"")
+                && line.contains("\"start_ms\":0")
+                && line.contains("\"end_ms\":1000")
+                && line.contains("\"text\":\"hello\"")
+        }));
+        assert!(jsonl.lines().any(|line| {
+            line.contains("\"event_type\":\"reconciled_final\"")
+                && line.contains("\"segment_id\":\"mic-reconciled-0000\"")
+                && line.contains("\"source_final_segment_id\":\"mic-chunk-0000-0-4000\"")
+        }));
+        assert!(jsonl
+            .lines()
+            .any(|line| line.contains("\"event_type\":\"chunk_queue\"")));
+
+        let manifest = fs::read_to_string(&out_manifest).unwrap();
+        assert!(manifest.contains("\"events\": ["));
+        assert!(manifest.contains("\"event_type\":\"reconciled_final\""));
+        assert!(manifest.contains("\"source_final_segment_id\":\"mic-chunk-0000-0-4000\""));
+        assert!(manifest.contains("\"chunk_queue\": {"));
+        assert!(manifest.contains("\"jsonl_path\":"));
+
+        replay_timeline(&out_jsonl).unwrap();
 
         let _ = fs::remove_dir_all(temp_dir);
     }
