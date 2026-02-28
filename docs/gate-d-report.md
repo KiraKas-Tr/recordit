@@ -1,67 +1,74 @@
-# Gate D 60-Minute Soak Report (bd-7cb)
+# Gate D Near-Live Soak Report (bd-23u)
 
-Date: 2026-02-27  
-Status: completed (invalid direct-binary full run preserved for audit; corrected full rerun passes gate)
+Date: 2026-02-28  
+Status: refreshed for deterministic near-live runtime soak
 
 ## Scope
 
-- Execute a true 60-minute reliability soak.
-- Track long-run drift and stability using per-run runtime artifacts.
-- Publish reusable regression-gate commands for repeat execution.
+- Refresh Gate D so soak evidence exercises the near-live runtime path (`--live-chunked`) instead of legacy offline-only invocation.
+- Preserve long-run reliability checks (duration, failures, latency drift, memory drift).
+- Add near-live truth checks for queue/lag visibility, continuity telemetry, and out-wav materialization.
 
-## Gate D Procedure
+## Procedure
 
-1. Build the runtime binary once:
-
-```bash
-cargo build --bin transcribe-live
-```
-
-2. Run a 3600-second soak loop that repeatedly executes `cargo run --quiet --bin transcribe-live -- ...` with `DYLD_LIBRARY_PATH=/usr/lib/swift`:
-   - `--asr-backend whispercpp`
-   - `--transcribe-channels mixed-fallback`
-   - bounded cleanup lane enabled (`--llm-cleanup`, `--llm-max-queue 1`, short timeout/retries)
-   - per-run JSONL/manifest/time/stdout artifacts saved under `artifacts/bench/gate_d/<stamp>/runs/`
-
-3. Aggregate per-run metrics into:
-   - `runs.csv`
-   - `summary.csv`
-
-## Gate D Thresholds
-
-| Check | Threshold | Why |
-|---|---|---|
-| Soak duration | `soak_seconds_actual >= 3600` | Ensures full long-duration exposure |
-| Harness reliability | `failure_count = 0` | Gate should fail on runtime instability |
-| Runtime latency drift | `manifest_wall_ms_p95_p95 <= 1.25 * manifest_wall_ms_p95_p50` | Bounds long-tail growth across the soak |
-| Memory pressure growth | `max_rss_kb_p95 <= 1.30 * max_rss_kb_p50` | Detects likely leak/accumulation patterns |
-| Cleanup backpressure visibility | `total_cleanup_dropped`, `total_cleanup_failed`, `total_cleanup_timed_out` present | Confirms queue/degradation visibility under stress |
-| Degradation signaling visibility | `total_degradation_events` present | Confirms trust/degradation metadata remains surfaced |
-
-## Reusable Regression Gate Commands
-
-Run Gate D soak:
+Run the gate:
 
 ```bash
 make gate-d-soak
 ```
 
-Evaluate a completed Gate D artifact:
+Implementation:
+- `scripts/gate_d_soak.sh`
+- `scripts/gate_d_summary.py`
 
-```bash
-SOAK_DIR=artifacts/bench/gate_d/<stamp>
-column -s, -t "$SOAK_DIR/summary.csv"
-```
+The soak harness is deterministic and host-independent:
+- builds `target/debug/transcribe-live`
+- stages a local harness binary under `artifacts/bench/gate_d/<stamp>/harness/bin/`
+- injects a fake `sequoia_capture` sibling that copies a deterministic stereo fixture and emits capture telemetry
+- runs repeated `--live-chunked` invocations while collecting per-run manifest/JSONL/time/stdout artifacts
 
-## Results
+## Artifact Layout
 
-- Full soak artifact: `artifacts/bench/gate_d/20260227T125909Z/`
-  - root cause of failure: direct execution of `target/debug/transcribe-live` aborted before runtime start with `dyld: Library not loaded: @rpath/libswift_Concurrency.dylib`
-  - final summary: `failure_count=22000`, `soak_seconds_actual=3600`, `threshold_soak_duration_ok=true`, `gate_pass=false`
-  - interpretation: Gate D correctly rejected the invalid launch path and preserved a full-duration failure artifact for audit
-- Fixed regression command: `make gate-d-soak`
-  - implementation: `scripts/gate_d_soak.sh` + `scripts/gate_d_summary.py`
-  - smoke validation: `artifacts/validation/bd-7cb.make-smoke/summary.csv` shows `gate_pass=true` for a short-duration harness check with the corrected `cargo run` launch path
-- Corrected full-duration rerun artifact: `artifacts/bench/gate_d/20260227T150827Z/`
-  - summary: `failure_count=0`, `soak_seconds_actual=3601`, `threshold_harness_reliability_ok=true`, `threshold_soak_duration_ok=true`, `gate_pass=true`
-  - observed stability envelope: `manifest_wall_ms_p95_p50=666.9248749999999`, `manifest_wall_ms_p95_p95=701.1608188499999`, `max_rss_kb_p50=199016448.0`, `max_rss_kb_p95=199819264.0`
+Gate root:
+- `artifacts/bench/gate_d/<stamp>/`
+
+Per-run artifacts:
+- `runs/run_<id>.capture.wav`
+- `runs/run_<id>.capture.telemetry.json`
+- `runs/run_<id>.session.wav`
+- `runs/run_<id>.manifest.json`
+- `runs/run_<id>.jsonl`
+- `runs/run_<id>.stdout.log`
+- `runs/run_<id>.time.txt`
+
+Aggregates:
+- `runs.csv`
+- `summary.csv`
+- `status.txt`
+
+## Thresholds
+
+| Check | Threshold |
+|---|---|
+| Soak duration | `soak_seconds_actual >= soak_seconds_target` |
+| Harness reliability | `failure_count = 0` |
+| Runtime latency drift | `manifest_wall_ms_p95_p95 <= 1.25 * manifest_wall_ms_p95_p50` |
+| Memory growth | `max_rss_kb_p95 <= 1.30 * max_rss_kb_p50` |
+| Near-live mode truth | `threshold_near_live_mode_ok=true` (runtime mode is live-chunked/near-live and `live_chunked=true`) |
+| Chunk queue visibility | `threshold_chunk_queue_visibility_ok=true` |
+| Chunk drain health | `threshold_chunk_drain_ok=true` |
+| Out-wav truth | `threshold_out_wav_truth_ok=true` |
+| Continuity signal presence | `threshold_continuity_signal_ok=true` |
+| Lag drift stability | `threshold_lag_drift_ok=true` |
+
+`summary.csv` publishes these booleans and `gate_pass`.
+
+## Validation Evidence
+
+Short validation soak (after refresh):
+- `artifacts/bench/gate_d/20260228T154530Z/summary.csv`
+- key outcomes: `run_count=2`, `failure_count=0`, `threshold_near_live_mode_ok=true`, `threshold_chunk_queue_visibility_ok=true`, `threshold_continuity_signal_ok=true`, `gate_pass=true`
+
+Intermediate failing validation during implementation (before mode-label fix):
+- `artifacts/bench/gate_d/20260228T154421Z/summary.csv`
+- `gate_pass=false` solely because runtime mode field reported `live-chunked` while the initial threshold expected `near-live`
