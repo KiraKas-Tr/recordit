@@ -45,6 +45,19 @@ Telemetry/artifact surface:
 - runtime JSONL emits a terminal `cleanup_queue` control event
 - runtime manifest persists the same cleanup queue summary under `cleanup_queue`
 
+## Near-Live Chunk Queue Contract (Transcribe)
+
+Near-live chunk scheduling must keep producer behavior non-blocking even when ASR chunk work lags:
+
+1. Chunk work submission uses a bounded queue (`--chunk-queue-cap`).
+2. Queue saturation uses explicit **drop-oldest** policy (never blocking the producer).
+3. Drop counts are surfaced as degradation/trust signals rather than silent data loss.
+
+Telemetry/artifact surface:
+- terminal summary prints near-live `chunk_queue` totals (`submitted`, `enqueued`, `dropped_oldest`, `processed`, `pending`, `high_water`, `drain_completed`)
+- runtime JSONL emits `chunk_queue` control events
+- runtime manifest persists `chunk_queue` under top-level reliability telemetry
+
 ## Near-Live Terminal UX Contract
 
 Near-live terminal behavior is governed by `docs/near-live-terminal-contract.md`.

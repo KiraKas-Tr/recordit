@@ -49,6 +49,7 @@ Top-level required fields:
   - `transcript_per_channel`
 - performance/reliability:
   - `benchmark` (`wall_ms_p50/p95`, SLO booleans, summary/runs artifact paths)
+  - `chunk_queue` (near-live chunk queue pressure + drop-oldest semantics)
   - `cleanup_queue` (queue pressure + drain semantics)
   - `degradation_events`
   - `trust` (structured trust notices)

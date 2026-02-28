@@ -216,6 +216,7 @@ cargo run --bin transcribe-live -- [--asr-model <local-model-path>] [flags...]
   - enable near-live contract with `--live-chunked`
   - `--live-chunked` prepares runtime input by launching a live capture session (`sequoia_capture`) and then runs a rolling near-live scheduler over the captured WAV
   - rolling scheduler semantics: `4s` default window, `1s` default stride, deterministic chunk segment IDs, and tail-aligned final window coverage
+  - near-live ASR work is routed through a bounded queue; when saturated, oldest queued chunk work is dropped to preserve non-blocking producer behavior
   - `--chunk-window-ms` default `4000`
   - `--chunk-stride-ms` default `1000`
   - `--chunk-queue-cap` default `4`
@@ -226,7 +227,9 @@ cargo run --bin transcribe-live -- [--asr-model <local-model-path>] [flags...]
   - runtime manifest records both `channel_mode_requested` and active `channel_mode`
   - runtime JSONL emits `event_type=mode_degradation` when fallback/degradation occurs
   - runtime JSONL emits `event_type=trust_notice` with cause/impact/guidance for user-facing trust calibration
+  - runtime JSONL emits `event_type=chunk_queue` with near-live chunk queue pressure counters
   - runtime manifest includes a `degradation_events` array with stable `code` + `detail`
+  - runtime manifest includes `chunk_queue` telemetry (`submitted`, `enqueued`, `dropped_oldest`, `processed`, `pending`, `high_water`)
   - runtime manifest includes a structured `trust` object (`degraded_mode_active`, `notice_count`, `notices`)
   - replay output prints trust notices so audit reads preserve degraded-mode context
 - readability default contract:
