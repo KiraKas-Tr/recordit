@@ -1366,7 +1366,51 @@ trait AsrAdapter {
     fn transcribe(&self, request: &AsrRequest<'_>) -> Result<String, CliError>;
 }
 
-struct WhisperCppAdapter;
+fn backend_helper_program_label(backend: AsrBackend) -> &'static str {
+    match backend {
+        AsrBackend::WhisperCpp => "whisper-cli",
+        AsrBackend::WhisperKit => "whisperkit-cli",
+        AsrBackend::Moonshine => "moonshine",
+    }
+}
+
+fn backend_helper_env_var(backend: AsrBackend) -> Option<&'static str> {
+    match backend {
+        AsrBackend::WhisperCpp => Some("RECORDIT_WHISPERCPP_CLI_PATH"),
+        AsrBackend::WhisperKit => Some("RECORDIT_WHISPERKIT_CLI_PATH"),
+        AsrBackend::Moonshine => None,
+    }
+}
+
+fn resolve_backend_program(backend: AsrBackend, model_path: &Path) -> String {
+    if let Some(env_name) = backend_helper_env_var(backend) {
+        if let Ok(value) = env::var(env_name) {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                return trimmed.to_string();
+            }
+        }
+    }
+
+    let helper_name = backend_helper_program_label(backend);
+    if let Some(parent) = model_path.parent() {
+        let sibling = parent.join(helper_name);
+        if sibling.is_file() {
+            return sibling.to_string_lossy().to_string();
+        }
+
+        let nested = parent.join("bin").join(helper_name);
+        if nested.is_file() {
+            return nested.to_string_lossy().to_string();
+        }
+    }
+
+    helper_name.to_string()
+}
+
+struct WhisperCppAdapter {
+    program: String,
+}
 
 impl AsrAdapter for WhisperCppAdapter {
     fn backend_id(&self) -> &'static str {
@@ -1374,7 +1418,7 @@ impl AsrAdapter for WhisperCppAdapter {
     }
 
     fn transcribe(&self, request: &AsrRequest<'_>) -> Result<String, CliError> {
-        let output = Command::new("whisper-cli")
+        let output = Command::new(&self.program)
             .args([
                 "-m",
                 &request.model_path.to_string_lossy(),
@@ -1388,7 +1432,12 @@ impl AsrAdapter for WhisperCppAdapter {
                 "-np",
             ])
             .output()
-            .map_err(|err| CliError::new(format!("failed to execute `whisper-cli`: {err}")))?;
+            .map_err(|err| {
+                CliError::new(format!(
+                    "failed to execute `{}`: {err}",
+                    backend_helper_program_label(AsrBackend::WhisperCpp)
+                ))
+            })?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1407,7 +1456,9 @@ impl AsrAdapter for WhisperCppAdapter {
     }
 }
 
-struct WhisperKitAdapter;
+struct WhisperKitAdapter {
+    program: String,
+}
 
 impl AsrAdapter for WhisperKitAdapter {
     fn backend_id(&self) -> &'static str {
@@ -1415,7 +1466,7 @@ impl AsrAdapter for WhisperKitAdapter {
     }
 
     fn transcribe(&self, request: &AsrRequest<'_>) -> Result<String, CliError> {
-        let output = Command::new("whisperkit-cli")
+        let output = Command::new(&self.program)
             .args([
                 "transcribe",
                 "--audio-path",
@@ -1429,7 +1480,12 @@ impl AsrAdapter for WhisperKitAdapter {
                 "--without-timestamps",
             ])
             .output()
-            .map_err(|err| CliError::new(format!("failed to execute `whisperkit-cli`: {err}")))?;
+            .map_err(|err| {
+                CliError::new(format!(
+                    "failed to execute `{}`: {err}",
+                    backend_helper_program_label(AsrBackend::WhisperKit)
+                ))
+            })?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1448,10 +1504,10 @@ impl AsrAdapter for WhisperKitAdapter {
     }
 }
 
-fn select_adapter(backend: AsrBackend) -> Result<Box<dyn AsrAdapter>, CliError> {
+fn select_adapter(backend: AsrBackend, program: String) -> Result<Box<dyn AsrAdapter>, CliError> {
     match backend {
-        AsrBackend::WhisperCpp => Ok(Box::new(WhisperCppAdapter)),
-        AsrBackend::WhisperKit => Ok(Box::new(WhisperKitAdapter)),
+        AsrBackend::WhisperCpp => Ok(Box::new(WhisperCppAdapter { program })),
+        AsrBackend::WhisperKit => Ok(Box::new(WhisperKitAdapter { program })),
         AsrBackend::Moonshine => Err(CliError::new(
             "moonshine adapter is not wired in this phase; use `--asr-backend whispercpp` or `--asr-backend whisperkit`",
         )),
@@ -1460,6 +1516,7 @@ fn select_adapter(backend: AsrBackend) -> Result<Box<dyn AsrAdapter>, CliError> 
 
 struct PooledAsrExecutor {
     backend: AsrBackend,
+    helper_program: String,
     model_path: PathBuf,
     language: String,
     threads: usize,
@@ -1471,12 +1528,14 @@ impl LiveAsrExecutor for PooledAsrExecutor {
         if !self.prewarm_enabled {
             return Ok(());
         }
-        let _ = select_adapter(self.backend).map_err(|err| err.to_string())?;
-        prewarm_backend_binary(self.backend)
+        let _ = select_adapter(self.backend, self.helper_program.clone())
+            .map_err(|err| err.to_string())?;
+        prewarm_backend_binary(self.backend, &self.helper_program)
     }
 
     fn transcribe(&self, audio_path: &Path) -> Result<String, String> {
-        let adapter = select_adapter(self.backend).map_err(|err| err.to_string())?;
+        let adapter = select_adapter(self.backend, self.helper_program.clone())
+            .map_err(|err| err.to_string())?;
         adapter
             .transcribe(&AsrRequest {
                 model_path: &self.model_path,
@@ -1488,10 +1547,10 @@ impl LiveAsrExecutor for PooledAsrExecutor {
     }
 }
 
-fn prewarm_backend_binary(backend: AsrBackend) -> Result<(), String> {
-    let (program, args): (&str, &[&str]) = match backend {
-        AsrBackend::WhisperCpp => ("whisper-cli", &["-h"]),
-        AsrBackend::WhisperKit => ("whisperkit-cli", &["--help"]),
+fn prewarm_backend_binary(backend: AsrBackend, program: &str) -> Result<(), String> {
+    let args: &[&str] = match backend {
+        AsrBackend::WhisperCpp => &["-h"],
+        AsrBackend::WhisperKit => &["--help"],
         AsrBackend::Moonshine => {
             return Err(
                 "moonshine adapter is not wired in this phase; use whispercpp/whisperkit"
@@ -1499,11 +1558,12 @@ fn prewarm_backend_binary(backend: AsrBackend) -> Result<(), String> {
             );
         }
     };
+    let helper_label = backend_helper_program_label(backend);
 
     Command::new(program)
         .args(args)
         .output()
-        .map_err(|err| format!("failed to execute `{program}` prewarm probe: {err}"))?;
+        .map_err(|err| format!("failed to execute `{helper_label}` prewarm probe: {err}"))?;
     Ok(())
 }
 
@@ -2008,8 +2068,10 @@ fn transcribe_channels_once(
         .live_asr_workers
         .max(1)
         .min(channel_inputs.len().max(1));
+    let helper_program = resolve_backend_program(config.asr_backend, resolved_model_path);
     let executor = Arc::new(PooledAsrExecutor {
         backend: config.asr_backend,
+        helper_program,
         model_path: resolved_model_path.to_path_buf(),
         language: config.asr_language.clone(),
         threads: config.asr_threads,
