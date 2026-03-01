@@ -140,6 +140,30 @@ make run-transcribe-model-doctor-app ASR_MODEL=artifacts/bench/models/whispercpp
 
 Both commands run in signed-app context and keep diagnostics aligned with the packaged beta execution path.
 
+Packaged live-stream model-doctor command:
+
+```bash
+make setup-whispercpp-model
+make run-transcribe-model-doctor-app \
+  ASR_MODEL=artifacts/bench/models/whispercpp/ggml-tiny.en.bin \
+  TRANSCRIBE_ARGS=--live-stream
+```
+
+Packaged live smoke gate:
+
+```bash
+make setup-whispercpp-model
+make gate-packaged-live-smoke
+```
+
+The packaged smoke gate writes deterministic evidence under:
+
+- `~/Library/Containers/com.recordit.sequoiatranscribe/Data/artifacts/packaged-beta/gates/gate_packaged_live_smoke/<timestamp>/summary.csv`
+- `~/Library/Containers/com.recordit.sequoiatranscribe/Data/artifacts/packaged-beta/gates/gate_packaged_live_smoke/<timestamp>/status.txt`
+
+Use `summary.csv` as the canonical packaged live evidence artifact when deciding whether downstream deprecation/review work can proceed.
+If `summary.csv` reports `runtime_helper_exec_blocked=true`, treat packaged live runtime as not ready in the current signed build and keep representative-chunk mode in service.
+
 ### Debug fallback command (engineering-only)
 
 Debug preflight command:

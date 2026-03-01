@@ -136,6 +136,35 @@ make gate-d-soak
 ```
 Runs the deterministic near-live soak harness (`scripts/gate_d_soak.sh`) and writes per-run artifacts plus `summary.csv` under `artifacts/bench/gate_d/<timestamp>/`.
 
+### Run Near-Live Backlog Pressure Gate
+```bash
+make gate-backlog-pressure
+```
+Runs the deterministic backlog-pressure gate harness and writes artifacts under `artifacts/bench/gate_backlog_pressure/<timestamp>/`.
+
+### Run Transcript Completeness Gate (Reconciliation Under Backlog)
+```bash
+make gate-transcript-completeness
+```
+Runs the reconciliation completeness gate under induced backlog and writes artifacts under `artifacts/bench/gate_transcript_completeness/<timestamp>/`.
+
+### Run V1 Acceptance Gate (Cold/Warm First-Emit + Artifact/Trust Checks)
+```bash
+make gate-v1-acceptance
+```
+Runs deterministic cold/warm near-live checks plus backlog/trust checks and writes artifacts under `artifacts/bench/gate_v1_acceptance/<timestamp>/`.
+
+### Run Packaged Live Smoke Gate (signed app, deterministic fake capture)
+```bash
+make gate-packaged-live-smoke
+```
+Runs the signed transcribe app executable in `--live-stream` mode with deterministic fake capture input and writes machine-readable evidence under:
+
+- `~/Library/Containers/com.recordit.sequoiatranscribe/Data/artifacts/packaged-beta/gates/gate_packaged_live_smoke/<timestamp>/summary.csv`
+- `~/Library/Containers/com.recordit.sequoiatranscribe/Data/artifacts/packaged-beta/gates/gate_packaged_live_smoke/<timestamp>/status.txt`
+
+Reference: `docs/gate-packaged-live-smoke.md`.
+
 ### Run Packaged Beta Entrypoint (signed app mode, recommended)
 ```bash
 make run-transcribe-app ASR_MODEL=models/ggml-base.en.bin
@@ -159,6 +188,24 @@ Optional overrides:
 - `TRANSCRIBE_APP_ARTIFACT_ROOT`
 - `TRANSCRIBE_APP_SESSION_STEM`
 
+Explicit packaged live-stream wrapper:
+
+```bash
+make run-transcribe-live-stream-app ASR_MODEL=models/ggml-base.en.bin
+```
+
+This keeps the same signed app entrypoint, prints the live input/output artifact paths before launch, and uses:
+
+- `<root>/<session-stem>.input.wav`
+- `<root>/<session-stem>.wav`
+- `<root>/<session-stem>.jsonl`
+- `<root>/<session-stem>.manifest.json`
+
+Packaged live follow-on evidence path:
+
+- `make gate-packaged-live-smoke` writes packaged live smoke evidence under `<root>/gates/gate_packaged_live_smoke/<timestamp>/...`
+- reference: `docs/adr-004-packaged-entrypoint.md` (follow-on design section)
+
 ### Run Transcription Preflight (signed app mode diagnostics)
 ```bash
 make run-transcribe-preflight-app ASR_MODEL=models/ggml-base.en.bin
@@ -172,6 +219,14 @@ Default signed preflight manifest path:
 make run-transcribe-model-doctor-app ASR_MODEL=models/ggml-base.en.bin
 ```
 Runs model/backend diagnostics in the same signed app context used by packaged beta runs so model resolution and backend readiness can be verified without using debug-only entrypoints.
+
+For live-stream prerequisite diagnostics in packaged context:
+```bash
+make run-transcribe-model-doctor-app \
+  ASR_MODEL=models/ggml-base.en.bin \
+  TRANSCRIBE_ARGS=--live-stream
+```
+Use this path for live-mode readiness checks; `--preflight` remains intentionally incompatible with `--live-stream`.
 
 ### Bundle + Sign
 ```bash

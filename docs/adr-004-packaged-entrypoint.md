@@ -44,3 +44,33 @@ Engineering-only surfaces remain supported but are not the packaged default:
 - Docs/help text should reference `run-transcribe-app` as the packaged beta default.
 - Follow-on work can standardize artifact destination and session summary around this path.
 - Capture-only and debug paths stay available for development/testing, but should be documented as non-default for packaged operators.
+
+## Follow-on Design: Packaged Live-Stream Plumbing (`bd-31s`)
+
+When packaged live-stream support is enabled after CLI v1 stabilization, keep the same packaged operator entrypoint and extend its argument/artifact contract instead of introducing a second app launcher.
+
+Argument plumbing plan:
+
+- entrypoint remains `make run-transcribe-app`
+- live selector is forwarded via `TRANSCRIBE_ARGS=--live-stream`
+- packaged live mode also needs an explicit container-scoped capture input path:
+  - proposed default: `$(TRANSCRIBE_APP_ARTIFACT_ROOT)/$(TRANSCRIBE_APP_SESSION_STEM).input.wav`
+- packaged preflight/model-doctor flows stay on the same entrypoint family and continue to reject incompatible selectors (`--preflight`, `--replay-jsonl`) exactly as the debug CLI does
+
+Artifact destination plan:
+
+- retain the current packaged root:
+  - `~/Library/Containers/com.recordit.sequoiatranscribe/Data/artifacts/packaged-beta/`
+- keep one session stem per run so packaged live writes a coherent quartet:
+  - `<stem>.input.wav`
+  - `<stem>.wav`
+  - `<stem>.jsonl`
+  - `<stem>.manifest.json`
+- reserve a sibling gate evidence subtree for packaged follow-on validation:
+  - `<root>/gates/<gate-name>/<timestamp>/...`
+
+Why this shape:
+
+1. downstream packaged tasks (`bd-3dx`, `bd-3ma`) can reuse the existing packaged app launch path
+2. live capture input becomes auditable in the same container root as output artifacts
+3. operator docs can describe one packaged path with mode-specific arguments instead of multiple competing app entrypoints
