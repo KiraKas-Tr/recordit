@@ -169,7 +169,7 @@ For packaged runs, use the post-run summary emitted by `make run-transcribe-app`
 If deeper inspection is needed, read the packaged manifest directly:
 
 ```bash
-jq '.trust, .degradation_events, .chunk_queue' \
+jq '.trust, .degradation_events, .reconciliation, .chunk_queue, .session_summary, .terminal_summary' \
   ~/Library/Containers/com.recordit.sequoiatranscribe/Data/artifacts/packaged-beta/session.manifest.json
 ```
 
@@ -180,16 +180,27 @@ Primary near-live trust/degradation codes and what to do:
   - Immediate action: verify input channel assumptions and re-run `make run-transcribe-preflight-app`.
 - `chunk_queue_backpressure`
   - Meaning: near-live queue saturation dropped oldest queued ASR work (`chunk_queue.dropped_oldest > 0`).
-  - Immediate action: treat live transcript as degraded and review `reconciled_final`/manifest output for final completeness.
+  - Immediate action: treat live transcript as degraded; tune `--chunk-queue-cap` or reduce load, then review `reconciled_final`/manifest output for canonical completeness.
+- `chunk_queue_backpressure_severe`
+  - Meaning: sustained queue pressure materially reduced incremental transcript fidelity/timeliness.
+  - Immediate action: prioritize post-session review (`reconciled_final`, `session_summary`, `chunk_queue` lag metrics) over in-session incremental output and reduce host load before rerun.
 - `reconciliation_applied`
   - Meaning: post-session reconciliation ran after backlog pressure to improve final completeness.
-  - Immediate action: use reconciled final output for review; if frequent, reduce system load before next run.
-- `live_capture_interruption_recovered`
-  - Meaning: capture restart(s) occurred and runtime recovered.
-  - Immediate action: check permission/device stability, then re-run preflight if interruptions persist.
-- `live_capture_continuity_unverified`
+  - Immediate action: use `reconciled_final` as canonical text and inspect `reconciliation.trigger_codes` for root-cause classification before deciding rerun scope.
+- `continuity_recovered_with_gaps`
+  - Meaning: capture interruption recovery succeeded, but continuity may contain boundary gaps.
+  - Immediate action: inspect `reconciliation.trigger_codes`, lifecycle timeline, and trust notices before treating session as gap-free.
+- `continuity_unverified`
   - Meaning: continuity telemetry was missing/unreadable, so continuity confidence is reduced.
   - Immediate action: verify writable artifact paths and rerun packaged preflight/model-doctor before trusting continuity-sensitive outcomes.
+
+Manifest interpretation checklist for degraded runs:
+
+1. If `trust.degraded_mode_active=true`, treat run as degraded even when command exit status is success.
+2. If `reconciliation.applied=true`, prefer `reconciled_final` output over raw `final` lines for operator review.
+3. If `chunk_queue.dropped_oldest > 0` or trust code includes `chunk_queue_backpressure*`, classify session as backlog-pressured and adjust queue/load tuning before next run.
+4. If trust code includes `continuity_*`, treat continuity-sensitive conclusions as provisional until a rerun verifies clean continuity telemetry.
+5. Use `terminal_summary` versus `session_summary` to separate what operators actually saw live from machine-normalized close-summary aggregates.
 
 ## 6) Tested Failure Signatures and Fixes
 

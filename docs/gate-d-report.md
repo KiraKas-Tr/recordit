@@ -23,8 +23,7 @@ Implementation:
 
 The soak harness is deterministic and host-independent:
 - builds `target/debug/transcribe-live`
-- stages a local harness binary under `artifacts/bench/gate_d/<stamp>/harness/bin/`
-- injects a fake `sequoia_capture` sibling that copies a deterministic stereo fixture and emits capture telemetry
+- runs `transcribe-live` with `RECORDIT_FAKE_CAPTURE_FIXTURE=<fixture>` so the shared live capture runtime uses deterministic fixture input and emits capture telemetry
 - runs repeated `--live-chunked` invocations while collecting per-run manifest/JSONL/time/stdout artifacts
 
 ## Artifact Layout
@@ -34,7 +33,7 @@ Gate root:
 
 Per-run artifacts:
 - `runs/run_<id>.capture.wav`
-- `runs/run_<id>.capture.telemetry.json`
+- `runs/run_<id>.session.telemetry.json` (primary; `capture.telemetry` accepted as fallback for compatibility)
 - `runs/run_<id>.session.wav`
 - `runs/run_<id>.manifest.json`
 - `runs/run_<id>.jsonl`

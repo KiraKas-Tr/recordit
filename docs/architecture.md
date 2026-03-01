@@ -66,6 +66,20 @@ Per chunk:
   - inherits `DYLD_LIBRARY_PATH=/usr/lib/swift` from `.cargo/config.toml`
   - avoids the `libswift_Concurrency.dylib` loader failure that occurs when the Swift runtime path is absent
 
+### Transcribe Runtime Taxonomy
+
+The transcribe path now treats runtime mode as a taxonomy contract:
+
+| Taxonomy mode | Selector | Runtime label | Status |
+|---|---|---|---|
+| `representative-offline` | `<default>` | `representative-offline` | implemented |
+| `representative-chunked` | `--live-chunked` | `live-chunked` | implemented |
+| `live-stream` | `--live-stream` | `live-stream` | implemented |
+
+Compatibility note:
+- `representative-chunked` intentionally preserves the `live-chunked` runtime label in artifacts to avoid breaking existing replay/gate tooling while `live-stream` now lands as the dedicated runtime entrypoint.
+- naming/deprecation guidance for this compatibility label is documented in `docs/live-chunked-migration.md`.
+
 ## Transcribe Model Resolution
 
 - `transcribe-live` resolves model assets with strict precedence:
@@ -96,11 +110,24 @@ Per chunk:
 1. Capture transport (`bd-3ib`)
    - callback path uses preallocated fixed-capacity transport (`src/rt_transport.rs`)
    - pressure/drop counters are explicit (`slot_miss_drops`, `queue_full_drops`, `ready_depth_high_water`)
+   - shared capture runtime extraction now lives in `src/live_capture.rs`:
+     - ScreenCaptureKit session setup/wiring
+     - callback transport + chunk conversion
+     - bounded restart policy + telemetry persistence
+   - `src/bin/sequoia_capture.rs` is a thin CLI wrapper over `recordit::live_capture::run_capture_cli`
+   - shared capture API boundary is defined in `src/capture_api.rs` with stable types for:
+     - capture chunk summaries (`CaptureChunkSummary`, `CaptureChunkKind`)
+     - degradation events (`CaptureDegradationEvent`, `CaptureRecoveryAction`)
+     - capture run telemetry summaries (`CaptureRunSummary` + nested transport/callback/sample-rate structs)
 2. Transcribe runtime (`bd-1yz`, `bd-if5`, `bd-3oj`, `bd-2wu`, `bd-2p6`, `bd-3lv`)
    - deterministic dual-channel merge + replayable JSONL event stream
    - bounded asynchronous cleanup lane with non-blocking enqueue/drop policy
    - explicit mode degradation semantics + `llm_final` lineage
-   - `--live-chunked` runtime path reuses `sequoia_capture` capture session primitives instead of duplicating callback-thread capture logic
+   - `--live-chunked` and `--live-stream` runtime paths call the shared `recordit::live_capture` session runtime in-process
+   - live queue work is classed as `final` / `partial` / `reconcile` with strict priority and oldest-lowest-priority eviction under pressure
+   - canonical `out_wav` is materialized progressively during live capture and finalized at session end
+   - lifecycle transitions (`warmup`, `active`, `draining`, `shutdown`) are explicit in terminal + artifact surfaces
+   - VAD segmentation now tracks speech incrementally per channel before producing deterministic merged boundaries
    - sandbox-aware model resolution precedence with actionable diagnostics
    - readable transcript defaults with deterministic overlap annotation policy
 3. Gate evidence and policy docs

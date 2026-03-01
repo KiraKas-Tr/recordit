@@ -55,6 +55,43 @@ make transcribe-live ASR_MODEL=models/ggml-base.en.bin
 ```
 Validates CLI flags, runs representative ASR transcription against `--input-wav` (auto-generated locally if missing), emits `partial`/`final` events to terminal + JSONL, computes VAD boundaries, and writes runtime manifest + mode-specific latency benchmark artifacts.
 
+### Run True Live-Stream Runtime (debug)
+```bash
+make transcribe-live-stream ASR_MODEL=models/ggml-base.en.bin
+```
+Runs the `--live-stream` runtime selector and prints absolute paths for captured input + emitted artifacts before execution.
+
+Common overrides:
+- `TRANSCRIBE_LIVE_STREAM_SECS`
+- `TRANSCRIBE_LIVE_STREAM_INPUT_WAV`
+- `TRANSCRIBE_LIVE_STREAM_OUT_WAV`, `TRANSCRIBE_LIVE_STREAM_OUT_JSONL`, `TRANSCRIBE_LIVE_STREAM_OUT_MANIFEST`
+- `TRANSCRIBE_LIVE_STREAM_ARGS` (pass-through extra `transcribe-live` flags)
+
+### Runtime Mode Quick Guide (operator first-read)
+
+| Runtime taxonomy mode | Selector | Use this when | When stable transcript lines appear |
+|---|---|---|---|
+| `representative-offline` | `<default>` | deterministic artifact validation against an input WAV | mostly at end-of-run summary/replay surfaces |
+| `representative-chunked` | `--live-chunked` | near-live scheduler validation on captured WAV (no true concurrent capture) | during runtime as boundaries close, with end summary for complete closeout |
+| `live-stream` | `--live-stream` | true live capture + transcription during recording | during active runtime after warmup, then deterministic close summary |
+
+Migration note for selector naming compatibility:
+- [Legacy `--live-chunked` migration note](docs/live-chunked-migration.md)
+
+Quick first-run path for true live mode:
+
+```bash
+make setup-whispercpp-model
+make transcribe-live-stream ASR_MODEL=artifacts/bench/models/whispercpp/ggml-tiny.en.bin
+```
+
+What to expect:
+
+- `warmup` lifecycle starts first; transcript lines are not expected until runtime reaches `active`.
+- once `active`, interactive terminals show low-noise partial updates and stable final lines as segments close.
+- close summary is deterministic; if stable lines were already shown live, duplicate replay is suppressed.
+- if summary reports degraded trust/degradation counters, use `reconciled_final` plus manifest trust/reconciliation fields for canonical review.
+
 ### One-Command Capture then Transcribe (debug)
 ```bash
 make capture-transcribe
@@ -211,9 +248,12 @@ cargo run --bin transcribe-live -- [--asr-model <local-model-path>] [flags...]
   - `--llm-max-queue`
   - `--llm-retries`
   - `--live-chunked`
+  - `--live-stream`
   - `--chunk-window-ms`
   - `--chunk-stride-ms`
   - `--chunk-queue-cap`
+  - `--live-asr-workers`
+  - `--keep-temp-audio`
   - `--transcribe-channels`
   - `--speaker-labels`
   - `--benchmark-runs`
@@ -247,30 +287,57 @@ cargo run --bin transcribe-live -- [--asr-model <local-model-path>] [flags...]
 - near-live runtime contract:
   - default runtime mode is `representative-offline`
   - enable near-live contract with `--live-chunked`
-  - `--live-chunked` prepares runtime input by launching a live capture session (`sequoia_capture`) and then runs a rolling near-live scheduler over the captured WAV
-  - rolling scheduler semantics: `4s` default window, `1s` default stride, deterministic chunk segment IDs, and tail-aligned final window coverage
+  - runtime taxonomy is authoritative and currently split into:
+
+    | Taxonomy mode | Current selector | `runtime_mode` artifact value | Primary operator intent | Transcript timing expectation | `--replay-jsonl` compatibility | `--preflight` compatibility |
+    |---|---|---|---|---|---|---|
+    | `representative-offline` | `<default>` | `representative-offline` | deterministic offline transcript contract validation | stable transcript lines are primarily end-of-run surfaces | compatible | compatible |
+    | `representative-chunked` | `--live-chunked` | `live-chunked` | near-live queue/scheduler behavior validation on captured WAV | runtime stable lines emit as boundaries close; summary closes out full session | incompatible | incompatible |
+    | `live-stream` | `--live-stream` | `live-stream` | true concurrent capture + transcription while recording | transcript emission starts after warmup enters `active` and continues during capture | incompatible | incompatible |
+
+  - `--live-chunked` prepares runtime input via the shared in-process live capture runtime (`recordit::live_capture`) and then runs a rolling near-live scheduler over the captured WAV
+  - rolling scheduler semantics: `2s` default window, `0.5s` default stride, deterministic chunk segment IDs, and tail-aligned final window coverage
+  - boundary-scoped final segment IDs are normalized from deterministic boundary ordering (`start_ms`, `end_ms`, `source`, `id`) so IDs stay stable even if upstream boundary insertion order changes
   - near-live ASR work is routed through a bounded queue; when saturated, oldest queued chunk work is dropped to preserve non-blocking producer behavior
   - if chunk backlog caused drops, a post-session reconciliation pass emits `reconciled_final` events from canonical session audio to improve final completeness without hiding live-path degradation
-  - `--chunk-window-ms` default `4000`
-  - `--chunk-stride-ms` default `1000`
+  - `--chunk-window-ms` default `2000`
+  - `--chunk-stride-ms` default `500`
   - `--chunk-queue-cap` default `4`
+  - `--live-asr-workers` default `2`
   - `--chunk-stride-ms` must be `<= --chunk-window-ms`
-  - chunk tuning flags require `--live-chunked`
-  - `--live-chunked` is incompatible with `--replay-jsonl` and `--preflight`
+  - live ASR channel work runs through a dedicated worker pool with explicit backend prewarm before the first live run
+  - channel-slice temp WAVs default to `retain-on-failure` cleanup; add `--keep-temp-audio` to retain them on success for debugging
+  - chunk tuning flags require `--live-chunked` or `--live-stream`
+  - `--live-stream` and `--live-chunked` are mutually exclusive selectors
+  - `--live-chunked` and `--live-stream` are incompatible with `--replay-jsonl` and `--preflight`
+  - selector naming/deprecation guidance lives in [`docs/live-chunked-migration.md`](docs/live-chunked-migration.md)
 - mode/degradation artifact policy:
   - runtime manifest records both `channel_mode_requested` and active `channel_mode`
+  - runtime manifest records mode contracts as additive fields: `runtime_mode`, `runtime_mode_taxonomy`, `runtime_mode_selector`, `runtime_mode_status`
   - runtime JSONL emits `event_type=mode_degradation` when fallback/degradation occurs
   - runtime JSONL emits `event_type=trust_notice` with cause/impact/guidance for user-facing trust calibration
+  - runtime JSONL emits `event_type=asr_worker_pool` with prewarm, queue, and temp-audio cleanup counters
   - runtime JSONL emits `event_type=chunk_queue` with near-live queue pressure + lag counters
+  - runtime JSONL is append-only and emitted incrementally during lifecycle progression (not only at shutdown)
+  - runtime JSONL durability checkpoints call `sync_data()` every 24 lines and at stage boundaries
   - runtime manifest records `out_wav`, `out_wav_materialized`, and `out_wav_bytes` for canonical session artifact truth
   - runtime manifest includes a `degradation_events` array with stable `code` + `detail`
+  - runtime manifest includes `asr_worker_pool` telemetry (`prewarm_ok`, `submitted`, `enqueued`, `dropped_queue_full`, `processed`, `succeeded`, `failed`, `retry_attempts`, `temp_audio_deleted`, `temp_audio_retained`)
   - runtime manifest includes `chunk_queue` telemetry (`submitted`, `enqueued`, `dropped_oldest`, `processed`, `pending`, `high_water`, `lag_sample_count`, `lag_p50_ms`, `lag_p95_ms`, `lag_max_ms`)
   - runtime manifest includes a structured `trust` object (`degraded_mode_active`, `notice_count`, `notices`)
+  - runtime manifest includes `session_summary`, a deterministic machine-consumable mirror of terminal close-summary fields (`session_status`, modes, transcript event counts, queue/lag, trust/degradation top codes, cleanup queue, artifacts)
+  - runtime manifest `event_counts` includes transcript family counts (`partial`, `final`, `llm_final`, `reconciled_final`) for deterministic diagnostics
   - replay output prints trust notices so audit reads preserve degraded-mode context
 - readability default contract:
+  - terminal rendering is capability-aware:
+    - interactive `TTY` shows low-noise partial overwrite updates using `[MM:SS.mmm-MM:SS.mmm] <channel> ~ <text>` and appends stable `final` lines as segments close
+    - non-`TTY` logs suppress partial overwrite updates and emit deterministic stable `final` lines during active runtime
+    - end-of-session summary avoids replaying those already-emitted live stable lines to reduce duplicate noise
+  - terminal close-summary fields are emitted in deterministic order (`session_status`, `duration_sec`, mode fields, transcript event counts, queue/lag, trust/degradation, cleanup queue, artifacts)
   - merged transcript line format: `[MM:SS.mmm-MM:SS.mmm] <channel>: <text>`
   - per-channel transcript line format: `[MM:SS.mmm-MM:SS.mmm] <text>`
   - near-simultaneous cross-channel finals are deterministic: keep canonical sort order and annotate the later line with `(overlap<=120ms with <channel>)`
+  - runtime manifest includes `terminal_summary` (`live_mode`, `stable_line_count`, `stable_lines_replayed`, `stable_lines`) aligned with end-of-session terminal behavior
   - runtime manifest persists ordered transcript events (`partial`, `final`, `llm_final`, `reconciled_final`) under `events`
   - runtime manifest includes `readability_defaults` + `transcript_per_channel` entries
 - use `cargo run --bin transcribe-live -- --help` to print the full contract
@@ -304,7 +371,7 @@ Benchmark artifacts are written under:
 ## Output Paths
 - `make capture` / direct `cargo run --bin sequoia_capture`: output path is resolved from the current shell working directory.
 - `make run-app`: app is sandboxed, so relative paths resolve inside container storage.
-- `make transcribe-live` and `make run-transcribe-app`: both pass absolute artifact paths and print them before execution.
+- `make transcribe-live`, `make transcribe-live-stream`, and `make run-transcribe-app`: all pass absolute artifact paths and print them before execution.
 - `make run-transcribe-app` also prints a post-run session summary (manifest presence + trust/degradation counters when `jq` is available).
 - `make transcribe-preflight` and `make run-transcribe-preflight-app`: run deterministic preflight checks and persist checklist outcomes in the manifest output.
 - `make transcribe-model-doctor` and `make run-transcribe-model-doctor-app`: run model/backend diagnostics in debug and packaged contexts with the same operator-facing contract.

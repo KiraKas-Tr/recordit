@@ -130,58 +130,10 @@ if [[ ! -x "$BIN" ]]; then
   exit 1
 fi
 
-HARNESS_BIN_DIR="$OUT_DIR/harness/bin"
-mkdir -p "$HARNESS_BIN_DIR"
-cp "$BIN" "$HARNESS_BIN_DIR/transcribe-live"
-
-cat >"$HARNESS_BIN_DIR/sequoia_capture" <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-
-if [[ $# -lt 5 ]]; then
-  echo "usage: sequoia_capture <duration_sec> <output_wav> <sample_rate_hz> <mismatch_policy> <callback_mode>" >&2
-  exit 2
-fi
-
-duration_sec="$1"
-output_wav="$2"
-sample_rate_hz="$3"
-mismatch_policy="$4"
-callback_mode="$5"
-fixture="${RECORDIT_FAKE_CAPTURE_FIXTURE:?missing RECORDIT_FAKE_CAPTURE_FIXTURE}"
-
-mkdir -p "$(dirname "$output_wav")"
-cp "$fixture" "$output_wav"
-
-stem="$(basename "$output_wav")"
-stem="${stem%.*}"
-telemetry_path="$(dirname "$output_wav")/${stem}.telemetry.json"
-cat >"$telemetry_path" <<JSON
-{
-  "output_wav_path": "$output_wav",
-  "duration_secs": $duration_sec,
-  "target_rate_hz": $sample_rate_hz,
-  "output_rate_hz": $sample_rate_hz,
-  "restart_count": 0,
-  "sample_rate_policy": {
-    "mismatch_policy": "$mismatch_policy",
-    "target_rate_hz": $sample_rate_hz,
-    "output_rate_hz": $sample_rate_hz,
-    "mic_input_rate_hz": $sample_rate_hz,
-    "system_input_rate_hz": $sample_rate_hz,
-    "mic_resampled_chunks": 0,
-    "system_resampled_chunks": 0
-  },
-  "callback_mode": "$callback_mode"
-}
-JSON
-EOF
-chmod +x "$HARNESS_BIN_DIR/sequoia_capture"
-
 set +e
 (
   cd "$ROOT"
-  /usr/bin/time -l env DYLD_LIBRARY_PATH=/usr/lib/swift RECORDIT_FAKE_CAPTURE_FIXTURE="$FIXTURE" "$HARNESS_BIN_DIR/transcribe-live" \
+  /usr/bin/time -l env DYLD_LIBRARY_PATH=/usr/lib/swift RECORDIT_FAKE_CAPTURE_FIXTURE="$FIXTURE" "$BIN" \
     --duration-sec "$DURATION_SEC" \
     --live-chunked \
     --input-wav "$RUN_INPUT_WAV" \

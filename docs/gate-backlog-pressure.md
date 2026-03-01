@@ -2,7 +2,8 @@
 
 This gate codifies near-live queue degradation behavior under intentional pressure.
 It is deterministic and host-independent: it runs `transcribe-live --live-chunked`
-through a fake capture harness that feeds a fixed stereo fixture.
+through the shared fake-capture runtime path (`RECORDIT_FAKE_CAPTURE_FIXTURE`)
+with a fixed stereo fixture.
 
 ## Run
 

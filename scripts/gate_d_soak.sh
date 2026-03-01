@@ -85,53 +85,6 @@ if [[ ! -x "$BIN" ]]; then
   echo "missing executable: $BIN" >&2
   exit 1
 fi
-HARNESS_BIN_DIR="$OUT_DIR/harness/bin"
-mkdir -p "$HARNESS_BIN_DIR"
-cp "$BIN" "$HARNESS_BIN_DIR/transcribe-live"
-
-cat >"$HARNESS_BIN_DIR/sequoia_capture" <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-
-if [[ $# -lt 5 ]]; then
-  echo "usage: sequoia_capture <duration_sec> <output_wav> <sample_rate_hz> <mismatch_policy> <callback_mode>" >&2
-  exit 2
-fi
-
-duration_sec="$1"
-output_wav="$2"
-sample_rate_hz="$3"
-mismatch_policy="$4"
-callback_mode="$5"
-fixture="${RECORDIT_FAKE_CAPTURE_FIXTURE:?missing RECORDIT_FAKE_CAPTURE_FIXTURE}"
-
-mkdir -p "$(dirname "$output_wav")"
-cp "$fixture" "$output_wav"
-
-stem="$(basename "$output_wav")"
-stem="${stem%.*}"
-telemetry_path="$(dirname "$output_wav")/${stem}.telemetry.json"
-cat >"$telemetry_path" <<JSON
-{
-  "output_wav_path": "$output_wav",
-  "duration_secs": $duration_sec,
-  "target_rate_hz": $sample_rate_hz,
-  "output_rate_hz": $sample_rate_hz,
-  "restart_count": 0,
-  "sample_rate_policy": {
-    "mismatch_policy": "$mismatch_policy",
-    "target_rate_hz": $sample_rate_hz,
-    "output_rate_hz": $sample_rate_hz,
-    "mic_input_rate_hz": $sample_rate_hz,
-    "system_input_rate_hz": $sample_rate_hz,
-    "mic_resampled_chunks": 0,
-    "system_resampled_chunks": 0
-  },
-  "callback_mode": "$callback_mode"
-}
-JSON
-EOF
-chmod +x "$HARNESS_BIN_DIR/sequoia_capture"
 
 start_epoch="$(date +%s)"
 end_epoch=$((start_epoch + SOAK_SECONDS))
@@ -191,13 +144,14 @@ while [[ "$(date +%s)" -lt "$end_epoch" ]]; do
   jsonl="$base.jsonl"
   input_wav="$base.capture.wav"
   out_wav="$base.session.wav"
-  telemetry="$base.capture.telemetry.json"
+  telemetry_primary="$base.session.telemetry.json"
+  telemetry_fallback="$base.capture.telemetry.json"
   start_utc="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
   set +e
   (
     cd "$ROOT"
-    /usr/bin/time -l env DYLD_LIBRARY_PATH=/usr/lib/swift RECORDIT_FAKE_CAPTURE_FIXTURE="$FIXTURE" "$HARNESS_BIN_DIR/transcribe-live" \
+    /usr/bin/time -l env DYLD_LIBRARY_PATH=/usr/lib/swift RECORDIT_FAKE_CAPTURE_FIXTURE="$FIXTURE" "$BIN" \
       --duration-sec "$RUN_DURATION_SEC" \
       --live-chunked \
       --asr-backend whispercpp \
@@ -283,6 +237,10 @@ while [[ "$(date +%s)" -lt "$end_epoch" ]]; do
     cleanup_timed_out=0
     mode_requested=unknown
     mode_active=unknown
+  fi
+  telemetry="$telemetry_primary"
+  if [[ ! -f "$telemetry" && -f "$telemetry_fallback" ]]; then
+    telemetry="$telemetry_fallback"
   fi
   if [[ -f "$telemetry" ]] && jq -e . "$telemetry" >/dev/null 2>&1; then
     capture_restart_count="$(jq -r '.restart_count // 0' "$telemetry" 2>/dev/null || echo 0)"

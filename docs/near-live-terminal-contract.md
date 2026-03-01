@@ -17,6 +17,8 @@ Applies when near-live mode is active (`--live-chunked` in the live CLI contract
 
 Does not change JSONL/manifest semantics. Terminal output is a presentation layer over the same runtime event stream.
 
+Canonical JSONL semantics are defined in `docs/live-jsonl-event-contract.md`.
+
 ## Output Profiles
 
 ### Profile A: Concise Default
@@ -30,14 +32,20 @@ Required behavior:
    - channel mode (requested/active)
    - chunk policy (`window_ms`, `stride_ms`, queue cap)
    - artifact destinations (`out_wav`, `out_jsonl`, `out_manifest`)
-2. Emit transcript lines only for stable user-facing events (`final` and `llm_final`).
+2. Split transcript rendering by terminal capability:
+   - `TTY` (`stdout` is interactive): emit low-noise partial overwrite updates plus stable lines for `final`, `llm_final`, and `reconciled_final`.
+   - non-`TTY` (redirected logs/CI): suppress partial updates and emit deterministic stable lines only (`final`, `llm_final`, `reconciled_final`).
 3. Emit trust/degradation notices only when state changes.
 4. Emit periodic heartbeat at a fixed cadence (default `10s`) with compact counters.
-5. Print one deterministic end-of-session summary block.
+5. Print one deterministic end-of-session summary block without replaying already-emitted live stable lines.
 
 Line format for transcript rows:
 
 `[MM:SS.mmm-MM:SS.mmm] <channel>: <text>`
+
+TTY partial overwrite format:
+
+`[MM:SS.mmm-MM:SS.mmm] <channel> ~ <text>`
 
 Optional overlap annotation remains bounded and deterministic:
 
@@ -90,6 +98,7 @@ Terminal summary fields must map directly to existing or planned JSONL/manifest 
 - `channel_mode_*` -> manifest `channel_mode_requested`, `channel_mode`
 - transcript counts -> JSONL event type counts (`partial`, `final`, `llm_final`, `reconciled_final`)
 - transcript event timeline -> manifest `events[]` and JSONL transcript events (replay-safe ordering)
+- transcript lineage -> JSONL `source_final_segment_id` on derived events (`llm_final`, `reconciled_final`)
 - trust/degradation counts -> JSONL `trust_notice` and `mode_degradation`
 - queue counters -> manifest/JSONL near-live `chunk_queue` telemetry and `cleanup_queue` telemetry
 - artifact paths -> runtime output destinations

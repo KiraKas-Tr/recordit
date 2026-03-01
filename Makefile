@@ -18,6 +18,12 @@ TRANSCRIBE_SECS ?= 10
 TRANSCRIBE_OUT_WAV ?= artifacts/transcribe-live.wav
 TRANSCRIBE_OUT_JSONL ?= artifacts/transcribe-live.jsonl
 TRANSCRIBE_OUT_MANIFEST ?= artifacts/transcribe-live.manifest.json
+TRANSCRIBE_LIVE_STREAM_SECS ?= 10
+TRANSCRIBE_LIVE_STREAM_INPUT_WAV ?= artifacts/transcribe-live-stream.input.wav
+TRANSCRIBE_LIVE_STREAM_OUT_WAV ?= artifacts/transcribe-live-stream.wav
+TRANSCRIBE_LIVE_STREAM_OUT_JSONL ?= artifacts/transcribe-live-stream.jsonl
+TRANSCRIBE_LIVE_STREAM_OUT_MANIFEST ?= artifacts/transcribe-live-stream.manifest.json
+TRANSCRIBE_LIVE_STREAM_ARGS ?=
 TRANSCRIBE_APP_ARTIFACT_ROOT ?= $(HOME)/Library/Containers/com.recordit.sequoiatranscribe/Data/artifacts/packaged-beta
 TRANSCRIBE_APP_SESSION_STEM ?= session
 TRANSCRIBE_APP_OUT_WAV ?= $(TRANSCRIBE_APP_ARTIFACT_ROOT)/$(TRANSCRIBE_APP_SESSION_STEM).wav
@@ -47,7 +53,7 @@ SMOKE_NEAR_LIVE_DETERMINISTIC_DIR ?= artifacts/smoke/near-live-deterministic
 SMOKE_NEAR_LIVE_INPUT_WAV ?= $(SMOKE_NEAR_LIVE_DIR)/capture.input.wav
 SMOKE_NEAR_LIVE_DETERMINISTIC_INPUT_WAV ?= artifacts/bench/corpus/gate_c/tts_phrase_stereo.wav
 
-.PHONY: help build build-release probe capture transcribe-live capture-transcribe transcribe-preflight transcribe-model-doctor smoke smoke-offline smoke-near-live smoke-near-live-deterministic setup-whispercpp-model run-transcribe-app run-transcribe-preflight-app run-transcribe-model-doctor-app bench-harness gate-d-soak bundle bundle-transcribe sign sign-transcribe verify run-app reset-perms clean
+.PHONY: help build build-release probe capture transcribe-live transcribe-live-stream capture-transcribe transcribe-preflight transcribe-model-doctor smoke smoke-offline smoke-near-live smoke-near-live-deterministic setup-whispercpp-model run-transcribe-app run-transcribe-preflight-app run-transcribe-model-doctor-app bench-harness gate-d-soak bundle bundle-transcribe sign sign-transcribe verify run-app reset-perms clean
 
 help:
 	@echo "Targets:"
@@ -56,6 +62,7 @@ help:
 	@echo "  probe         - Run API probe (debug)"
 	@echo "  capture       - Run WAV recorder (debug)"
 	@echo "  transcribe-live   - Validate transcribe-live CLI contract (debug)"
+	@echo "  transcribe-live-stream - Run the true live-stream debug path with captured input + printed artifact paths"
 	@echo "  capture-transcribe - One-command capture then transcription workflow (debug)"
 	@echo "  transcribe-preflight - Run transcribe-live preflight diagnostics (debug)"
 	@echo "  transcribe-model-doctor - Run transcribe-live model/backend diagnostics (debug)"
@@ -94,6 +101,14 @@ transcribe-live: build
 	@echo "  JSONL:    $(abspath $(TRANSCRIBE_OUT_JSONL))"
 	@echo "  Manifest: $(abspath $(TRANSCRIBE_OUT_MANIFEST))"
 	DYLD_LIBRARY_PATH=/usr/lib/swift cargo run --bin $(TRANSCRIBE_BIN) -- --duration-sec $(TRANSCRIBE_SECS) --out-wav "$(abspath $(TRANSCRIBE_OUT_WAV))" --out-jsonl "$(abspath $(TRANSCRIBE_OUT_JSONL))" --out-manifest "$(abspath $(TRANSCRIBE_OUT_MANIFEST))" --asr-model "$(ASR_MODEL)" $(TRANSCRIBE_ARGS)
+
+transcribe-live-stream: build
+	@echo "Transcribe-live-stream absolute artifact paths:"
+	@echo "  Input WAV: $(abspath $(TRANSCRIBE_LIVE_STREAM_INPUT_WAV))"
+	@echo "  WAV:       $(abspath $(TRANSCRIBE_LIVE_STREAM_OUT_WAV))"
+	@echo "  JSONL:     $(abspath $(TRANSCRIBE_LIVE_STREAM_OUT_JSONL))"
+	@echo "  Manifest:  $(abspath $(TRANSCRIBE_LIVE_STREAM_OUT_MANIFEST))"
+	DYLD_LIBRARY_PATH=/usr/lib/swift cargo run --bin $(TRANSCRIBE_BIN) -- --duration-sec $(TRANSCRIBE_LIVE_STREAM_SECS) --live-stream --input-wav "$(abspath $(TRANSCRIBE_LIVE_STREAM_INPUT_WAV))" --out-wav "$(abspath $(TRANSCRIBE_LIVE_STREAM_OUT_WAV))" --out-jsonl "$(abspath $(TRANSCRIBE_LIVE_STREAM_OUT_JSONL))" --out-manifest "$(abspath $(TRANSCRIBE_LIVE_STREAM_OUT_MANIFEST))" --asr-model "$(ASR_MODEL)" $(TRANSCRIBE_LIVE_STREAM_ARGS)
 
 capture-transcribe: build
 	@echo "Capture+Transcribe absolute artifact paths:"
