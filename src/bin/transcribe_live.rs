@@ -300,6 +300,13 @@ fn runtime_mode_compatibility_matrix() -> &'static [RuntimeModeCompatibility; 3]
     ]
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimeExecutionBranch {
+    RepresentativeOffline,
+    RepresentativeChunked,
+    LiveStream,
+}
+
 #[derive(Debug, Clone)]
 struct TranscribeConfig {
     duration_sec: u64,
@@ -1584,11 +1591,44 @@ fn prewarm_backend_binary(backend: AsrBackend, program: &str) -> Result<(), Stri
     Ok(())
 }
 
-fn run_live_pipeline(config: &TranscribeConfig) -> Result<LiveRunReport, CliError> {
+fn select_runtime_execution_branch(config: &TranscribeConfig) -> RuntimeExecutionBranch {
     if config.live_stream {
-        return run_live_stream_pipeline(config);
+        RuntimeExecutionBranch::LiveStream
+    } else if config.live_chunked {
+        RuntimeExecutionBranch::RepresentativeChunked
+    } else {
+        RuntimeExecutionBranch::RepresentativeOffline
     }
-    run_standard_pipeline(config)
+}
+
+fn run_runtime_pipeline(config: &TranscribeConfig) -> Result<LiveRunReport, CliError> {
+    match select_runtime_execution_branch(config) {
+        RuntimeExecutionBranch::RepresentativeOffline => {
+            run_representative_offline_pipeline(config)
+        }
+        RuntimeExecutionBranch::RepresentativeChunked => {
+            run_representative_chunked_pipeline(config)
+        }
+        RuntimeExecutionBranch::LiveStream => run_live_stream_pipeline(config),
+    }
+}
+
+fn run_representative_offline_pipeline(
+    config: &TranscribeConfig,
+) -> Result<LiveRunReport, CliError> {
+    let mut offline_config = config.clone();
+    offline_config.live_chunked = false;
+    offline_config.live_stream = false;
+    run_standard_pipeline(&offline_config)
+}
+
+fn run_representative_chunked_pipeline(
+    config: &TranscribeConfig,
+) -> Result<LiveRunReport, CliError> {
+    let mut chunked_config = config.clone();
+    chunked_config.live_chunked = true;
+    chunked_config.live_stream = false;
+    run_standard_pipeline(&chunked_config)
 }
 
 fn run_live_stream_pipeline(config: &TranscribeConfig) -> Result<LiveRunReport, CliError> {
@@ -2487,8 +2527,7 @@ fn build_targeted_reconciliation_events(
                 boundary.start_ms,
                 boundary.end_ms,
             );
-            let segment_text =
-                chunk_scoped_text(&transcript.text, boundary_idx, boundary_count);
+            let segment_text = chunk_scoped_text(&transcript.text, boundary_idx, boundary_count);
             if segment_text.trim().is_empty() {
                 continue;
             }
@@ -4765,7 +4804,11 @@ fn write_runtime_jsonl(config: &TranscribeConfig, report: &LiveRunReport) -> Res
         writeln!(
             file,
             "{}",
-            jsonl_mode_degradation_line(report.channel_mode, report.active_channel_mode, degradation)
+            jsonl_mode_degradation_line(
+                report.channel_mode,
+                report.active_channel_mode,
+                degradation
+            )
         )
         .map_err(io_to_cli)?;
     }
@@ -5530,7 +5573,7 @@ fn main() -> ExitCode {
                 }
 
                 config.print_summary();
-                match run_live_pipeline(&config) {
+                match run_runtime_pipeline(&config) {
                     Ok(run_report) => {
                         print_live_report(&config, &run_report);
                         ExitCode::SUCCESS
@@ -6404,31 +6447,28 @@ fn command_stdout(program: &str, args: &[&str]) -> Result<String, CliError> {
 mod tests {
     use super::{
         build_live_chunked_events_with_queue, build_live_close_summary_lines,
-        build_reconciliation_events,
-        build_reconciliation_matrix, build_rolling_chunk_windows,
-        build_targeted_reconciliation_events,
-        build_terminal_render_actions, build_transcript_events, build_trust_notices,
-        bundled_backend_program_from_exe,
+        build_reconciliation_events, build_reconciliation_matrix, build_rolling_chunk_windows,
+        build_targeted_reconciliation_events, build_terminal_render_actions,
+        build_transcript_events, build_trust_notices, bundled_backend_program_from_exe,
         chunk_queue_backpressure_is_severe, collect_live_capture_continuity_events,
         detect_per_channel_vad_boundaries, detect_vad_boundaries,
-        emit_latest_lifecycle_transition_jsonl,
-        live_capture_telemetry_path_candidates, live_terminal_render_actions, materialize_out_wav,
-        merge_channel_vad_boundaries, merge_transcript_events, model_checksum_info, parse_args_from,
+        emit_latest_lifecycle_transition_jsonl, live_capture_telemetry_path_candidates,
+        live_terminal_render_actions, materialize_out_wav, merge_channel_vad_boundaries,
+        merge_transcript_events, model_checksum_info, parse_args_from,
         parse_replay_transcript_event, parse_trust_notice, prepare_channel_inputs,
         reconstruct_transcript, reconstruct_transcript_per_channel, replay_timeline,
-        resolve_model_path, run_cleanup_queue_with, run_live_chunk_queue,
-        resolve_backend_program,
-        runtime_mode_compatibility_matrix, write_preflight_manifest, write_runtime_jsonl,
-        write_runtime_manifest, AsrBackend, AsrWorkClass, AsrWorkItem, BenchmarkSummary,
-        ChannelMode, ChannelVadBoundary, CheckStatus, CleanupAttemptOutcome, CleanupQueueTelemetry, CleanupTaskStatus,
-        IncrementalVadTracker, LiveAsrPoolTelemetry, LiveChunkQueueTelemetry, LiveLifecyclePhase,
-        LiveLifecycleTelemetry, LiveRunReport, ModeDegradationEvent, ParseOutcome, PreflightCheck,
-        PreflightReport, ReconciliationMatrix, ResolvedModelPath, RuntimeJsonlStream,
+        resolve_backend_program, resolve_model_path, run_cleanup_queue_with, run_live_chunk_queue,
+        runtime_mode_compatibility_matrix, select_runtime_execution_branch,
+        write_preflight_manifest, write_runtime_jsonl, write_runtime_manifest, AsrBackend,
+        AsrWorkClass, AsrWorkItem, BenchmarkSummary, ChannelMode, ChannelVadBoundary, CheckStatus,
+        CleanupAttemptOutcome, CleanupQueueTelemetry, CleanupTaskStatus, IncrementalVadTracker,
+        LiveAsrPoolTelemetry, LiveChunkQueueTelemetry, LiveLifecyclePhase, LiveLifecycleTelemetry,
+        LiveRunReport, ModeDegradationEvent, ParseOutcome, PreflightCheck, PreflightReport,
+        ReconciliationMatrix, ResolvedModelPath, RuntimeExecutionBranch, RuntimeJsonlStream,
         TerminalRenderActionKind, TerminalRenderMode, TranscribeConfig, TranscriptEvent,
-        VadBoundary, HELP_TEXT, LIVE_CAPTURE_INTERRUPTION_RECOVERED_CODE,
-        LIVE_CAPTURE_CONTINUITY_UNVERIFIED_CODE,
-        LIVE_CHUNK_QUEUE_BACKPRESSURE_SEVERE_CODE, LIVE_CHUNK_QUEUE_DROP_OLDEST_CODE,
-        RECONCILIATION_APPLIED_CODE,
+        VadBoundary, HELP_TEXT, LIVE_CAPTURE_CONTINUITY_UNVERIFIED_CODE,
+        LIVE_CAPTURE_INTERRUPTION_RECOVERED_CODE, LIVE_CHUNK_QUEUE_BACKPRESSURE_SEVERE_CODE,
+        LIVE_CHUNK_QUEUE_DROP_OLDEST_CODE, RECONCILIATION_APPLIED_CODE,
     };
     use hound::{SampleFormat, WavSpec, WavWriter};
     use std::env;
@@ -6492,6 +6532,36 @@ mod tests {
         assert!(matrix
             .iter()
             .any(|row| row.taxonomy_mode == "live-stream" && row.status == "implemented"));
+    }
+
+    #[test]
+    fn runtime_execution_branch_defaults_to_representative_offline() {
+        let config = TranscribeConfig::default();
+        assert_eq!(
+            select_runtime_execution_branch(&config),
+            RuntimeExecutionBranch::RepresentativeOffline
+        );
+    }
+
+    #[test]
+    fn runtime_execution_branch_selects_representative_chunked_when_enabled() {
+        let mut config = TranscribeConfig::default();
+        config.live_chunked = true;
+        assert_eq!(
+            select_runtime_execution_branch(&config),
+            RuntimeExecutionBranch::RepresentativeChunked
+        );
+    }
+
+    #[test]
+    fn runtime_execution_branch_prefers_live_stream_over_chunked() {
+        let mut config = TranscribeConfig::default();
+        config.live_chunked = true;
+        config.live_stream = true;
+        assert_eq!(
+            select_runtime_execution_branch(&config),
+            RuntimeExecutionBranch::LiveStream
+        );
     }
 
     #[test]
@@ -7917,7 +7987,18 @@ mod tests {
             }],
             lifecycle: sample_lifecycle(),
             reconciliation: ReconciliationMatrix::none(),
-            asr_worker_pool: LiveAsrPoolTelemetry::default(),
+            asr_worker_pool: LiveAsrPoolTelemetry {
+                prewarm_ok: true,
+                submitted: 3,
+                enqueued: 2,
+                dropped_queue_full: 1,
+                processed: 2,
+                succeeded: 1,
+                failed: 2,
+                retry_attempts: 0,
+                temp_audio_deleted: 1,
+                temp_audio_retained: 1,
+            },
             chunk_queue: LiveChunkQueueTelemetry::disabled(&config),
             cleanup_queue: CleanupQueueTelemetry::disabled(&config),
             benchmark: BenchmarkSummary {
@@ -8194,7 +8275,9 @@ mod tests {
         );
 
         assert_eq!(events.len(), 2);
-        assert!(events.iter().all(|event| event.event_type == "reconciled_final"));
+        assert!(events
+            .iter()
+            .all(|event| event.event_type == "reconciled_final"));
         assert!(events.iter().all(|event| event.start_ms == 1_700));
         let lineage = events
             .iter()
@@ -8751,6 +8834,8 @@ mod tests {
         assert!(manifest.contains("\"phase\":\"shutdown\""));
         assert!(manifest.contains("\"reconciliation\": {"));
         assert!(manifest.contains("\"asr_worker_pool\": {"));
+        assert!(manifest.contains("\"temp_audio_deleted\":1"));
+        assert!(manifest.contains("\"temp_audio_retained\":1"));
         assert!(manifest.contains("\"terminal_summary\": {"));
         assert!(manifest.contains("\"stable_line_count\":1"));
         assert!(manifest.contains("\"stable_lines_replayed\":false"));
@@ -8891,7 +8976,11 @@ mod tests {
                     end_ms: 100,
                     source: "energy_threshold",
                 }],
-                events: vec![final_event(&format!("{mode_slug}-segment-0"), "mic", "hello world")],
+                events: vec![final_event(
+                    &format!("{mode_slug}-segment-0"),
+                    "mic",
+                    "hello world",
+                )],
                 degradation_events: Vec::new(),
                 trust_notices: Vec::new(),
                 lifecycle: sample_lifecycle(),
@@ -8923,9 +9012,7 @@ mod tests {
                 "\"runtime_mode_selector\": \"{runtime_selector}\""
             )));
             assert!(manifest.contains("\"runtime_mode_status\": \"implemented\""));
-            assert!(manifest.contains(&format!(
-                "\"live_mode\":{terminal_live_mode}"
-            )));
+            assert!(manifest.contains(&format!("\"live_mode\":{terminal_live_mode}")));
             assert!(manifest.contains(&format!(
                 "\"stable_lines_replayed\":{stable_lines_replayed}"
             )));
@@ -8986,7 +9073,18 @@ mod tests {
             trust_notices: Vec::new(),
             lifecycle: sample_lifecycle(),
             reconciliation: ReconciliationMatrix::none(),
-            asr_worker_pool: LiveAsrPoolTelemetry::default(),
+            asr_worker_pool: LiveAsrPoolTelemetry {
+                prewarm_ok: true,
+                submitted: 4,
+                enqueued: 3,
+                dropped_queue_full: 1,
+                processed: 3,
+                succeeded: 2,
+                failed: 2,
+                retry_attempts: 1,
+                temp_audio_deleted: 2,
+                temp_audio_retained: 1,
+            },
             chunk_queue,
             cleanup_queue: CleanupQueueTelemetry::disabled(&config),
             benchmark: BenchmarkSummary {
@@ -9012,8 +9110,10 @@ mod tests {
             .find(|line| line.contains("\"event_type\":\"asr_worker_pool\""))
             .unwrap();
         assert!(asr_pool_line.contains("\"channel\":\"control\""));
-        assert!(asr_pool_line.contains("\"prewarm_ok\":"));
-        assert!(asr_pool_line.contains("\"submitted\":0"));
+        assert!(asr_pool_line.contains("\"prewarm_ok\":true"));
+        assert!(asr_pool_line.contains("\"submitted\":4"));
+        assert!(asr_pool_line.contains("\"temp_audio_deleted\":2"));
+        assert!(asr_pool_line.contains("\"temp_audio_retained\":1"));
         let chunk_queue_line = jsonl
             .lines()
             .find(|line| line.contains("\"event_type\":\"chunk_queue\""))
@@ -9134,7 +9234,10 @@ mod tests {
 
         lifecycle.transition(LiveLifecyclePhase::Active, "capture loop active");
         emit_latest_lifecycle_transition_jsonl(&mut stream, &lifecycle).unwrap();
-        lifecycle.transition(LiveLifecyclePhase::Draining, "draining queue and reconciliation");
+        lifecycle.transition(
+            LiveLifecyclePhase::Draining,
+            "draining queue and reconciliation",
+        );
         emit_latest_lifecycle_transition_jsonl(&mut stream, &lifecycle).unwrap();
         stream.finalize().unwrap();
 
@@ -9331,8 +9434,7 @@ mod tests {
         fs::create_dir_all(&helpers_dir).unwrap();
         File::create(helpers_dir.join("whisper-cli")).unwrap();
 
-        let resolved =
-            bundled_backend_program_from_exe(AsrBackend::WhisperCpp, &exe_path).unwrap();
+        let resolved = bundled_backend_program_from_exe(AsrBackend::WhisperCpp, &exe_path).unwrap();
         assert_eq!(resolved, resources_helper.to_string_lossy().to_string());
 
         let _ = fs::remove_dir_all(temp_dir);

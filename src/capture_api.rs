@@ -115,6 +115,13 @@ pub struct CaptureChunk {
 }
 
 #[derive(Debug, Clone)]
+pub enum CaptureMessage {
+    Chunk(CaptureChunk),
+    Event(CaptureEvent),
+    Finished(CaptureSummary),
+}
+
+#[derive(Debug, Clone)]
 pub struct CaptureChunkSummary {
     pub kind: CaptureChunkKind,
     pub pts_seconds: f64,
@@ -239,6 +246,17 @@ pub struct CaptureSummary {
     pub degradation_events: Vec<CaptureEvent>,
 }
 
+pub trait CaptureSink {
+    fn on_chunk(&mut self, chunk: CaptureChunk) -> Result<(), String>;
+    fn on_event(&mut self, event: CaptureEvent) -> Result<(), String>;
+}
+
+#[derive(Debug, Clone)]
+pub struct StreamingCaptureResult {
+    pub summary: CaptureSummary,
+    pub progressive_output_path: PathBuf,
+}
+
 impl CaptureSummary {
     pub fn degraded(&self) -> bool {
         !self.degradation_events.is_empty()
@@ -257,6 +275,32 @@ pub fn capture_telemetry_path_for_output(output: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Default)]
+    struct RecordingSink {
+        chunks: Vec<CaptureChunk>,
+        events: Vec<CaptureEvent>,
+        reject_chunks: bool,
+        reject_events: bool,
+    }
+
+    impl CaptureSink for RecordingSink {
+        fn on_chunk(&mut self, chunk: CaptureChunk) -> Result<(), String> {
+            if self.reject_chunks {
+                return Err("chunk rejected by sink".to_string());
+            }
+            self.chunks.push(chunk);
+            Ok(())
+        }
+
+        fn on_event(&mut self, event: CaptureEvent) -> Result<(), String> {
+            if self.reject_events {
+                return Err("event rejected by sink".to_string());
+            }
+            self.events.push(event);
+            Ok(())
+        }
+    }
 
     #[test]
     fn sample_rate_policy_parser_accepts_known_values() {
@@ -317,5 +361,125 @@ mod tests {
             ..clean
         };
         assert!(degraded.degraded());
+    }
+
+    #[test]
+    fn capture_sink_contract_records_chunks_and_events() {
+        let mut sink = RecordingSink::default();
+        let chunk = CaptureChunk {
+            stream: CaptureStream::Microphone,
+            pts_seconds: 1.25,
+            sample_rate_hz: 16_000,
+            mono_samples: vec![0.2, 0.3, 0.4],
+        };
+        let event = CaptureEvent {
+            generated_unix: 10,
+            code: CaptureEventCode::QueueFullDrops,
+            count: 2,
+            recovery_action: CaptureRecoveryAction::DropSampleContinue,
+            detail: "dropped chunk due to full queue".to_string(),
+        };
+
+        sink.on_chunk(chunk.clone())
+            .expect("capture sink should accept chunk");
+        sink.on_event(event.clone())
+            .expect("capture sink should accept event");
+
+        assert_eq!(sink.chunks.len(), 1);
+        assert_eq!(sink.events.len(), 1);
+        assert_eq!(sink.chunks[0].stream, CaptureStream::Microphone);
+        assert_eq!(sink.events[0].code, CaptureEventCode::QueueFullDrops);
+    }
+
+    #[test]
+    fn capture_message_variants_match_payload_contract() {
+        let chunk = CaptureChunk {
+            stream: CaptureStream::SystemAudio,
+            pts_seconds: 0.5,
+            sample_rate_hz: 48_000,
+            mono_samples: vec![0.0, 0.1],
+        };
+        let event = CaptureEvent {
+            generated_unix: 22,
+            code: CaptureEventCode::StreamInterruption,
+            count: 1,
+            recovery_action: CaptureRecoveryAction::RestartStream,
+            detail: "capture interrupted".to_string(),
+        };
+        let summary = CaptureSummary {
+            generated_unix: 42,
+            output_wav_path: PathBuf::from("progressive.wav"),
+            duration_secs: 5,
+            target_rate_hz: 48_000,
+            output_rate_hz: 48_000,
+            mismatch_policy: SampleRateMismatchPolicy::AdaptStreamRate,
+            microphone: CaptureStreamSummary::default(),
+            system_audio: CaptureStreamSummary::default(),
+            output_frames: 2,
+            restart_count: 0,
+            transport: TransportStatsSnapshot::default(),
+            callback_contract: CallbackContractSummary::default(),
+            degradation_events: Vec::new(),
+        };
+
+        let chunk_message = CaptureMessage::Chunk(chunk.clone());
+        match chunk_message {
+            CaptureMessage::Chunk(value) => assert_eq!(value.sample_rate_hz, 48_000),
+            _ => panic!("expected chunk message"),
+        }
+
+        let event_message = CaptureMessage::Event(event.clone());
+        match event_message {
+            CaptureMessage::Event(value) => {
+                assert_eq!(value.recovery_action, CaptureRecoveryAction::RestartStream)
+            }
+            _ => panic!("expected event message"),
+        }
+
+        let finished_message = CaptureMessage::Finished(summary.clone());
+        match finished_message {
+            CaptureMessage::Finished(value) => {
+                assert_eq!(value.output_wav_path, summary.output_wav_path)
+            }
+            _ => panic!("expected finished message"),
+        }
+
+        let result = StreamingCaptureResult {
+            summary,
+            progressive_output_path: PathBuf::from("progressive.wav"),
+        };
+        assert_eq!(
+            result.progressive_output_path.to_string_lossy(),
+            "progressive.wav"
+        );
+    }
+
+    #[test]
+    fn capture_sink_errors_are_string_typed() {
+        let mut sink = RecordingSink {
+            reject_chunks: true,
+            reject_events: true,
+            ..RecordingSink::default()
+        };
+        let chunk_err = sink
+            .on_chunk(CaptureChunk {
+                stream: CaptureStream::Microphone,
+                pts_seconds: 0.0,
+                sample_rate_hz: 16_000,
+                mono_samples: vec![0.0],
+            })
+            .expect_err("chunk should be rejected");
+        let event_err = sink
+            .on_event(CaptureEvent {
+                generated_unix: 0,
+                code: CaptureEventCode::FillFailures,
+                count: 1,
+                recovery_action: CaptureRecoveryAction::DropSampleContinue,
+                detail: "failed to fill chunk".to_string(),
+            })
+            .expect_err("event should be rejected");
+
+        assert!(chunk_err.contains("chunk rejected"));
+        assert!(event_err.contains("event rejected"));
     }
 }

@@ -1,7 +1,9 @@
 use crate::capture_api::{
-    capture_telemetry_path_for_output, CaptureCallbackAuditSummary, CaptureChunkKind,
-    CaptureChunkSummary, CaptureDegradationEvent, CaptureRecoveryAction, CaptureResampleSummary,
-    CaptureRunSummary, CaptureSampleRatePolicySummary, CaptureTransportSummary,
+    capture_telemetry_path_for_output, CallbackContractSummary, CaptureCallbackAuditSummary,
+    CaptureChunk, CaptureChunkKind, CaptureChunkSummary, CaptureDegradationEvent, CaptureEvent,
+    CaptureEventCode, CaptureRecoveryAction, CaptureResampleSummary, CaptureRunSummary,
+    CaptureSampleRatePolicySummary, CaptureSink, CaptureStream, CaptureStreamSummary,
+    CaptureSummary, CaptureTransportSummary, ResampleSummary, StreamingCaptureResult,
 };
 use crate::rt_transport::{preallocated_spsc, PreallocatedProducer};
 use anyhow::{bail, Context, Result};
@@ -13,6 +15,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::thread;
 use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -25,6 +28,7 @@ const PROGRESSIVE_WAV_MATERIALIZE_INTERVAL: Duration = Duration::from_millis(750
 const PROGRESSIVE_WAV_MATERIALIZE_MIN_NEW_CHUNKS: usize = 8;
 const FAKE_CAPTURE_FIXTURE_ENV: &str = "RECORDIT_FAKE_CAPTURE_FIXTURE";
 const FAKE_CAPTURE_RESTART_COUNT_ENV: &str = "RECORDIT_FAKE_CAPTURE_RESTART_COUNT";
+const FAKE_CAPTURE_REALTIME_ENV: &str = "RECORDIT_FAKE_CAPTURE_REALTIME";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SampleRateMismatchPolicy {
@@ -259,6 +263,20 @@ impl TimedChunk {
             frame_count: self.mono_samples.len(),
         })
     }
+
+    fn to_capture_chunk(&self) -> Option<CaptureChunk> {
+        let stream = match self.kind {
+            SCStreamOutputType::Audio => CaptureStream::SystemAudio,
+            SCStreamOutputType::Microphone => CaptureStream::Microphone,
+            SCStreamOutputType::Screen => return None,
+        };
+        Some(CaptureChunk {
+            stream,
+            pts_seconds: self.pts_seconds,
+            sample_rate_hz: self.sample_rate_hz,
+            mono_samples: self.mono_samples.clone(),
+        })
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -291,6 +309,13 @@ struct ResampleStats {
     resampled_chunks: usize,
     input_frames: usize,
     output_frames: usize,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct RuntimeEventCursor {
+    restart_count: usize,
+    transport: crate::rt_transport::TransportStatsSnapshot,
+    callback_audit: CallbackAuditSnapshot,
 }
 
 fn parse_u64_arg(args: &[String], index: usize, default: u64) -> Result<u64> {
@@ -326,6 +351,116 @@ fn env_u64_or_default(name: &str, default: u64) -> Result<u64> {
             .with_context(|| format!("{name} must be an integer")),
         Err(_) => Ok(default),
     }
+}
+
+fn env_bool_or_default(name: &str, default: bool) -> Result<bool> {
+    match env::var(name) {
+        Ok(value) => match value.trim().to_ascii_lowercase().as_str() {
+            "" => Ok(default),
+            "1" | "true" | "yes" | "on" => Ok(true),
+            "0" | "false" | "no" | "off" => Ok(false),
+            other => {
+                bail!("{name} must be one of: 1|0, true|false, yes|no, on|off (received '{other}')")
+            }
+        },
+        Err(_) => Ok(default),
+    }
+}
+
+fn read_fixture_stereo_channels(path: &Path) -> Result<(u32, Vec<f32>, Vec<f32>)> {
+    let mut reader = hound::WavReader::open(path)
+        .with_context(|| format!("failed to open fixture WAV {}", path.display()))?;
+    let spec = reader.spec();
+    let channels = spec.channels as usize;
+    if channels < 2 {
+        bail!(
+            "fake capture fixture must be stereo (>=2 channels), got {} channel(s): {}",
+            channels,
+            path.display()
+        );
+    }
+    if spec.sample_rate == 0 {
+        bail!("fixture WAV has zero sample-rate: {}", path.display());
+    }
+
+    let mut mic = Vec::new();
+    let mut system = Vec::new();
+
+    match spec.sample_format {
+        SampleFormat::Float => {
+            for (idx, sample) in reader.samples::<f32>().enumerate() {
+                let sample = sample.with_context(|| {
+                    format!(
+                        "failed to read floating-point fixture sample at index {idx} from {}",
+                        path.display()
+                    )
+                })?;
+                match idx % channels {
+                    0 => mic.push(sample),
+                    1 => system.push(sample),
+                    _ => {}
+                }
+            }
+        }
+        SampleFormat::Int => {
+            let bits = usize::from(spec.bits_per_sample);
+            if bits == 0 || bits > 32 {
+                bail!(
+                    "unsupported integer fixture bit depth {} in {}",
+                    spec.bits_per_sample,
+                    path.display()
+                );
+            }
+            let denom = ((1_i64 << (bits - 1)) - 1) as f32;
+            for (idx, sample) in reader.samples::<i32>().enumerate() {
+                let sample = sample.with_context(|| {
+                    format!(
+                        "failed to read integer fixture sample at index {idx} from {}",
+                        path.display()
+                    )
+                })?;
+                let normalized = (sample as f32 / denom).clamp(-1.0, 1.0);
+                match idx % channels {
+                    0 => mic.push(normalized),
+                    1 => system.push(normalized),
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    if mic.is_empty() || system.is_empty() {
+        bail!(
+            "fixture WAV must contain interleaved stereo samples (path={})",
+            path.display()
+        );
+    }
+
+    let frame_count = mic.len().min(system.len());
+    mic.truncate(frame_count);
+    system.truncate(frame_count);
+    Ok((spec.sample_rate, mic, system))
+}
+
+fn fake_capture_chunk_frames(sample_rate_hz: u32) -> usize {
+    // 20ms replay granularity keeps deterministic ordering while limiting sink call volume.
+    usize::max(1, (sample_rate_hz as usize) / 50)
+}
+
+fn maybe_sleep_for_replay(realtime: bool, replay_start: Instant, pts_seconds: f64) -> Result<()> {
+    if !realtime {
+        return Ok(());
+    }
+    if !pts_seconds.is_finite() || pts_seconds <= 0.0 {
+        return Ok(());
+    }
+
+    let target_elapsed = Duration::from_secs_f64(pts_seconds);
+    let now_elapsed = replay_start.elapsed();
+    if target_elapsed > now_elapsed {
+        thread::sleep(target_elapsed - now_elapsed);
+    }
+    Ok(())
 }
 
 fn read_f32_le(bytes: &[u8], sample_index: usize) -> f32 {
@@ -626,6 +761,31 @@ struct RunTelemetry {
     callback_audit: CallbackAuditSnapshot,
 }
 
+#[derive(Default)]
+struct CollectingCaptureSink {
+    chunks: Vec<CaptureChunk>,
+    events: Vec<CaptureEvent>,
+}
+
+impl CaptureSink for CollectingCaptureSink {
+    fn on_chunk(&mut self, chunk: CaptureChunk) -> std::result::Result<(), String> {
+        self.chunks.push(chunk);
+        Ok(())
+    }
+
+    fn on_event(&mut self, event: CaptureEvent) -> std::result::Result<(), String> {
+        self.events.push(event);
+        Ok(())
+    }
+}
+
+fn now_unix() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 fn to_capture_recovery_action(action: RecoveryAction) -> CaptureRecoveryAction {
     match action {
         RecoveryAction::DropSampleContinue => CaptureRecoveryAction::DropSampleContinue,
@@ -633,6 +793,38 @@ fn to_capture_recovery_action(action: RecoveryAction) -> CaptureRecoveryAction {
         RecoveryAction::AdaptOutputRate => CaptureRecoveryAction::AdaptOutputRate,
         RecoveryAction::FailFastReconfigure => CaptureRecoveryAction::FailFastReconfigure,
     }
+}
+
+fn to_capture_sample_rate_mismatch_policy(
+    policy: SampleRateMismatchPolicy,
+) -> crate::capture_api::SampleRateMismatchPolicy {
+    match policy {
+        SampleRateMismatchPolicy::Strict => crate::capture_api::SampleRateMismatchPolicy::Strict,
+        SampleRateMismatchPolicy::AdaptStreamRate => {
+            crate::capture_api::SampleRateMismatchPolicy::AdaptStreamRate
+        }
+    }
+}
+
+fn append_capture_event(
+    events: &mut Vec<CaptureEvent>,
+    generated_unix: u64,
+    code: CaptureEventCode,
+    count: u64,
+    action: RecoveryAction,
+    detail: &str,
+) {
+    if count == 0 {
+        return;
+    }
+
+    events.push(CaptureEvent {
+        generated_unix,
+        code,
+        count,
+        recovery_action: to_capture_recovery_action(action),
+        detail: detail.to_string(),
+    });
 }
 
 fn append_degradation_event(
@@ -767,6 +959,101 @@ fn build_degradation_events(
     events
 }
 
+fn build_capture_events(telemetry: &RunTelemetry, generated_unix: u64) -> Vec<CaptureEvent> {
+    let mut events = Vec::new();
+
+    append_capture_event(
+        &mut events,
+        generated_unix,
+        CaptureEventCode::StreamInterruption,
+        telemetry.restart_count as u64,
+        RecoveryAction::RestartStream,
+        "capture stream interruption detected and restart attempted",
+    );
+    append_capture_event(
+        &mut events,
+        generated_unix,
+        CaptureEventCode::SlotMissDrops,
+        telemetry.transport.slot_miss_drops,
+        RecoveryAction::DropSampleContinue,
+        "callback could not acquire a free slot",
+    );
+    append_capture_event(
+        &mut events,
+        generated_unix,
+        CaptureEventCode::FillFailures,
+        telemetry.transport.fill_failures,
+        RecoveryAction::DropSampleContinue,
+        "callback could not fill timed chunk payload",
+    );
+    append_capture_event(
+        &mut events,
+        generated_unix,
+        CaptureEventCode::QueueFullDrops,
+        telemetry.transport.queue_full_drops,
+        RecoveryAction::DropSampleContinue,
+        "ready queue full during callback handoff",
+    );
+    append_capture_event(
+        &mut events,
+        generated_unix,
+        CaptureEventCode::RecycleFailures,
+        telemetry.transport.recycle_failures,
+        RecoveryAction::DropSampleContinue,
+        "consumer recycle path failed to return slot",
+    );
+    append_capture_event(
+        &mut events,
+        generated_unix,
+        CaptureEventCode::MissingAudioBufferList,
+        telemetry.callback_audit.missing_audio_buffer_list,
+        recovery_action_for_callback_violation(CallbackContractViolation::MissingAudioBufferList),
+        "audio buffer list was unavailable in callback path",
+    );
+    append_capture_event(
+        &mut events,
+        generated_unix,
+        CaptureEventCode::MissingFirstAudioBuffer,
+        telemetry.callback_audit.missing_first_audio_buffer,
+        recovery_action_for_callback_violation(CallbackContractViolation::MissingFirstAudioBuffer),
+        "first audio buffer missing in callback path",
+    );
+    append_capture_event(
+        &mut events,
+        generated_unix,
+        CaptureEventCode::MissingFormatDescription,
+        telemetry.callback_audit.missing_format_description,
+        recovery_action_for_callback_violation(CallbackContractViolation::MissingFormatDescription),
+        "format description unavailable for callback sample",
+    );
+    append_capture_event(
+        &mut events,
+        generated_unix,
+        CaptureEventCode::MissingSampleRate,
+        telemetry.callback_audit.missing_sample_rate,
+        recovery_action_for_callback_violation(CallbackContractViolation::MissingSampleRate),
+        "sample rate unavailable in callback sample metadata",
+    );
+    append_capture_event(
+        &mut events,
+        generated_unix,
+        CaptureEventCode::NonFloatPcm,
+        telemetry.callback_audit.non_float_pcm,
+        recovery_action_for_callback_violation(CallbackContractViolation::NonFloatPcm),
+        "non-float PCM observed in callback path",
+    );
+    append_capture_event(
+        &mut events,
+        generated_unix,
+        CaptureEventCode::ChunkTooLarge,
+        telemetry.callback_audit.chunk_too_large,
+        recovery_action_for_callback_violation(CallbackContractViolation::ChunkTooLarge),
+        "callback chunk exceeded preallocated max sample count",
+    );
+
+    events
+}
+
 fn build_capture_run_summary(
     telemetry: &RunTelemetry,
     degradation_events: Vec<CaptureDegradationEvent>,
@@ -820,6 +1107,47 @@ fn build_capture_run_summary(
     }
 }
 
+fn build_capture_summary(telemetry: &RunTelemetry, generated_unix: u64) -> CaptureSummary {
+    CaptureSummary {
+        generated_unix,
+        output_wav_path: telemetry.output_wav_path.clone(),
+        duration_secs: telemetry.duration_secs,
+        target_rate_hz: telemetry.target_rate_hz,
+        output_rate_hz: telemetry.output_rate_hz,
+        mismatch_policy: to_capture_sample_rate_mismatch_policy(telemetry.mismatch_policy),
+        microphone: CaptureStreamSummary {
+            input_rate_hz: telemetry.mic_input_rate_hz,
+            chunk_count: telemetry.mic_chunks,
+            resample: ResampleSummary {
+                resampled_chunks: telemetry.mic_resample.resampled_chunks,
+                input_frames: telemetry.mic_resample.input_frames,
+                output_frames: telemetry.mic_resample.output_frames,
+            },
+        },
+        system_audio: CaptureStreamSummary {
+            input_rate_hz: telemetry.system_input_rate_hz,
+            chunk_count: telemetry.system_chunks,
+            resample: ResampleSummary {
+                resampled_chunks: telemetry.system_resample.resampled_chunks,
+                input_frames: telemetry.system_resample.input_frames,
+                output_frames: telemetry.system_resample.output_frames,
+            },
+        },
+        output_frames: telemetry.output_frames,
+        restart_count: telemetry.restart_count,
+        transport: telemetry.transport,
+        callback_contract: CallbackContractSummary {
+            missing_audio_buffer_list: telemetry.callback_audit.missing_audio_buffer_list,
+            missing_first_audio_buffer: telemetry.callback_audit.missing_first_audio_buffer,
+            missing_format_description: telemetry.callback_audit.missing_format_description,
+            missing_sample_rate: telemetry.callback_audit.missing_sample_rate,
+            non_float_pcm: telemetry.callback_audit.non_float_pcm,
+            chunk_too_large: telemetry.callback_audit.chunk_too_large,
+        },
+        degradation_events: build_capture_events(telemetry, generated_unix),
+    }
+}
+
 fn render_degradation_events_json(events: &[CaptureDegradationEvent]) -> String {
     if events.is_empty() {
         return String::new();
@@ -844,10 +1172,7 @@ fn render_degradation_events_json(events: &[CaptureDegradationEvent]) -> String 
 }
 
 fn write_run_telemetry(path: &Path, telemetry: &RunTelemetry) -> Result<()> {
-    let now_unix = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+    let now_unix = now_unix();
     let degradation_events = build_degradation_events(telemetry, now_unix);
     let summary = build_capture_run_summary(telemetry, degradation_events);
     let degradation_events_json = render_degradation_events_json(&summary.degradation_events);
@@ -1038,25 +1363,12 @@ pub fn run_capture_cli(args: &[String]) -> Result<()> {
     run_capture_session(&config)
 }
 
-fn read_wav_shape(path: &Path) -> Result<(u32, usize)> {
-    let reader = hound::WavReader::open(path)
-        .with_context(|| format!("failed to open {}", path.display()))?;
-    let spec = reader.spec();
-    if spec.channels == 0 || spec.sample_rate == 0 {
-        bail!(
-            "fixture WAV must have non-zero channels/sample-rate (path={})",
-            path.display()
-        );
-    }
-    let frame_count = reader.duration() as usize;
-    Ok((spec.sample_rate, frame_count))
-}
-
 fn run_fake_capture_session(
     config: &LiveCaptureConfig,
     fixture: &Path,
     restart_count: u64,
-) -> Result<()> {
+    sink: &mut dyn CaptureSink,
+) -> Result<StreamingCaptureResult> {
     if !fixture.is_file() {
         bail!(
             "fake capture fixture from {} is not a file: {}",
@@ -1069,7 +1381,8 @@ fn run_fake_capture_session(
             .with_context(|| format!("failed to create output directory {}", parent.display()))?;
     }
 
-    let (fixture_rate_hz, frame_count) = read_wav_shape(fixture)?;
+    let (fixture_rate_hz, mic_samples, system_samples) = read_fixture_stereo_channels(fixture)?;
+    let frame_count = mic_samples.len().min(system_samples.len());
     if config.mismatch_policy == SampleRateMismatchPolicy::Strict
         && fixture_rate_hz != config.target_rate_hz
     {
@@ -1079,6 +1392,38 @@ fn run_fake_capture_session(
             config.target_rate_hz
         );
     }
+    let replay_realtime = env_bool_or_default(FAKE_CAPTURE_REALTIME_ENV, false)?;
+    let chunk_frames = fake_capture_chunk_frames(fixture_rate_hz);
+    let replay_started = Instant::now();
+    let mut mic_chunk_count = 0usize;
+    let mut system_chunk_count = 0usize;
+    let mut frame_start = 0usize;
+    while frame_start < frame_count {
+        let frame_end = (frame_start + chunk_frames).min(frame_count);
+        let pts_seconds = frame_start as f64 / fixture_rate_hz as f64;
+        maybe_sleep_for_replay(replay_realtime, replay_started, pts_seconds)?;
+
+        sink.on_chunk(CaptureChunk {
+            stream: CaptureStream::SystemAudio,
+            pts_seconds,
+            sample_rate_hz: fixture_rate_hz,
+            mono_samples: system_samples[frame_start..frame_end].to_vec(),
+        })
+        .map_err(|err| anyhow::anyhow!("capture sink rejected fake system chunk: {err}"))?;
+        system_chunk_count += 1;
+
+        sink.on_chunk(CaptureChunk {
+            stream: CaptureStream::Microphone,
+            pts_seconds,
+            sample_rate_hz: fixture_rate_hz,
+            mono_samples: mic_samples[frame_start..frame_end].to_vec(),
+        })
+        .map_err(|err| anyhow::anyhow!("capture sink rejected fake microphone chunk: {err}"))?;
+        mic_chunk_count += 1;
+
+        frame_start = frame_end;
+    }
+
     fs::copy(fixture, &config.output).with_context(|| {
         format!(
             "failed to copy fake capture fixture {} -> {}",
@@ -1098,8 +1443,8 @@ fn run_fake_capture_session(
         system_input_rate_hz: fixture_rate_hz,
         mic_resample: ResampleStats::default(),
         system_resample: ResampleStats::default(),
-        mic_chunks: usize::from(frame_count > 0),
-        system_chunks: usize::from(frame_count > 0),
+        mic_chunks: mic_chunk_count,
+        system_chunks: system_chunk_count,
         output_frames: frame_count,
         restart_count: restart_count as usize,
         transport: crate::rt_transport::TransportStatsSnapshot {
@@ -1111,9 +1456,15 @@ fn run_fake_capture_session(
     write_run_telemetry(&telemetry_path, &telemetry)?;
 
     println!(
-        "Using fake live capture fixture via {}: {}",
+        "Using fake live capture fixture via {}: {} (mode={}, chunk_frames={})",
         FAKE_CAPTURE_FIXTURE_ENV,
-        fixture.display()
+        fixture.display(),
+        if replay_realtime {
+            "realtime"
+        } else {
+            "accelerated"
+        },
+        chunk_frames
     );
     println!(
         "WAV written: {} (source fixture: {}, frames: {}, restarts: {}, output_rate: {} Hz)",
@@ -1124,17 +1475,34 @@ fn run_fake_capture_session(
         fixture_rate_hz
     );
     println!("Telemetry written: {}", telemetry_path.display());
+    if restart_count > 0 {
+        sink.on_event(CaptureEvent {
+            generated_unix: now_unix(),
+            code: CaptureEventCode::StreamInterruption,
+            count: restart_count,
+            recovery_action: CaptureRecoveryAction::RestartStream,
+            detail: "fake capture restart count injected for deterministic testing".to_string(),
+        })
+        .map_err(|err| anyhow::anyhow!("capture sink rejected fake interruption event: {err}"))?;
+    }
+    let summary = build_capture_summary(&telemetry, now_unix());
     enforce_callback_contract(
         config.callback_contract_mode,
         CallbackAuditSnapshot::default(),
     )?;
-    Ok(())
+    Ok(StreamingCaptureResult {
+        summary,
+        progressive_output_path: config.output.clone(),
+    })
 }
 
-pub fn run_capture_session(config: &LiveCaptureConfig) -> Result<()> {
+pub fn run_streaming_capture_session(
+    config: &LiveCaptureConfig,
+    sink: &mut dyn CaptureSink,
+) -> Result<StreamingCaptureResult> {
     if let Some(fixture) = non_empty_env_path(FAKE_CAPTURE_FIXTURE_ENV) {
         let restart_count = env_u64_or_default(FAKE_CAPTURE_RESTART_COUNT_ENV, 0)?;
-        return run_fake_capture_session(config, &fixture, restart_count);
+        return run_fake_capture_session(config, &fixture, restart_count, sink);
     }
 
     let duration_secs = config.duration_secs;
@@ -1239,6 +1607,11 @@ pub fn run_capture_session(config: &LiveCaptureConfig) -> Result<()> {
                     consumer.recycle(chunk_slot);
                     last_chunk_at = Instant::now();
 
+                    if let Some(capture_chunk) = chunk.to_capture_chunk() {
+                        sink.on_chunk(capture_chunk)
+                            .map_err(|err| anyhow::anyhow!("capture sink rejected chunk: {err}"))?;
+                    }
+
                     match chunk.kind {
                         SCStreamOutputType::Audio => sys_chunks.push(chunk),
                         SCStreamOutputType::Microphone => mic_chunks.push(chunk),
@@ -1302,6 +1675,17 @@ pub fn run_capture_session(config: &LiveCaptureConfig) -> Result<()> {
             "capture interruption detected (restart {}/{}). Recovery action: {:?}.",
             restart_count, interruption_policy.max_restarts, action
         );
+        sink.on_event(CaptureEvent {
+            generated_unix: now_unix(),
+            code: CaptureEventCode::StreamInterruption,
+            count: 1,
+            recovery_action: to_capture_recovery_action(action),
+            detail: format!(
+                "capture interruption detected (restart {restart_count}/{})",
+                interruption_policy.max_restarts
+            ),
+        })
+        .map_err(|err| anyhow::anyhow!("capture sink rejected interruption event: {err}"))?;
 
         stream
             .start_capture()
@@ -1394,8 +1778,26 @@ pub fn run_capture_session(config: &LiveCaptureConfig) -> Result<()> {
     };
     write_run_telemetry(&telemetry_path, &telemetry)?;
     println!("Telemetry written: {}", telemetry_path.display());
+    let summary = build_capture_summary(&telemetry, now_unix());
+    for event in summary
+        .degradation_events
+        .iter()
+        .filter(|event| event.code != CaptureEventCode::StreamInterruption)
+    {
+        sink.on_event(event.clone())
+            .map_err(|err| anyhow::anyhow!("capture sink rejected summary event: {err}"))?;
+    }
     enforce_callback_contract(callback_contract_mode, callback_audit_snapshot)?;
 
+    Ok(StreamingCaptureResult {
+        summary,
+        progressive_output_path: output,
+    })
+}
+
+pub fn run_capture_session(config: &LiveCaptureConfig) -> Result<()> {
+    let mut sink = CollectingCaptureSink::default();
+    let _ = run_streaming_capture_session(config, &mut sink)?;
     Ok(())
 }
 
@@ -1411,12 +1813,33 @@ mod tests {
         CallbackContractMode, CallbackContractViolation, InterruptionPolicy, LiveCaptureConfig,
         RecoveryAction, ResampleStats, RunTelemetry, SampleRateMismatchPolicy, TimedChunk,
     };
-    use crate::capture_api::{CaptureChunkKind, CaptureRecoveryAction};
+    use crate::capture_api::{
+        CaptureChunk, CaptureChunkKind, CaptureEvent, CaptureEventCode, CaptureRecoveryAction,
+        CaptureSink,
+    };
     use crate::rt_transport::TransportStatsSnapshot;
     use screencapturekit::prelude::SCStreamOutputType;
     use std::fs;
     use std::path::PathBuf;
     use std::time::Duration;
+
+    #[derive(Default)]
+    struct RecordingSink {
+        chunks: Vec<CaptureChunk>,
+        events: Vec<CaptureEvent>,
+    }
+
+    impl CaptureSink for RecordingSink {
+        fn on_chunk(&mut self, chunk: CaptureChunk) -> std::result::Result<(), String> {
+            self.chunks.push(chunk);
+            Ok(())
+        }
+
+        fn on_event(&mut self, event: CaptureEvent) -> std::result::Result<(), String> {
+            self.events.push(event);
+            Ok(())
+        }
+    }
 
     #[test]
     fn strict_policy_fails_on_target_mismatch() {
@@ -1488,7 +1911,8 @@ mod tests {
             callback_contract_mode: CallbackContractMode::Warn,
         };
 
-        run_fake_capture_session(&config, &fixture, 2)
+        let mut sink = RecordingSink::default();
+        let result = run_fake_capture_session(&config, &fixture, 2, &mut sink)
             .expect("fake capture harness should materialize fixture and telemetry");
         assert!(output.is_file(), "fake capture output WAV should exist");
         let telemetry_path = telemetry_path_for_output(&output);
@@ -1506,7 +1930,101 @@ mod tests {
             telemetry.contains("\"output_rate_hz\": 16000"),
             "telemetry should reflect fixture sample-rate"
         );
+        assert_eq!(result.progressive_output_path, output);
+        assert_eq!(result.summary.restart_count, 2);
+        assert_eq!(sink.chunks.len(), 2);
+        assert_eq!(
+            sink.chunks[0].stream,
+            crate::capture_api::CaptureStream::SystemAudio
+        );
+        assert_eq!(
+            sink.chunks[1].stream,
+            crate::capture_api::CaptureStream::Microphone
+        );
+        assert_eq!(result.summary.system_audio.chunk_count, 1);
+        assert_eq!(result.summary.microphone.chunk_count, 1);
+        assert_eq!(sink.events.len(), 1);
+        assert_eq!(sink.events[0].code, CaptureEventCode::StreamInterruption);
+        assert_eq!(sink.events[0].count, 2);
 
+        let _ = fs::remove_file(output);
+        let _ = fs::remove_file(fixture);
+        let _ = fs::remove_file(telemetry_path);
+        let _ = fs::remove_dir(root);
+    }
+
+    #[test]
+    fn fake_capture_replay_emits_timestamp_ordered_system_then_mic_pairs() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock should be monotonic")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "recordit-fake-capture-ordering-{}-{}",
+            std::process::id(),
+            stamp
+        ));
+        let fixture = root.join("fixture.wav");
+        let output = root.join("runtime.wav");
+
+        fs::create_dir_all(&root).expect("temp test root should be creatable");
+        let spec = hound::WavSpec {
+            channels: 2,
+            sample_rate: 200,
+            bits_per_sample: 32,
+            sample_format: hound::SampleFormat::Float,
+        };
+        let mut writer = hound::WavWriter::create(&fixture, spec)
+            .expect("fixture wav should be writable for test");
+        for idx in 0..16 {
+            writer
+                .write_sample(idx as f32) // mic
+                .expect("fixture mic sample write should succeed");
+            writer
+                .write_sample(-(idx as f32)) // system
+                .expect("fixture system sample write should succeed");
+        }
+        writer
+            .finalize()
+            .expect("fixture wav finalize should succeed");
+
+        let config = LiveCaptureConfig {
+            duration_secs: 1,
+            output: output.clone(),
+            target_rate_hz: 200,
+            mismatch_policy: SampleRateMismatchPolicy::AdaptStreamRate,
+            callback_contract_mode: CallbackContractMode::Warn,
+        };
+
+        let mut sink = RecordingSink::default();
+        let result = run_fake_capture_session(&config, &fixture, 0, &mut sink)
+            .expect("fake capture replay should emit deterministic chunks");
+        let chunk_frames = 4; // sample_rate/50 for 200Hz replay
+        let expected_pairs = 16 / chunk_frames;
+        assert_eq!(sink.chunks.len(), expected_pairs * 2);
+        assert_eq!(result.summary.system_audio.chunk_count, expected_pairs);
+        assert_eq!(result.summary.microphone.chunk_count, expected_pairs);
+        assert!(sink.events.is_empty());
+
+        let mut previous_pts = -1.0f64;
+        for pair in sink.chunks.chunks_exact(2) {
+            let system = &pair[0];
+            let mic = &pair[1];
+            assert_eq!(
+                system.stream,
+                crate::capture_api::CaptureStream::SystemAudio
+            );
+            assert_eq!(mic.stream, crate::capture_api::CaptureStream::Microphone);
+            assert_eq!(system.pts_seconds, mic.pts_seconds);
+            assert!(system.pts_seconds >= previous_pts);
+            previous_pts = system.pts_seconds;
+        }
+
+        // Validate channel mapping from fixture interleaving (L=mic, R=system).
+        assert_eq!(sink.chunks[0].mono_samples, vec![-0.0, -1.0, -2.0, -3.0]);
+        assert_eq!(sink.chunks[1].mono_samples, vec![0.0, 1.0, 2.0, 3.0]);
+
+        let telemetry_path = telemetry_path_for_output(&output);
         let _ = fs::remove_file(output);
         let _ = fs::remove_file(fixture);
         let _ = fs::remove_file(telemetry_path);
