@@ -1597,7 +1597,11 @@ fn run_standard_pipeline(config: &TranscribeConfig) -> Result<LiveRunReport, Cli
     let generated_at_utc = runtime_timestamp_utc();
     let stamp = command_stdout("date", &["-u", "+%Y%m%dT%H%M%SZ"])
         .unwrap_or_else(|_| "unknown".to_string());
-    let backend_id = select_adapter(config.asr_backend)?.backend_id();
+    let backend_id = match config.asr_backend {
+        AsrBackend::WhisperCpp => "whispercpp",
+        AsrBackend::WhisperKit => "whisperkit",
+        AsrBackend::Moonshine => "moonshine",
+    };
     let channel_plan = prepare_channel_inputs(config, &stamp)?;
     let refresh_channel_inputs_per_run =
         channel_plan.inputs.iter().any(|input| input.is_temp_audio);

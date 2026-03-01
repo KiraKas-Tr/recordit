@@ -32,6 +32,11 @@ TRANSCRIBE_APP_OUT_MANIFEST ?= $(TRANSCRIBE_APP_ARTIFACT_ROOT)/$(TRANSCRIBE_APP_
 TRANSCRIBE_APP_LIVE_STREAM_INPUT_WAV ?= $(TRANSCRIBE_APP_ARTIFACT_ROOT)/$(TRANSCRIBE_APP_SESSION_STEM).input.wav
 TRANSCRIBE_APP_LIVE_STREAM_ARGS ?=
 TRANSCRIBE_APP_SHOW_LIVE_INPUT ?= 0
+WHISPERCPP_HELPER_BIN ?= /opt/homebrew/bin/whisper-cli
+WHISPERCPP_HELPER_LIB_DIR ?= /opt/homebrew/lib
+WHISPERCPP_HELPER_LIBS ?= libwhisper.1.dylib libggml.0.dylib libggml-cpu.0.dylib libggml-blas.0.dylib libggml-metal.0.dylib libggml-base.0.dylib
+TRANSCRIBE_APP_HELPER_BIN_DIR ?= $(TRANSCRIBE_APP_DIR)/Contents/Resources/bin
+TRANSCRIBE_APP_HELPER_LIB_DIR ?= $(TRANSCRIBE_APP_DIR)/Contents/Resources/lib
 WHISPERCPP_MODEL_DEFAULT ?= artifacts/bench/models/whispercpp/ggml-tiny.en.bin
 ASR_MODEL ?= $(WHISPERCPP_MODEL_DEFAULT)
 TRANSCRIBE_ARGS ?=
@@ -179,6 +184,7 @@ gate-transcript-completeness:
 gate-v1-acceptance:
 	MODEL="$(abspath $(ASR_MODEL))" scripts/gate_v1_acceptance.sh
 
+gate-packaged-live-smoke: PATH := $(abspath $(TRANSCRIBE_APP_HELPER_BIN_DIR)):$(PATH)
 gate-packaged-live-smoke:
 	MODEL="$(abspath $(ASR_MODEL))" PACKAGED_ROOT="$(TRANSCRIBE_APP_ARTIFACT_ROOT)" SIGN_IDENTITY="$(SIGN_IDENTITY)" scripts/gate_packaged_live_smoke.sh
 
@@ -204,6 +210,18 @@ bundle-transcribe: build-release
 	/usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier com.recordit.sequoiatranscribe" $(TRANSCRIBE_APP_DIR)/Contents/Info.plist
 	/usr/libexec/PlistBuddy -c "Set :CFBundleExecutable $(TRANSCRIBE_APP_NAME)" $(TRANSCRIBE_APP_DIR)/Contents/Info.plist
 	install_name_tool -add_rpath /usr/lib/swift $(TRANSCRIBE_APP_EXE) || true
+	@mkdir -p "$(TRANSCRIBE_APP_HELPER_BIN_DIR)" "$(TRANSCRIBE_APP_HELPER_LIB_DIR)"
+	@if [ -x "$(WHISPERCPP_HELPER_BIN)" ]; then \
+		cp "$(WHISPERCPP_HELPER_BIN)" "$(TRANSCRIBE_APP_HELPER_BIN_DIR)/whisper-cli"; \
+		chmod +x "$(TRANSCRIBE_APP_HELPER_BIN_DIR)/whisper-cli"; \
+		for lib in $(WHISPERCPP_HELPER_LIBS); do \
+			if [ -f "$(WHISPERCPP_HELPER_LIB_DIR)/$$lib" ]; then \
+				cp "$(WHISPERCPP_HELPER_LIB_DIR)/$$lib" "$(TRANSCRIBE_APP_HELPER_LIB_DIR)/$$lib"; \
+			fi; \
+		done; \
+	else \
+		echo "warning: whispercpp helper binary not found at $(WHISPERCPP_HELPER_BIN); signed-app live runtime may fail helper prewarm"; \
+	fi
 
 sign: bundle
 	codesign --force --deep --options runtime --entitlements $(ENTITLEMENTS) --sign "$(SIGN_IDENTITY)" $(APP_DIR)
@@ -222,13 +240,14 @@ run-transcribe-app: sign-transcribe
 	@mkdir -p "$(dir $(TRANSCRIBE_APP_OUT_WAV))"
 	@echo "Signed app transcribe-live absolute artifact paths:"
 	@echo "  Root:     $(TRANSCRIBE_APP_ARTIFACT_ROOT)"
+	@echo "  Helper bin search prefix: $(abspath $(TRANSCRIBE_APP_HELPER_BIN_DIR))"
 	@if [ "$(TRANSCRIBE_APP_SHOW_LIVE_INPUT)" = "1" ]; then \
 		echo "  Input WAV: $(TRANSCRIBE_APP_LIVE_STREAM_INPUT_WAV)"; \
 	fi
 	@echo "  WAV:      $(TRANSCRIBE_APP_OUT_WAV)"
 	@echo "  JSONL:    $(TRANSCRIBE_APP_OUT_JSONL)"
 	@echo "  Manifest: $(TRANSCRIBE_APP_OUT_MANIFEST)"
-	open -W $(TRANSCRIBE_APP_DIR) --args --duration-sec $(TRANSCRIBE_SECS) --out-wav "$(TRANSCRIBE_APP_OUT_WAV)" --out-jsonl "$(TRANSCRIBE_APP_OUT_JSONL)" --out-manifest "$(TRANSCRIBE_APP_OUT_MANIFEST)" --asr-model "$(ASR_MODEL)" $(TRANSCRIBE_ARGS)
+	PATH="$(abspath $(TRANSCRIBE_APP_HELPER_BIN_DIR)):$$PATH" open -W $(TRANSCRIBE_APP_DIR) --args --duration-sec $(TRANSCRIBE_SECS) --out-wav "$(TRANSCRIBE_APP_OUT_WAV)" --out-jsonl "$(TRANSCRIBE_APP_OUT_JSONL)" --out-manifest "$(TRANSCRIBE_APP_OUT_MANIFEST)" --asr-model "$(ASR_MODEL)" $(TRANSCRIBE_ARGS)
 	@echo "Signed app session summary:"
 	@echo "  Artifacts root: $(TRANSCRIBE_APP_ARTIFACT_ROOT)"
 	@echo "  Manifest:       $(TRANSCRIBE_APP_OUT_MANIFEST)"
