@@ -263,8 +263,9 @@ impl LiveAsrService {
         }
 
         let incoming_class = job.class;
+        let queue_state = Arc::clone(&self.queue_state);
         let enqueue_outcome = {
-            let (lock, notify) = &*self.queue_state;
+            let (lock, notify) = &*queue_state;
             let mut queue = match lock.lock() {
                 Ok(guard) => guard,
                 Err(_) => {

@@ -702,6 +702,129 @@ fn write_interleaved_stereo_wav(
     Ok(())
 }
 
+fn emit_capture_event_if_increased(
+    sink: &mut dyn CaptureSink,
+    code: CaptureEventCode,
+    previous: u64,
+    current: u64,
+    recovery_action: RecoveryAction,
+    detail: &'static str,
+) -> Result<()> {
+    if current <= previous {
+        return Ok(());
+    }
+    sink.on_event(CaptureEvent {
+        generated_unix: now_unix(),
+        code,
+        count: current - previous,
+        recovery_action: to_capture_recovery_action(recovery_action),
+        detail: detail.to_string(),
+    })
+    .map_err(|err| anyhow::anyhow!("capture sink rejected runtime event: {err}"))
+}
+
+fn emit_runtime_event_deltas(
+    sink: &mut dyn CaptureSink,
+    cursor: &mut RuntimeEventCursor,
+    restart_count: usize,
+    transport: crate::rt_transport::TransportStatsSnapshot,
+    callback_audit: CallbackAuditSnapshot,
+) -> Result<()> {
+    emit_capture_event_if_increased(
+        sink,
+        CaptureEventCode::StreamInterruption,
+        cursor.restart_count as u64,
+        restart_count as u64,
+        RecoveryAction::RestartStream,
+        "capture stream interruption detected and restart attempted",
+    )?;
+    emit_capture_event_if_increased(
+        sink,
+        CaptureEventCode::SlotMissDrops,
+        cursor.transport.slot_miss_drops,
+        transport.slot_miss_drops,
+        RecoveryAction::DropSampleContinue,
+        "callback could not acquire a free slot",
+    )?;
+    emit_capture_event_if_increased(
+        sink,
+        CaptureEventCode::FillFailures,
+        cursor.transport.fill_failures,
+        transport.fill_failures,
+        RecoveryAction::DropSampleContinue,
+        "callback could not fill timed chunk payload",
+    )?;
+    emit_capture_event_if_increased(
+        sink,
+        CaptureEventCode::QueueFullDrops,
+        cursor.transport.queue_full_drops,
+        transport.queue_full_drops,
+        RecoveryAction::DropSampleContinue,
+        "ready queue full during callback handoff",
+    )?;
+    emit_capture_event_if_increased(
+        sink,
+        CaptureEventCode::RecycleFailures,
+        cursor.transport.recycle_failures,
+        transport.recycle_failures,
+        RecoveryAction::DropSampleContinue,
+        "consumer recycle path failed to return slot",
+    )?;
+    emit_capture_event_if_increased(
+        sink,
+        CaptureEventCode::MissingAudioBufferList,
+        cursor.callback_audit.missing_audio_buffer_list,
+        callback_audit.missing_audio_buffer_list,
+        recovery_action_for_callback_violation(CallbackContractViolation::MissingAudioBufferList),
+        "audio buffer list was unavailable in callback path",
+    )?;
+    emit_capture_event_if_increased(
+        sink,
+        CaptureEventCode::MissingFirstAudioBuffer,
+        cursor.callback_audit.missing_first_audio_buffer,
+        callback_audit.missing_first_audio_buffer,
+        recovery_action_for_callback_violation(CallbackContractViolation::MissingFirstAudioBuffer),
+        "first audio buffer missing in callback path",
+    )?;
+    emit_capture_event_if_increased(
+        sink,
+        CaptureEventCode::MissingFormatDescription,
+        cursor.callback_audit.missing_format_description,
+        callback_audit.missing_format_description,
+        recovery_action_for_callback_violation(CallbackContractViolation::MissingFormatDescription),
+        "format description unavailable for callback sample",
+    )?;
+    emit_capture_event_if_increased(
+        sink,
+        CaptureEventCode::MissingSampleRate,
+        cursor.callback_audit.missing_sample_rate,
+        callback_audit.missing_sample_rate,
+        recovery_action_for_callback_violation(CallbackContractViolation::MissingSampleRate),
+        "sample rate unavailable in callback sample metadata",
+    )?;
+    emit_capture_event_if_increased(
+        sink,
+        CaptureEventCode::NonFloatPcm,
+        cursor.callback_audit.non_float_pcm,
+        callback_audit.non_float_pcm,
+        recovery_action_for_callback_violation(CallbackContractViolation::NonFloatPcm),
+        "non-float PCM observed in callback path",
+    )?;
+    emit_capture_event_if_increased(
+        sink,
+        CaptureEventCode::ChunkTooLarge,
+        cursor.callback_audit.chunk_too_large,
+        callback_audit.chunk_too_large,
+        recovery_action_for_callback_violation(CallbackContractViolation::ChunkTooLarge),
+        "callback chunk exceeded preallocated max sample count",
+    )?;
+
+    cursor.restart_count = restart_count;
+    cursor.transport = transport;
+    cursor.callback_audit = callback_audit;
+    Ok(())
+}
+
 fn materialize_progressive_wav_snapshot(
     output: &Path,
     mic_chunks: &[TimedChunk],
@@ -723,6 +846,24 @@ fn materialize_progressive_wav_snapshot(
     write_interleaved_stereo_wav(output, output_rate_hz, &mic, &sys)?;
 
     Ok(Some(output_rate_hz))
+}
+
+fn should_materialize_progressive_snapshot(
+    progressive_materializations: usize,
+    materialized_chunk_total: usize,
+    total_chunks: usize,
+    elapsed_since_last: Duration,
+) -> bool {
+    let new_chunks = total_chunks.saturating_sub(materialized_chunk_total);
+    if new_chunks == 0 {
+        return false;
+    }
+    if progressive_materializations == 0 {
+        // Ensure the first progressive WAV appears during active capture as soon as data exists.
+        return true;
+    }
+    new_chunks >= PROGRESSIVE_WAV_MATERIALIZE_MIN_NEW_CHUNKS
+        && elapsed_since_last >= PROGRESSIVE_WAV_MATERIALIZE_INTERVAL
 }
 
 fn telemetry_path_for_output(output: &Path) -> PathBuf {
@@ -1397,6 +1538,23 @@ fn run_fake_capture_session(
     let replay_started = Instant::now();
     let mut mic_chunk_count = 0usize;
     let mut system_chunk_count = 0usize;
+    let mut mic_chunks = Vec::<TimedChunk>::new();
+    let mut sys_chunks = Vec::<TimedChunk>::new();
+    let mut last_materialize_at = Instant::now();
+    let mut materialized_chunk_total = 0usize;
+    let mut progressive_materializations = 0usize;
+
+    if restart_count > 0 {
+        sink.on_event(CaptureEvent {
+            generated_unix: now_unix(),
+            code: CaptureEventCode::StreamInterruption,
+            count: restart_count,
+            recovery_action: CaptureRecoveryAction::RestartStream,
+            detail: "fake capture restart count injected for deterministic testing".to_string(),
+        })
+        .map_err(|err| anyhow::anyhow!("capture sink rejected fake interruption event: {err}"))?;
+    }
+
     let mut frame_start = 0usize;
     while frame_start < frame_count {
         let frame_end = (frame_start + chunk_frames).min(frame_count);
@@ -1411,6 +1569,12 @@ fn run_fake_capture_session(
         })
         .map_err(|err| anyhow::anyhow!("capture sink rejected fake system chunk: {err}"))?;
         system_chunk_count += 1;
+        sys_chunks.push(TimedChunk {
+            kind: SCStreamOutputType::Audio,
+            pts_seconds,
+            sample_rate_hz: fixture_rate_hz,
+            mono_samples: system_samples[frame_start..frame_end].to_vec(),
+        });
 
         sink.on_chunk(CaptureChunk {
             stream: CaptureStream::Microphone,
@@ -1420,8 +1584,58 @@ fn run_fake_capture_session(
         })
         .map_err(|err| anyhow::anyhow!("capture sink rejected fake microphone chunk: {err}"))?;
         mic_chunk_count += 1;
+        mic_chunks.push(TimedChunk {
+            kind: SCStreamOutputType::Microphone,
+            pts_seconds,
+            sample_rate_hz: fixture_rate_hz,
+            mono_samples: mic_samples[frame_start..frame_end].to_vec(),
+        });
+
+        let total_chunks = mic_chunks.len().saturating_add(sys_chunks.len());
+        let has_both_channels = !mic_chunks.is_empty() && !sys_chunks.is_empty();
+        let cadence_elapsed = if replay_realtime {
+            last_materialize_at.elapsed()
+        } else {
+            PROGRESSIVE_WAV_MATERIALIZE_INTERVAL
+        };
+        if has_both_channels
+            && should_materialize_progressive_snapshot(
+                progressive_materializations,
+                materialized_chunk_total,
+                total_chunks,
+                cadence_elapsed,
+            )
+        {
+            if materialize_progressive_wav_snapshot(
+                &config.output,
+                &mic_chunks,
+                &sys_chunks,
+                config.target_rate_hz,
+                config.mismatch_policy,
+            )?
+            .is_some()
+            {
+                progressive_materializations += 1;
+                materialized_chunk_total = total_chunks;
+                last_materialize_at = Instant::now();
+            }
+        }
 
         frame_start = frame_end;
+    }
+
+    if progressive_materializations == 0 && !mic_chunks.is_empty() && !sys_chunks.is_empty() {
+        if materialize_progressive_wav_snapshot(
+            &config.output,
+            &mic_chunks,
+            &sys_chunks,
+            config.target_rate_hz,
+            config.mismatch_policy,
+        )?
+        .is_some()
+        {
+            progressive_materializations = 1;
+        }
     }
 
     fs::copy(fixture, &config.output).with_context(|| {
@@ -1474,17 +1688,11 @@ fn run_fake_capture_session(
         restart_count,
         fixture_rate_hz
     );
+    println!(
+        "progressive_out_wav_materializations: {}",
+        progressive_materializations
+    );
     println!("Telemetry written: {}", telemetry_path.display());
-    if restart_count > 0 {
-        sink.on_event(CaptureEvent {
-            generated_unix: now_unix(),
-            code: CaptureEventCode::StreamInterruption,
-            count: restart_count,
-            recovery_action: CaptureRecoveryAction::RestartStream,
-            detail: "fake capture restart count injected for deterministic testing".to_string(),
-        })
-        .map_err(|err| anyhow::anyhow!("capture sink rejected fake interruption event: {err}"))?;
-    }
     let summary = build_capture_summary(&telemetry, now_unix());
     enforce_callback_contract(
         config.callback_contract_mode,
@@ -1590,6 +1798,7 @@ pub fn run_streaming_capture_session(
     let mut last_materialize_at = Instant::now();
     let mut materialized_chunk_total = 0usize;
     let mut progressive_materializations = 0usize;
+    let mut runtime_event_cursor = RuntimeEventCursor::default();
 
     while Instant::now() < deadline {
         let mut last_chunk_at = Instant::now();
@@ -1619,9 +1828,14 @@ pub fn run_streaming_capture_session(
                     }
 
                     let total_chunks = mic_chunks.len().saturating_add(sys_chunks.len());
-                    let new_chunks = total_chunks.saturating_sub(materialized_chunk_total);
-                    if new_chunks >= PROGRESSIVE_WAV_MATERIALIZE_MIN_NEW_CHUNKS
-                        && last_materialize_at.elapsed() >= PROGRESSIVE_WAV_MATERIALIZE_INTERVAL
+                    let has_both_channels = !mic_chunks.is_empty() && !sys_chunks.is_empty();
+                    if has_both_channels
+                        && should_materialize_progressive_snapshot(
+                            progressive_materializations,
+                            materialized_chunk_total,
+                            total_chunks,
+                            last_materialize_at.elapsed(),
+                        )
                     {
                         if materialize_progressive_wav_snapshot(
                             &output,
@@ -1637,8 +1851,23 @@ pub fn run_streaming_capture_session(
                             last_materialize_at = Instant::now();
                         }
                     }
+
+                    emit_runtime_event_deltas(
+                        sink,
+                        &mut runtime_event_cursor,
+                        restart_count,
+                        consumer.stats_snapshot(),
+                        callback_audit.snapshot(),
+                    )?;
                 }
                 Err(RecvTimeoutError::Timeout) => {
+                    emit_runtime_event_deltas(
+                        sink,
+                        &mut runtime_event_cursor,
+                        restart_count,
+                        consumer.stats_snapshot(),
+                        callback_audit.snapshot(),
+                    )?;
                     let idle_gap = Instant::now().saturating_duration_since(last_chunk_at);
                     if idle_gap >= interruption_policy.idle_timeout {
                         interrupted = true;
@@ -1686,6 +1915,7 @@ pub fn run_streaming_capture_session(
             ),
         })
         .map_err(|err| anyhow::anyhow!("capture sink rejected interruption event: {err}"))?;
+        runtime_event_cursor.restart_count = restart_count;
 
         stream
             .start_capture()
@@ -1757,6 +1987,13 @@ pub fn run_streaming_capture_session(
         callback_audit_snapshot.non_float_pcm,
         callback_audit_snapshot.chunk_too_large
     );
+    emit_runtime_event_deltas(
+        sink,
+        &mut runtime_event_cursor,
+        restart_count,
+        transport_stats,
+        callback_audit_snapshot,
+    )?;
 
     let telemetry_path = telemetry_path_for_output(&output);
     let telemetry = RunTelemetry {
@@ -1779,14 +2016,6 @@ pub fn run_streaming_capture_session(
     write_run_telemetry(&telemetry_path, &telemetry)?;
     println!("Telemetry written: {}", telemetry_path.display());
     let summary = build_capture_summary(&telemetry, now_unix());
-    for event in summary
-        .degradation_events
-        .iter()
-        .filter(|event| event.code != CaptureEventCode::StreamInterruption)
-    {
-        sink.on_event(event.clone())
-            .map_err(|err| anyhow::anyhow!("capture sink rejected summary event: {err}"))?;
-    }
     enforce_callback_contract(callback_contract_mode, callback_audit_snapshot)?;
 
     Ok(StreamingCaptureResult {
@@ -1805,13 +2034,14 @@ pub fn run_capture_session(config: &LiveCaptureConfig) -> Result<()> {
 mod tests {
     use super::{
         build_capture_run_summary, build_degradation_events, callback_recovery_breakdown,
-        can_restart_capture, config_from_cli_args, enforce_callback_contract,
-        materialize_progressive_wav_snapshot, paint_chunks_timeline,
+        can_restart_capture, config_from_cli_args, emit_runtime_event_deltas,
+        enforce_callback_contract, materialize_progressive_wav_snapshot, paint_chunks_timeline,
         recovery_action_for_callback_violation, recovery_action_for_interruption,
         resample_linear_mono, resolve_output_sample_rate, run_fake_capture_session,
-        telemetry_path_for_output, write_run_telemetry, CallbackAuditSnapshot,
-        CallbackContractMode, CallbackContractViolation, InterruptionPolicy, LiveCaptureConfig,
-        RecoveryAction, ResampleStats, RunTelemetry, SampleRateMismatchPolicy, TimedChunk,
+        should_materialize_progressive_snapshot, telemetry_path_for_output, write_run_telemetry,
+        CallbackAuditSnapshot, CallbackContractMode, CallbackContractViolation,
+        InterruptionPolicy, LiveCaptureConfig, RecoveryAction, ResampleStats, RunTelemetry,
+        RuntimeEventCursor, SampleRateMismatchPolicy, TimedChunk,
     };
     use crate::capture_api::{
         CaptureChunk, CaptureChunkKind, CaptureEvent, CaptureEventCode, CaptureRecoveryAction,
@@ -1827,16 +2057,19 @@ mod tests {
     struct RecordingSink {
         chunks: Vec<CaptureChunk>,
         events: Vec<CaptureEvent>,
+        event_sequence: Vec<&'static str>,
     }
 
     impl CaptureSink for RecordingSink {
         fn on_chunk(&mut self, chunk: CaptureChunk) -> std::result::Result<(), String> {
             self.chunks.push(chunk);
+            self.event_sequence.push("chunk");
             Ok(())
         }
 
         fn on_event(&mut self, event: CaptureEvent) -> std::result::Result<(), String> {
             self.events.push(event);
+            self.event_sequence.push("event");
             Ok(())
         }
     }
@@ -1946,6 +2179,11 @@ mod tests {
         assert_eq!(sink.events.len(), 1);
         assert_eq!(sink.events[0].code, CaptureEventCode::StreamInterruption);
         assert_eq!(sink.events[0].count, 2);
+        assert_eq!(
+            sink.event_sequence.first().copied(),
+            Some("event"),
+            "fake restart continuity signal should be emitted during active replay"
+        );
 
         let _ = fs::remove_file(output);
         let _ = fs::remove_file(fixture);
@@ -2005,6 +2243,7 @@ mod tests {
         assert_eq!(result.summary.system_audio.chunk_count, expected_pairs);
         assert_eq!(result.summary.microphone.chunk_count, expected_pairs);
         assert!(sink.events.is_empty());
+        assert_eq!(sink.event_sequence.first().copied(), Some("chunk"));
 
         let mut previous_pts = -1.0f64;
         for pair in sink.chunks.chunks_exact(2) {
@@ -2210,6 +2449,34 @@ mod tests {
         assert_eq!(reader.duration(), 3);
 
         let _ = fs::remove_file(output);
+    }
+
+    #[test]
+    fn progressive_materialization_policy_emits_initial_snapshot_then_applies_cadence() {
+        assert!(should_materialize_progressive_snapshot(
+            0,
+            0,
+            2,
+            Duration::from_millis(0)
+        ));
+        assert!(!should_materialize_progressive_snapshot(
+            1,
+            10,
+            14,
+            Duration::from_millis(1_000)
+        ));
+        assert!(!should_materialize_progressive_snapshot(
+            1,
+            10,
+            18,
+            Duration::from_millis(500)
+        ));
+        assert!(should_materialize_progressive_snapshot(
+            1,
+            10,
+            18,
+            Duration::from_millis(800)
+        ));
     }
 
     #[test]
@@ -2482,6 +2749,60 @@ mod tests {
             CaptureRecoveryAction::FailFastReconfigure
         );
         assert_eq!(by_source("chunk_too_large").count, 10);
+    }
+
+    #[test]
+    fn runtime_event_deltas_emit_once_per_increment() {
+        let mut sink = RecordingSink::default();
+        let mut cursor = RuntimeEventCursor::default();
+
+        let transport_a = TransportStatsSnapshot {
+            queue_full_drops: 2,
+            ..TransportStatsSnapshot::default()
+        };
+        let callback_a = CallbackAuditSnapshot {
+            missing_format_description: 1,
+            ..CallbackAuditSnapshot::default()
+        };
+        emit_runtime_event_deltas(&mut sink, &mut cursor, 1, transport_a, callback_a)
+            .expect("delta emission should succeed");
+        assert_eq!(sink.events.len(), 3);
+        assert!(sink
+            .events
+            .iter()
+            .any(|event| event.code == CaptureEventCode::StreamInterruption && event.count == 1));
+        assert!(sink
+            .events
+            .iter()
+            .any(|event| event.code == CaptureEventCode::QueueFullDrops && event.count == 2));
+        assert!(sink.events.iter().any(|event| event.code
+            == CaptureEventCode::MissingFormatDescription
+            && event.count == 1));
+
+        // Re-emitting with the same snapshots must not duplicate events.
+        emit_runtime_event_deltas(&mut sink, &mut cursor, 1, transport_a, callback_a)
+            .expect("duplicate snapshot should not fail");
+        assert_eq!(sink.events.len(), 3);
+
+        // Incremental updates should emit only the delta.
+        let transport_b = TransportStatsSnapshot {
+            queue_full_drops: 5,
+            ..TransportStatsSnapshot::default()
+        };
+        let callback_b = CallbackAuditSnapshot {
+            missing_format_description: 4,
+            ..CallbackAuditSnapshot::default()
+        };
+        emit_runtime_event_deltas(&mut sink, &mut cursor, 1, transport_b, callback_b)
+            .expect("incremental update should succeed");
+        assert_eq!(sink.events.len(), 5);
+        assert!(sink
+            .events
+            .iter()
+            .any(|event| event.code == CaptureEventCode::QueueFullDrops && event.count == 3));
+        assert!(sink.events.iter().any(|event| event.code
+            == CaptureEventCode::MissingFormatDescription
+            && event.count == 3));
     }
 
     #[test]
