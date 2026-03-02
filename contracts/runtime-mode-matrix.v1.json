@@ -1,0 +1,73 @@
+{
+  "schema_version": "1",
+  "kind": "recordit.runtime-mode-matrix",
+  "runtime_mode_fields": [
+    "runtime_mode",
+    "runtime_mode_taxonomy",
+    "runtime_mode_selector",
+    "runtime_mode_status"
+  ],
+  "selector_rules": [
+    {
+      "id": "live_selectors_mutually_exclusive",
+      "rule": "--live-stream and --live-chunked cannot be combined",
+      "stability_class": "S0"
+    },
+    {
+      "id": "chunk_tuning_requires_live_selector",
+      "rule": "--chunk-window-ms/--chunk-stride-ms/--chunk-queue-cap require --live-stream or --live-chunked",
+      "stability_class": "S0"
+    },
+    {
+      "id": "replay_incompatible_with_live_selectors",
+      "rule": "--replay-jsonl cannot be combined with --live-stream/--live-chunked",
+      "stability_class": "S0"
+    },
+    {
+      "id": "preflight_incompatible_with_live_selectors",
+      "rule": "--preflight cannot be combined with --live-stream/--live-chunked",
+      "stability_class": "S0"
+    }
+  ],
+  "modes": [
+    {
+      "runtime_mode": "representative-offline",
+      "runtime_mode_taxonomy": "representative-offline",
+      "runtime_mode_selector": "<default>",
+      "runtime_mode_status": "implemented",
+      "compatibility": {
+        "replay_jsonl": "compatible",
+        "preflight": "compatible",
+        "chunk_tuning": "forbidden"
+      },
+      "operator_meaning": "default representative offline path",
+      "stability_class": "S0"
+    },
+    {
+      "runtime_mode": "live-chunked",
+      "runtime_mode_taxonomy": "representative-chunked",
+      "runtime_mode_selector": "--live-chunked",
+      "runtime_mode_status": "implemented",
+      "compatibility": {
+        "replay_jsonl": "incompatible",
+        "preflight": "incompatible",
+        "chunk_tuning": "compatible"
+      },
+      "operator_meaning": "representative chunked path; runtime_mode label remains live-chunked for compatibility",
+      "stability_class": "S1"
+    },
+    {
+      "runtime_mode": "live-stream",
+      "runtime_mode_taxonomy": "live-stream",
+      "runtime_mode_selector": "--live-stream",
+      "runtime_mode_status": "implemented",
+      "compatibility": {
+        "replay_jsonl": "incompatible",
+        "preflight": "incompatible",
+        "chunk_tuning": "compatible"
+      },
+      "operator_meaning": "primary true live-stream runtime path",
+      "stability_class": "S0"
+    }
+  ]
+}

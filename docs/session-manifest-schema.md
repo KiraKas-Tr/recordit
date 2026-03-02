@@ -166,6 +166,10 @@ Machine-readable schema snapshot from current examples:
 
 - `artifacts/validation/bd-oe2.manifest-schema-examples.json`
 
+Canonical JSON Schema artifact for external validators:
+
+- `contracts/session-manifest.schema.v1.json`
+
 This artifact captures top-level and key nested field sets for runtime and preflight manifests to support CI/schema drift checks.
 
 ## Benchmark Interpretation Guide

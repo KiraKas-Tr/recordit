@@ -1,0 +1,1182 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://recordit.dev/contracts/session-manifest.schema.v1.json",
+  "title": "Recordit Session Manifest Schema v1",
+  "description": "Machine-readable schema for transcribe-live runtime and preflight manifest artifacts.",
+  "type": "object",
+  "oneOf": [
+    {
+      "$ref": "#/$defs/runtime_manifest"
+    },
+    {
+      "$ref": "#/$defs/preflight_manifest"
+    }
+  ],
+  "$defs": {
+    "non_negative_integer": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "non_negative_number": {
+      "type": "number",
+      "minimum": 0
+    },
+    "runtime_manifest": {
+      "type": "object",
+      "required": [
+        "schema_version",
+        "kind",
+        "generated_at_utc",
+        "asr_backend",
+        "asr_model",
+        "asr_model_source",
+        "asr_model_checksum_sha256",
+        "asr_model_checksum_status",
+        "input_wav",
+        "input_wav_semantics",
+        "out_wav",
+        "out_wav_semantics",
+        "out_wav_materialized",
+        "out_wav_bytes",
+        "channel_mode_requested",
+        "channel_mode",
+        "runtime_mode",
+        "runtime_mode_taxonomy",
+        "runtime_mode_selector",
+        "runtime_mode_status",
+        "live_config",
+        "lifecycle",
+        "speaker_labels",
+        "event_channels",
+        "vad",
+        "transcript",
+        "readability_defaults",
+        "transcript_per_channel",
+        "terminal_summary",
+        "first_emit_timing_ms",
+        "queue_defer",
+        "ordering_metadata",
+        "events",
+        "benchmark",
+        "reconciliation",
+        "asr_worker_pool",
+        "chunk_queue",
+        "cleanup_queue",
+        "degradation_events",
+        "trust",
+        "event_counts",
+        "session_summary",
+        "jsonl_path"
+      ],
+      "properties": {
+        "schema_version": {
+          "type": "string",
+          "const": "1"
+        },
+        "kind": {
+          "type": "string",
+          "const": "transcribe-live-runtime"
+        },
+        "generated_at_utc": {
+          "type": "string"
+        },
+        "asr_backend": {
+          "type": "string"
+        },
+        "asr_model": {
+          "type": "string"
+        },
+        "asr_model_source": {
+          "type": "string"
+        },
+        "asr_model_checksum_sha256": {
+          "type": "string"
+        },
+        "asr_model_checksum_status": {
+          "type": "string",
+          "enum": [
+            "available",
+            "unavailable_directory",
+            "unavailable_not_file",
+            "unavailable_unresolved",
+            "unavailable_checksum_error"
+          ]
+        },
+        "input_wav": {
+          "type": "string"
+        },
+        "input_wav_semantics": {
+          "type": "string"
+        },
+        "out_wav": {
+          "type": "string"
+        },
+        "out_wav_semantics": {
+          "type": "string"
+        },
+        "out_wav_materialized": {
+          "type": "boolean"
+        },
+        "out_wav_bytes": {
+          "$ref": "#/$defs/non_negative_integer"
+        },
+        "channel_mode_requested": {
+          "type": "string"
+        },
+        "channel_mode": {
+          "type": "string"
+        },
+        "runtime_mode": {
+          "type": "string"
+        },
+        "runtime_mode_taxonomy": {
+          "type": "string"
+        },
+        "runtime_mode_selector": {
+          "type": "string"
+        },
+        "runtime_mode_status": {
+          "type": "string"
+        },
+        "live_config": {
+          "type": "object",
+          "required": [
+            "live_chunked",
+            "chunk_window_ms",
+            "chunk_stride_ms",
+            "chunk_queue_cap"
+          ],
+          "properties": {
+            "live_chunked": {
+              "type": "boolean"
+            },
+            "chunk_window_ms": {
+              "$ref": "#/$defs/non_negative_integer"
+            },
+            "chunk_stride_ms": {
+              "$ref": "#/$defs/non_negative_integer"
+            },
+            "chunk_queue_cap": {
+              "$ref": "#/$defs/non_negative_integer"
+            }
+          },
+          "additionalProperties": true
+        },
+        "lifecycle": {
+          "type": "object",
+          "required": [
+            "current_phase",
+            "ready_for_transcripts",
+            "transitions"
+          ],
+          "properties": {
+            "current_phase": {
+              "type": "string"
+            },
+            "ready_for_transcripts": {
+              "type": "boolean"
+            },
+            "transitions": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": [
+                  "phase",
+                  "transition_index",
+                  "entered_at_utc",
+                  "ready_for_transcripts",
+                  "detail"
+                ],
+                "properties": {
+                  "phase": {
+                    "type": "string"
+                  },
+                  "transition_index": {
+                    "$ref": "#/$defs/non_negative_integer"
+                  },
+                  "entered_at_utc": {
+                    "type": "string"
+                  },
+                  "ready_for_transcripts": {
+                    "type": "boolean"
+                  },
+                  "detail": {
+                    "type": "string"
+                  }
+                },
+                "additionalProperties": true
+              }
+            }
+          },
+          "additionalProperties": true
+        },
+        "speaker_labels": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "minItems": 2,
+          "maxItems": 2
+        },
+        "event_channels": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1
+        },
+        "vad": {
+          "type": "object",
+          "required": [
+            "backend",
+            "threshold",
+            "min_speech_ms",
+            "min_silence_ms",
+            "boundary_count"
+          ],
+          "properties": {
+            "backend": {
+              "type": "string"
+            },
+            "threshold": {
+              "$ref": "#/$defs/non_negative_number"
+            },
+            "min_speech_ms": {
+              "$ref": "#/$defs/non_negative_integer"
+            },
+            "min_silence_ms": {
+              "$ref": "#/$defs/non_negative_integer"
+            },
+            "boundary_count": {
+              "$ref": "#/$defs/non_negative_integer"
+            }
+          },
+          "additionalProperties": true
+        },
+        "transcript": {
+          "type": "object",
+          "required": [
+            "segment_id",
+            "start_ms",
+            "end_ms",
+            "text"
+          ],
+          "properties": {
+            "segment_id": {
+              "type": "string"
+            },
+            "start_ms": {
+              "$ref": "#/$defs/non_negative_integer"
+            },
+            "end_ms": {
+              "$ref": "#/$defs/non_negative_integer"
+            },
+            "text": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": true
+        },
+        "readability_defaults": {
+          "type": "object",
+          "required": [
+            "merged_line_format",
+            "near_overlap_window_ms",
+            "near_overlap_annotation",
+            "ordering"
+          ],
+          "properties": {
+            "merged_line_format": {
+              "type": "string"
+            },
+            "near_overlap_window_ms": {
+              "$ref": "#/$defs/non_negative_integer"
+            },
+            "near_overlap_annotation": {
+              "type": "string"
+            },
+            "ordering": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": true
+        },
+        "transcript_per_channel": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "channel",
+              "text"
+            ],
+            "properties": {
+              "channel": {
+                "type": "string"
+              },
+              "text": {
+                "type": "string"
+              }
+            },
+            "additionalProperties": true
+          }
+        },
+        "terminal_summary": {
+          "type": "object",
+          "required": [
+            "live_mode",
+            "render_mode",
+            "stable_line_policy",
+            "stable_line_count",
+            "stable_lines_replayed",
+            "stable_lines"
+          ],
+          "properties": {
+            "live_mode": {
+              "type": "boolean"
+            },
+            "render_mode": {
+              "type": "string"
+            },
+            "stable_line_policy": {
+              "type": "string"
+            },
+            "stable_line_count": {
+              "$ref": "#/$defs/non_negative_integer"
+            },
+            "stable_lines_replayed": {
+              "type": "boolean"
+            },
+            "stable_lines": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          "additionalProperties": true
+        },
+        "first_emit_timing_ms": {
+          "type": "object",
+          "required": [
+            "first_any",
+            "first_partial",
+            "first_final",
+            "first_stable"
+          ],
+          "properties": {
+            "first_any": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "first_partial": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "first_final": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "first_stable": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          "additionalProperties": true
+        },
+        "queue_defer": {
+          "type": "object",
+          "required": [
+            "deferred_final_submissions",
+            "max_pending_final_backlog",
+            "submit_window"
+          ],
+          "properties": {
+            "deferred_final_submissions": {
+              "$ref": "#/$defs/non_negative_integer"
+            },
+            "max_pending_final_backlog": {
+              "$ref": "#/$defs/non_negative_integer"
+            },
+            "submit_window": {
+              "$ref": "#/$defs/non_negative_integer"
+            }
+          },
+          "additionalProperties": true
+        },
+        "ordering_metadata": {
+          "type": "object",
+          "required": [
+            "event_sort_key",
+            "stable_line_sort_key",
+            "stable_line_event_types",
+            "event_count"
+          ],
+          "properties": {
+            "event_sort_key": {
+              "type": "string"
+            },
+            "stable_line_sort_key": {
+              "type": "string"
+            },
+            "stable_line_event_types": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "event_count": {
+              "$ref": "#/$defs/non_negative_integer"
+            }
+          },
+          "additionalProperties": true
+        },
+        "events": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "event_type",
+              "channel",
+              "segment_id",
+              "start_ms",
+              "end_ms",
+              "text"
+            ],
+            "properties": {
+              "event_type": {
+                "type": "string"
+              },
+              "channel": {
+                "type": "string"
+              },
+              "segment_id": {
+                "type": "string"
+              },
+              "source_final_segment_id": {
+                "type": "string"
+              },
+              "start_ms": {
+                "$ref": "#/$defs/non_negative_integer"
+              },
+              "end_ms": {
+                "$ref": "#/$defs/non_negative_integer"
+              },
+              "text": {
+                "type": "string"
+              }
+            },
+            "additionalProperties": true
+          }
+        },
+        "benchmark": {
+          "type": "object",
+          "required": [
+            "run_count",
+            "wall_ms_p50",
+            "wall_ms_p95",
+            "partial_slo_met",
+            "final_slo_met",
+            "summary_csv",
+            "runs_csv"
+          ],
+          "properties": {
+            "run_count": {
+              "$ref": "#/$defs/non_negative_integer"
+            },
+            "wall_ms_p50": {
+              "$ref": "#/$defs/non_negative_number"
+            },
+            "wall_ms_p95": {
+              "$ref": "#/$defs/non_negative_number"
+            },
+            "partial_slo_met": {
+              "type": "boolean"
+            },
+            "final_slo_met": {
+              "type": "boolean"
+            },
+            "summary_csv": {
+              "type": "string"
+            },
+            "runs_csv": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": true
+        },
+        "reconciliation": {
+          "type": "object",
+          "required": [
+            "required",
+            "applied",
+            "trigger_count",
+            "trigger_codes"
+          ],
+          "properties": {
+            "required": {
+              "type": "boolean"
+            },
+            "applied": {
+              "type": "boolean"
+            },
+            "trigger_count": {
+              "$ref": "#/$defs/non_negative_integer"
+            },
+            "trigger_codes": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          "additionalProperties": true
+        },
+        "asr_worker_pool": {
+          "type": "object",
+          "required": [
+            "prewarm_ok",
+            "submitted",
+            "enqueued",
+            "dropped_queue_full",
+            "processed",
+            "succeeded",
+            "failed",
+            "retry_attempts",
+            "temp_audio_deleted",
+            "temp_audio_retained"
+          ],
+          "properties": {
+            "prewarm_ok": {
+              "type": "boolean"
+            },
+            "submitted": {
+              "$ref": "#/$defs/non_negative_integer"
+            },
+            "enqueued": {
+              "$ref": "#/$defs/non_negative_integer"
+            },
+            "dropped_queue_full": {
+              "$ref": "#/$defs/non_negative_integer"
+            },
+            "processed": {
+              "$ref": "#/$defs/non_negative_integer"
+            },
+            "succeeded": {
+              "$ref": "#/$defs/non_negative_integer"
+            },
+            "failed": {
+              "$ref": "#/$defs/non_negative_integer"
+            },
+            "retry_attempts": {
+              "$ref": "#/$defs/non_negative_integer"
+            },
+            "temp_audio_deleted": {
+              "$ref": "#/$defs/non_negative_integer"
+            },
+            "temp_audio_retained": {
+              "$ref": "#/$defs/non_negative_integer"
+            }
+          },
+          "additionalProperties": true
+        },
+        "chunk_queue": {
+          "type": "object",
+          "required": [
+            "enabled",
+            "max_queue",
+            "submitted",
+            "enqueued",
+            "dropped_oldest",
+            "processed",
+            "pending",
+            "high_water",
+            "drain_completed",
+            "lag_sample_count",
+            "lag_p50_ms",
+            "lag_p95_ms",
+            "lag_max_ms"
+          ],
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            },
+            "max_queue": {
+              "$ref": "#/$defs/non_negative_integer"
+            },
+            "submitted": {
+              "$ref": "#/$defs/non_negative_integer"
+            },
+            "enqueued": {
+              "$ref": "#/$defs/non_negative_integer"
+            },
+            "dropped_oldest": {
+              "$ref": "#/$defs/non_negative_integer"
+            },
+            "processed": {
+              "$ref": "#/$defs/non_negative_integer"
+            },
+            "pending": {
+              "$ref": "#/$defs/non_negative_integer"
+            },
+            "high_water": {
+              "$ref": "#/$defs/non_negative_integer"
+            },
+            "drain_completed": {
+              "type": "boolean"
+            },
+            "lag_sample_count": {
+              "$ref": "#/$defs/non_negative_integer"
+            },
+            "lag_p50_ms": {
+              "$ref": "#/$defs/non_negative_integer"
+            },
+            "lag_p95_ms": {
+              "$ref": "#/$defs/non_negative_integer"
+            },
+            "lag_max_ms": {
+              "$ref": "#/$defs/non_negative_integer"
+            }
+          },
+          "additionalProperties": true
+        },
+        "cleanup_queue": {
+          "type": "object",
+          "required": [
+            "enabled",
+            "max_queue",
+            "timeout_ms",
+            "retries",
+            "submitted",
+            "enqueued",
+            "dropped_queue_full",
+            "processed",
+            "succeeded",
+            "timed_out",
+            "failed",
+            "retry_attempts",
+            "pending",
+            "drain_budget_ms",
+            "drain_completed"
+          ],
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            },
+            "max_queue": {
+              "$ref": "#/$defs/non_negative_integer"
+            },
+            "timeout_ms": {
+              "$ref": "#/$defs/non_negative_integer"
+            },
+            "retries": {
+              "$ref": "#/$defs/non_negative_integer"
+            },
+            "submitted": {
+              "$ref": "#/$defs/non_negative_integer"
+            },
+            "enqueued": {
+              "$ref": "#/$defs/non_negative_integer"
+            },
+            "dropped_queue_full": {
+              "$ref": "#/$defs/non_negative_integer"
+            },
+            "processed": {
+              "$ref": "#/$defs/non_negative_integer"
+            },
+            "succeeded": {
+              "$ref": "#/$defs/non_negative_integer"
+            },
+            "timed_out": {
+              "$ref": "#/$defs/non_negative_integer"
+            },
+            "failed": {
+              "$ref": "#/$defs/non_negative_integer"
+            },
+            "retry_attempts": {
+              "$ref": "#/$defs/non_negative_integer"
+            },
+            "pending": {
+              "$ref": "#/$defs/non_negative_integer"
+            },
+            "drain_budget_ms": {
+              "$ref": "#/$defs/non_negative_integer"
+            },
+            "drain_completed": {
+              "type": "boolean"
+            }
+          },
+          "additionalProperties": true
+        },
+        "degradation_events": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "code",
+              "detail"
+            ],
+            "properties": {
+              "code": {
+                "type": "string"
+              },
+              "detail": {
+                "type": "string"
+              }
+            },
+            "additionalProperties": true
+          }
+        },
+        "trust": {
+          "type": "object",
+          "required": [
+            "degraded_mode_active",
+            "notice_count",
+            "notices"
+          ],
+          "properties": {
+            "degraded_mode_active": {
+              "type": "boolean"
+            },
+            "notice_count": {
+              "$ref": "#/$defs/non_negative_integer"
+            },
+            "notices": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": [
+                  "code",
+                  "severity",
+                  "cause",
+                  "impact",
+                  "guidance"
+                ],
+                "properties": {
+                  "code": {
+                    "type": "string"
+                  },
+                  "severity": {
+                    "type": "string"
+                  },
+                  "cause": {
+                    "type": "string"
+                  },
+                  "impact": {
+                    "type": "string"
+                  },
+                  "guidance": {
+                    "type": "string"
+                  }
+                },
+                "additionalProperties": true
+              }
+            }
+          },
+          "additionalProperties": true
+        },
+        "event_counts": {
+          "type": "object",
+          "required": [
+            "vad_boundary",
+            "transcript",
+            "partial",
+            "final",
+            "llm_final",
+            "reconciled_final"
+          ],
+          "properties": {
+            "vad_boundary": {
+              "$ref": "#/$defs/non_negative_integer"
+            },
+            "transcript": {
+              "$ref": "#/$defs/non_negative_integer"
+            },
+            "partial": {
+              "$ref": "#/$defs/non_negative_integer"
+            },
+            "final": {
+              "$ref": "#/$defs/non_negative_integer"
+            },
+            "llm_final": {
+              "$ref": "#/$defs/non_negative_integer"
+            },
+            "reconciled_final": {
+              "$ref": "#/$defs/non_negative_integer"
+            }
+          },
+          "additionalProperties": true
+        },
+        "session_summary": {
+          "type": "object",
+          "required": [
+            "session_status",
+            "duration_sec",
+            "channel_mode_requested",
+            "channel_mode_active",
+            "transcript_events",
+            "chunk_queue",
+            "chunk_lag",
+            "trust_notices",
+            "degradation_events",
+            "cleanup_queue",
+            "artifacts"
+          ],
+          "properties": {
+            "session_status": {
+              "type": "string",
+              "enum": [
+                "ok",
+                "degraded"
+              ]
+            },
+            "duration_sec": {
+              "$ref": "#/$defs/non_negative_integer"
+            },
+            "channel_mode_requested": {
+              "type": "string"
+            },
+            "channel_mode_active": {
+              "type": "string"
+            },
+            "transcript_events": {
+              "type": "object",
+              "required": [
+                "partial",
+                "final",
+                "llm_final",
+                "reconciled_final"
+              ],
+              "properties": {
+                "partial": {
+                  "$ref": "#/$defs/non_negative_integer"
+                },
+                "final": {
+                  "$ref": "#/$defs/non_negative_integer"
+                },
+                "llm_final": {
+                  "$ref": "#/$defs/non_negative_integer"
+                },
+                "reconciled_final": {
+                  "$ref": "#/$defs/non_negative_integer"
+                }
+              },
+              "additionalProperties": true
+            },
+            "chunk_queue": {
+              "type": "object",
+              "required": [
+                "submitted",
+                "enqueued",
+                "dropped_oldest",
+                "processed",
+                "pending",
+                "high_water",
+                "drain_completed"
+              ],
+              "properties": {
+                "submitted": {
+                  "$ref": "#/$defs/non_negative_integer"
+                },
+                "enqueued": {
+                  "$ref": "#/$defs/non_negative_integer"
+                },
+                "dropped_oldest": {
+                  "$ref": "#/$defs/non_negative_integer"
+                },
+                "processed": {
+                  "$ref": "#/$defs/non_negative_integer"
+                },
+                "pending": {
+                  "$ref": "#/$defs/non_negative_integer"
+                },
+                "high_water": {
+                  "$ref": "#/$defs/non_negative_integer"
+                },
+                "drain_completed": {
+                  "type": "boolean"
+                }
+              },
+              "additionalProperties": true
+            },
+            "chunk_lag": {
+              "type": "object",
+              "required": [
+                "lag_sample_count",
+                "lag_p50_ms",
+                "lag_p95_ms",
+                "lag_max_ms"
+              ],
+              "properties": {
+                "lag_sample_count": {
+                  "$ref": "#/$defs/non_negative_integer"
+                },
+                "lag_p50_ms": {
+                  "$ref": "#/$defs/non_negative_integer"
+                },
+                "lag_p95_ms": {
+                  "$ref": "#/$defs/non_negative_integer"
+                },
+                "lag_max_ms": {
+                  "$ref": "#/$defs/non_negative_integer"
+                }
+              },
+              "additionalProperties": true
+            },
+            "trust_notices": {
+              "type": "object",
+              "required": [
+                "count",
+                "top_codes"
+              ],
+              "properties": {
+                "count": {
+                  "$ref": "#/$defs/non_negative_integer"
+                },
+                "top_codes": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              },
+              "additionalProperties": true
+            },
+            "degradation_events": {
+              "type": "object",
+              "required": [
+                "count",
+                "top_codes"
+              ],
+              "properties": {
+                "count": {
+                  "$ref": "#/$defs/non_negative_integer"
+                },
+                "top_codes": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              },
+              "additionalProperties": true
+            },
+            "cleanup_queue": {
+              "type": "object",
+              "required": [
+                "enabled",
+                "submitted",
+                "enqueued",
+                "dropped_queue_full",
+                "processed",
+                "succeeded",
+                "timed_out",
+                "failed",
+                "retry_attempts",
+                "pending",
+                "drain_completed"
+              ],
+              "properties": {
+                "enabled": {
+                  "type": "boolean"
+                },
+                "submitted": {
+                  "$ref": "#/$defs/non_negative_integer"
+                },
+                "enqueued": {
+                  "$ref": "#/$defs/non_negative_integer"
+                },
+                "dropped_queue_full": {
+                  "$ref": "#/$defs/non_negative_integer"
+                },
+                "processed": {
+                  "$ref": "#/$defs/non_negative_integer"
+                },
+                "succeeded": {
+                  "$ref": "#/$defs/non_negative_integer"
+                },
+                "timed_out": {
+                  "$ref": "#/$defs/non_negative_integer"
+                },
+                "failed": {
+                  "$ref": "#/$defs/non_negative_integer"
+                },
+                "retry_attempts": {
+                  "$ref": "#/$defs/non_negative_integer"
+                },
+                "pending": {
+                  "$ref": "#/$defs/non_negative_integer"
+                },
+                "drain_completed": {
+                  "type": "boolean"
+                }
+              },
+              "additionalProperties": true
+            },
+            "artifacts": {
+              "type": "object",
+              "required": [
+                "out_wav",
+                "out_jsonl",
+                "out_manifest"
+              ],
+              "properties": {
+                "out_wav": {
+                  "type": "string"
+                },
+                "out_jsonl": {
+                  "type": "string"
+                },
+                "out_manifest": {
+                  "type": "string"
+                }
+              },
+              "additionalProperties": true
+            }
+          },
+          "additionalProperties": true
+        },
+        "jsonl_path": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": true
+    },
+    "preflight_manifest": {
+      "type": "object",
+      "required": [
+        "schema_version",
+        "kind",
+        "generated_at_utc",
+        "overall_status",
+        "config",
+        "checks"
+      ],
+      "properties": {
+        "schema_version": {
+          "type": "string",
+          "const": "1"
+        },
+        "kind": {
+          "type": "string",
+          "const": "transcribe-live-preflight"
+        },
+        "generated_at_utc": {
+          "type": "string"
+        },
+        "overall_status": {
+          "type": "string",
+          "enum": [
+            "PASS",
+            "WARN",
+            "FAIL"
+          ]
+        },
+        "config": {
+          "type": "object",
+          "required": [
+            "out_wav",
+            "out_jsonl",
+            "out_manifest",
+            "asr_backend",
+            "asr_model_requested",
+            "asr_model_resolved",
+            "asr_model_source",
+            "sample_rate_hz"
+          ],
+          "properties": {
+            "out_wav": {
+              "type": "string"
+            },
+            "out_wav_semantics": {
+              "type": "string"
+            },
+            "out_jsonl": {
+              "type": "string"
+            },
+            "out_manifest": {
+              "type": "string"
+            },
+            "asr_backend": {
+              "type": "string"
+            },
+            "asr_model_requested": {
+              "type": "string"
+            },
+            "asr_model_resolved": {
+              "type": "string"
+            },
+            "asr_model_source": {
+              "type": "string"
+            },
+            "asr_model_checksum_sha256": {
+              "type": "string"
+            },
+            "asr_model_checksum_status": {
+              "type": "string"
+            },
+            "runtime_mode": {
+              "type": "string"
+            },
+            "runtime_mode_taxonomy": {
+              "type": "string"
+            },
+            "runtime_mode_selector": {
+              "type": "string"
+            },
+            "runtime_mode_status": {
+              "type": "string"
+            },
+            "sample_rate_hz": {
+              "$ref": "#/$defs/non_negative_integer"
+            }
+          },
+          "additionalProperties": true
+        },
+        "checks": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "id",
+              "status",
+              "detail",
+              "remediation"
+            ],
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "PASS",
+                  "WARN",
+                  "FAIL"
+                ]
+              },
+              "detail": {
+                "type": "string"
+              },
+              "remediation": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "additionalProperties": true
+          }
+        }
+      },
+      "additionalProperties": true
+    }
+  }
+}

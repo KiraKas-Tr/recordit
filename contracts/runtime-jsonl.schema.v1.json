@@ -1,0 +1,662 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://recordit/contracts/runtime-jsonl.schema.v1.json",
+  "title": "recordit runtime JSONL event schema v1",
+  "description": "Schema for a single JSON object line emitted by runtime JSONL artifacts.",
+  "oneOf": [
+    {
+      "$ref": "#/$defs/eventShapes/partial"
+    },
+    {
+      "$ref": "#/$defs/eventShapes/final"
+    },
+    {
+      "$ref": "#/$defs/eventShapes/llm_final"
+    },
+    {
+      "$ref": "#/$defs/eventShapes/reconciled_final"
+    },
+    {
+      "$ref": "#/$defs/eventShapes/vad_boundary"
+    },
+    {
+      "$ref": "#/$defs/eventShapes/mode_degradation"
+    },
+    {
+      "$ref": "#/$defs/eventShapes/trust_notice"
+    },
+    {
+      "$ref": "#/$defs/eventShapes/lifecycle_phase"
+    },
+    {
+      "$ref": "#/$defs/eventShapes/reconciliation_matrix"
+    },
+    {
+      "$ref": "#/$defs/eventShapes/asr_worker_pool"
+    },
+    {
+      "$ref": "#/$defs/eventShapes/chunk_queue"
+    },
+    {
+      "$ref": "#/$defs/eventShapes/cleanup_queue"
+    }
+  ],
+  "$defs": {
+    "eventShapes": {
+      "partial": {
+        "type": "object",
+        "required": [
+          "event_type",
+          "channel",
+          "segment_id",
+          "start_ms",
+          "end_ms",
+          "text",
+          "asr_backend",
+          "vad_boundary_count"
+        ],
+        "properties": {
+          "event_type": {
+            "const": "partial"
+          },
+          "channel": {
+            "type": "string"
+          },
+          "segment_id": {
+            "type": "string"
+          },
+          "start_ms": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "end_ms": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "text": {
+            "type": "string"
+          },
+          "asr_backend": {
+            "type": "string"
+          },
+          "vad_boundary_count": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "source_final_segment_id": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": true
+      },
+      "final": {
+        "type": "object",
+        "required": [
+          "event_type",
+          "channel",
+          "segment_id",
+          "start_ms",
+          "end_ms",
+          "text",
+          "asr_backend",
+          "vad_boundary_count"
+        ],
+        "properties": {
+          "event_type": {
+            "const": "final"
+          },
+          "channel": {
+            "type": "string"
+          },
+          "segment_id": {
+            "type": "string"
+          },
+          "start_ms": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "end_ms": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "text": {
+            "type": "string"
+          },
+          "asr_backend": {
+            "type": "string"
+          },
+          "vad_boundary_count": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "source_final_segment_id": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": true
+      },
+      "llm_final": {
+        "type": "object",
+        "required": [
+          "event_type",
+          "channel",
+          "segment_id",
+          "start_ms",
+          "end_ms",
+          "text",
+          "asr_backend",
+          "vad_boundary_count"
+        ],
+        "properties": {
+          "event_type": {
+            "const": "llm_final"
+          },
+          "channel": {
+            "type": "string"
+          },
+          "segment_id": {
+            "type": "string"
+          },
+          "start_ms": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "end_ms": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "text": {
+            "type": "string"
+          },
+          "asr_backend": {
+            "type": "string"
+          },
+          "vad_boundary_count": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "source_final_segment_id": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": true
+      },
+      "reconciled_final": {
+        "type": "object",
+        "required": [
+          "event_type",
+          "channel",
+          "segment_id",
+          "start_ms",
+          "end_ms",
+          "text",
+          "asr_backend",
+          "vad_boundary_count"
+        ],
+        "properties": {
+          "event_type": {
+            "const": "reconciled_final"
+          },
+          "channel": {
+            "type": "string"
+          },
+          "segment_id": {
+            "type": "string"
+          },
+          "start_ms": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "end_ms": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "text": {
+            "type": "string"
+          },
+          "asr_backend": {
+            "type": "string"
+          },
+          "vad_boundary_count": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "source_final_segment_id": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": true
+      },
+      "vad_boundary": {
+        "type": "object",
+        "required": [
+          "event_type",
+          "channel",
+          "boundary_id",
+          "start_ms",
+          "end_ms",
+          "source",
+          "vad_backend",
+          "vad_threshold"
+        ],
+        "properties": {
+          "event_type": {
+            "const": "vad_boundary"
+          },
+          "channel": {
+            "type": "string"
+          },
+          "boundary_id": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "start_ms": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "end_ms": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "source": {
+            "type": "string"
+          },
+          "vad_backend": {
+            "type": "string"
+          },
+          "vad_threshold": {
+            "type": "number",
+            "minimum": 0.0,
+            "maximum": 1.0
+          }
+        },
+        "additionalProperties": true
+      },
+      "mode_degradation": {
+        "type": "object",
+        "required": [
+          "event_type",
+          "channel",
+          "requested_mode",
+          "active_mode",
+          "code",
+          "detail"
+        ],
+        "properties": {
+          "event_type": {
+            "const": "mode_degradation"
+          },
+          "channel": {
+            "type": "string"
+          },
+          "requested_mode": {
+            "type": "string"
+          },
+          "active_mode": {
+            "type": "string"
+          },
+          "code": {
+            "type": "string"
+          },
+          "detail": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": true
+      },
+      "trust_notice": {
+        "type": "object",
+        "required": [
+          "event_type",
+          "channel",
+          "code",
+          "severity",
+          "cause",
+          "impact",
+          "guidance"
+        ],
+        "properties": {
+          "event_type": {
+            "const": "trust_notice"
+          },
+          "channel": {
+            "type": "string"
+          },
+          "code": {
+            "type": "string"
+          },
+          "severity": {
+            "type": "string",
+            "enum": [
+              "info",
+              "warn",
+              "error"
+            ]
+          },
+          "cause": {
+            "type": "string"
+          },
+          "impact": {
+            "type": "string"
+          },
+          "guidance": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": true
+      },
+      "lifecycle_phase": {
+        "type": "object",
+        "required": [
+          "event_type",
+          "channel",
+          "phase",
+          "transition_index",
+          "entered_at_utc",
+          "ready_for_transcripts",
+          "detail"
+        ],
+        "properties": {
+          "event_type": {
+            "const": "lifecycle_phase"
+          },
+          "channel": {
+            "type": "string"
+          },
+          "phase": {
+            "type": "string",
+            "enum": [
+              "warmup",
+              "active",
+              "draining",
+              "shutdown"
+            ]
+          },
+          "transition_index": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "entered_at_utc": {
+            "type": "string"
+          },
+          "ready_for_transcripts": {
+            "type": "boolean"
+          },
+          "detail": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": true
+      },
+      "reconciliation_matrix": {
+        "type": "object",
+        "required": [
+          "event_type",
+          "channel",
+          "required",
+          "applied",
+          "trigger_count",
+          "trigger_codes"
+        ],
+        "properties": {
+          "event_type": {
+            "const": "reconciliation_matrix"
+          },
+          "channel": {
+            "type": "string"
+          },
+          "required": {
+            "type": "boolean"
+          },
+          "applied": {
+            "type": "boolean"
+          },
+          "trigger_count": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "trigger_codes": {
+            "type": [
+              "string",
+              "array"
+            ]
+          }
+        },
+        "additionalProperties": true
+      },
+      "asr_worker_pool": {
+        "type": "object",
+        "required": [
+          "event_type",
+          "channel",
+          "prewarm_ok",
+          "submitted",
+          "enqueued",
+          "dropped_queue_full",
+          "processed",
+          "succeeded",
+          "failed",
+          "retry_attempts",
+          "temp_audio_deleted",
+          "temp_audio_retained"
+        ],
+        "properties": {
+          "event_type": {
+            "const": "asr_worker_pool"
+          },
+          "channel": {
+            "type": "string"
+          },
+          "prewarm_ok": {
+            "type": "boolean"
+          },
+          "submitted": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "enqueued": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "dropped_queue_full": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "processed": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "succeeded": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "failed": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "retry_attempts": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "temp_audio_deleted": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "temp_audio_retained": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "additionalProperties": true
+      },
+      "chunk_queue": {
+        "type": "object",
+        "required": [
+          "event_type",
+          "channel",
+          "enabled",
+          "max_queue",
+          "submitted",
+          "enqueued",
+          "dropped_oldest",
+          "processed",
+          "pending",
+          "high_water",
+          "drain_completed",
+          "lag_sample_count",
+          "lag_p50_ms",
+          "lag_p95_ms",
+          "lag_max_ms"
+        ],
+        "properties": {
+          "event_type": {
+            "const": "chunk_queue"
+          },
+          "channel": {
+            "type": "string"
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "max_queue": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "submitted": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "enqueued": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "dropped_oldest": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "processed": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "pending": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "high_water": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "drain_completed": {
+            "type": "boolean"
+          },
+          "lag_sample_count": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "lag_p50_ms": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "lag_p95_ms": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "lag_max_ms": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "additionalProperties": true
+      },
+      "cleanup_queue": {
+        "type": "object",
+        "required": [
+          "event_type",
+          "channel",
+          "enabled",
+          "max_queue",
+          "timeout_ms",
+          "retries",
+          "submitted",
+          "enqueued",
+          "dropped_queue_full",
+          "processed",
+          "succeeded",
+          "timed_out",
+          "failed",
+          "retry_attempts",
+          "pending",
+          "drain_budget_ms",
+          "drain_completed"
+        ],
+        "properties": {
+          "event_type": {
+            "const": "cleanup_queue"
+          },
+          "channel": {
+            "type": "string"
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "max_queue": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "timeout_ms": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "retries": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "submitted": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "enqueued": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "dropped_queue_full": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "processed": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "succeeded": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "timed_out": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "failed": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "retry_attempts": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "pending": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "drain_budget_ms": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "drain_completed": {
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": true
+      }
+    }
+  }
+}

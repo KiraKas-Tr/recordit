@@ -1,0 +1,104 @@
+{
+  "schema_version": "1",
+  "kind": "recordit.exit-code-contract",
+  "command": "recordit",
+  "default_success_exit_code": 0,
+  "default_failure_exit_code": 2,
+  "notes": [
+    "Current v1 recordit behavior uses numeric exit codes 0 and 2 only.",
+    "Failure/degradation specificity is carried by class ids plus manifest/runtime signals rather than distinct numeric codes.",
+    "Successful but degraded runtime sessions keep exit_code=0 and must be interpreted through manifest trust/degradation fields."
+  ],
+  "classes": [
+    {
+      "id": "success",
+      "exit_code": 0,
+      "category": "success",
+      "summary": "Command completed without CLI/runtime failure.",
+      "applies_to": ["run", "doctor", "preflight", "replay", "inspect-contract"]
+    },
+    {
+      "id": "degraded_success",
+      "exit_code": 0,
+      "category": "success_with_degradation",
+      "summary": "Runtime command completed, but trust/degradation signals require operator review before treating output as nominal.",
+      "applies_to": ["run"],
+      "manifest_signals": {
+        "session_status": "session_summary.session_status=degraded",
+        "trust_flag": "trust.degraded_mode_active=true",
+        "trust_notice_count": "trust.notice_count>0",
+        "trust_notice_codes": [
+          "mode_degradation",
+          "continuity_recovered_with_gaps",
+          "continuity_unverified",
+          "capture_transport_degraded",
+          "capture_callback_contract_degraded",
+          "chunk_queue_backpressure",
+          "chunk_queue_backpressure_severe",
+          "reconciliation_applied",
+          "cleanup_queue_drop",
+          "cleanup_processing_failure",
+          "cleanup_drain_incomplete"
+        ],
+        "degradation_event_codes": [
+          "fallback_to_mixed",
+          "live_capture_interruption_recovered",
+          "live_capture_continuity_unverified",
+          "live_capture_transport_degraded",
+          "live_capture_callback_contract_degraded",
+          "live_chunk_queue_drop_oldest",
+          "live_chunk_queue_backpressure_severe",
+          "reconciliation_applied_after_backpressure"
+        ]
+      },
+      "automation_guidance": "Treat artifacts as produced successfully, but branch to degraded-handling logic before considering the session nominal."
+    },
+    {
+      "id": "usage_or_config_error",
+      "exit_code": 2,
+      "category": "failure",
+      "summary": "CLI parse/validation failed before command execution.",
+      "applies_to": ["run", "doctor", "preflight", "replay", "inspect-contract"],
+      "sources": [
+        "unknown command",
+        "unknown option",
+        "missing required value",
+        "unsupported enum/value",
+        "invalid mode/flag combination"
+      ]
+    },
+    {
+      "id": "preflight_failure",
+      "exit_code": 2,
+      "category": "failure",
+      "summary": "Preflight completed with at least one FAIL check or encountered an unexpected preflight error.",
+      "applies_to": ["preflight"],
+      "signals": {
+        "manifest_kind": "transcribe-live-preflight",
+        "overall_status": "FAIL"
+      }
+    },
+    {
+      "id": "runtime_failure",
+      "exit_code": 2,
+      "category": "failure",
+      "summary": "Runtime execution did not complete successfully, or runtime artifact emission failed.",
+      "applies_to": ["run"],
+      "signals": {
+        "stderr_prefix": "error: runtime execution failed:",
+        "artifact_expectation": "no successful runtime completion envelope"
+      }
+    },
+    {
+      "id": "replay_failure",
+      "exit_code": 2,
+      "category": "failure",
+      "summary": "Replay could not read or parse the requested JSONL artifact.",
+      "applies_to": ["replay"],
+      "signals": {
+        "stderr_prefix": "error: failed to read replay JSONL",
+        "required_argument": "--jsonl <path>"
+      }
+    }
+  ]
+}

@@ -1,0 +1,132 @@
+{
+  "contract": "recordit-cli",
+  "version": "v1",
+  "published": true,
+  "source": "docs/recordit-cli-grammar-contract.md",
+  "binary": "recordit",
+  "top_level_verbs": [
+    "run",
+    "doctor",
+    "preflight",
+    "replay",
+    "inspect-contract"
+  ],
+  "canonical_grammar": [
+    "recordit run --mode <live|offline> [mode options] [shared options]",
+    "recordit doctor [doctor options]",
+    "recordit preflight [preflight options]",
+    "recordit replay --jsonl <path> [--format <text|json>]",
+    "recordit inspect-contract <cli|runtime-modes|jsonl-schema|manifest-schema|exit-codes> [--format json]"
+  ],
+  "commands": {
+    "run": {
+      "required_options": [
+        "--mode"
+      ],
+      "shared_options": [
+        "--output-root",
+        "--profile",
+        "--language",
+        "--model",
+        "--duration-sec",
+        "--json"
+      ],
+      "modes": {
+        "live": {
+          "required_options": [],
+          "forbidden_options": [
+            "--input-wav"
+          ],
+          "maps_to": {
+            "legacy_binary": "transcribe-live",
+            "runtime_selector": "--live-stream",
+            "runtime_mode": "live-stream",
+            "runtime_mode_taxonomy": "live-stream"
+          }
+        },
+        "offline": {
+          "required_options": [
+            "--input-wav"
+          ],
+          "forbidden_options": [],
+          "maps_to": {
+            "legacy_binary": "transcribe-live",
+            "runtime_selector": "<default>",
+            "runtime_mode": "representative-offline",
+            "runtime_mode_taxonomy": "representative-offline"
+          }
+        }
+      }
+    },
+    "doctor": {
+      "options": [
+        "--model",
+        "--backend",
+        "--json"
+      ],
+      "backend_values": [
+        "auto",
+        "whispercpp",
+        "whisperkit",
+        "moonshine"
+      ]
+    },
+    "preflight": {
+      "options": [
+        "--mode",
+        "--input-wav",
+        "--output-root",
+        "--json"
+      ],
+      "mode_values": [
+        "live",
+        "offline"
+      ]
+    },
+    "replay": {
+      "required_options": [
+        "--jsonl"
+      ],
+      "options": [
+        "--jsonl",
+        "--format"
+      ],
+      "format_values": [
+        "text",
+        "json"
+      ]
+    },
+    "inspect-contract": {
+      "required_positionals": [
+        "name"
+      ],
+      "name_values": [
+        "cli",
+        "runtime-modes",
+        "jsonl-schema",
+        "manifest-schema",
+        "exit-codes"
+      ],
+      "options": [
+        "--format"
+      ],
+      "format_values": [
+        "json"
+      ]
+    }
+  },
+  "output_root_contract": {
+    "default_root_pattern": "<artifact-base>/sessions/<YYYYMMDD>/<timestamp>-<mode>/",
+    "explicit_root_behavior": "If --output-root is provided, that directory is used as the session root directly.",
+    "canonical_filenames": [
+      "session.input.wav",
+      "session.wav",
+      "session.jsonl",
+      "session.manifest.json"
+    ]
+  },
+  "compatibility": {
+    "legacy_transcribe_live_remains_supported": true,
+    "positioning": "additive-v1"
+  }
+}
