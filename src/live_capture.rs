@@ -1729,11 +1729,15 @@ pub fn run_streaming_capture_session(
             .with_context(|| format!("failed to create output directory {}", parent.display()))?;
     }
 
-    println!(
-        "Starting Sequoia capture for {}s -> {}",
-        duration_secs,
-        output.display()
-    );
+    if duration_secs == 0 {
+        println!("Starting Sequoia capture until interrupted -> {}", output.display());
+    } else {
+        println!(
+            "Starting Sequoia capture for {}s -> {}",
+            duration_secs,
+            output.display()
+        );
+    }
     println!("Stereo mapping: left=mic, right=system");
     println!("Sample-rate mismatch policy: {}", mismatch_policy.as_str());
     println!("Callback contract mode: {:?}", callback_contract_mode);
@@ -1792,7 +1796,11 @@ pub fn run_streaming_capture_session(
         .start_capture()
         .context("failed to start stream capture")?;
 
-    let deadline = Instant::now() + Duration::from_secs(duration_secs);
+    let deadline = if duration_secs == 0 {
+        None
+    } else {
+        Some(Instant::now() + Duration::from_secs(duration_secs))
+    };
     let mut mic_chunks = Vec::<TimedChunk>::new();
     let mut sys_chunks = Vec::<TimedChunk>::new();
     let mut restart_count = 0usize;
@@ -1801,11 +1809,11 @@ pub fn run_streaming_capture_session(
     let mut progressive_materializations = 0usize;
     let mut runtime_event_cursor = RuntimeEventCursor::default();
 
-    while Instant::now() < deadline {
+    while deadline.is_none_or(|end| Instant::now() < end) {
         let mut last_chunk_at = Instant::now();
         let mut interrupted = false;
 
-        while Instant::now() < deadline {
+        while deadline.is_none_or(|end| Instant::now() < end) {
             match consumer.recv_timeout(CALLBACK_RECV_TIMEOUT) {
                 Ok(chunk_slot) => {
                     let chunk = TimedChunk {

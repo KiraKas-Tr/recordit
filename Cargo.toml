@@ -13,3 +13,6 @@ screencapturekit = { version = "1.5.1", features = ["macos_15_0"] }
 [[bin]]
 name = "transcribe-live"
 path = "src/bin/transcribe_live.rs"
+
+[dev-dependencies]
+serde_json = "1.0.145"
