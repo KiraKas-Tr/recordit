@@ -23,10 +23,12 @@ Debug commands in this runbook are troubleshooting/development surfaces, not the
 
 ## Packaged Session Summary Contract
 
-`make run-transcribe-app` now provides a two-part operator summary:
+`make run-transcribe-app` now provides a packaged operator wrapper with:
 
 1. pre-run absolute artifact paths (single packaged root + session files)
-2. post-run summary after signed app exit:
+2. attached terminal execution for live selectors (`--live-stream`, `--live-chunked`) so transcript output stays visible during runtime
+3. automatic model staging into the packaged container for attached live runs so the signed runtime can read the explicit `--asr-model` asset under sandbox rules
+4. post-run summary after signed app exit:
    - manifest presence check
    - trust degraded-mode flag
    - trust notice count
@@ -188,6 +190,8 @@ Preflight checks include:
 
 For packaged runs, use the post-run summary emitted by `make run-transcribe-app` first:
 
+- `run_status` (`ok|degraded|failed`)
+- `remediation_hints` (top deterministic next actions)
 - `trust.degraded_mode_active`
 - `trust.notice_count`
 - `degradation_events` count
