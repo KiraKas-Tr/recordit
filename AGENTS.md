@@ -280,65 +280,24 @@ Next steps (pick one)
 
 NEVER EVER DO THAT AGAIN. The answer is literally ALWAYS the same: those are changes created by the potentially dozen of other agents working on the project at the same time. This is not only a common occurence, it happens multiple times PER MINUTE. The way to deal with it is simple: you NEVER, under ANY CIRCUMSTANCE, stash, revert, overwrite, or otherwise disturb in ANY way the work of other agents. Just treat those changes identically to changes that you yourself made. Just fool yourself into thinking YOU made the changes and simply don't recall it for some reason.
 
-<!-- bv-agent-instructions-v1 -->
+## Legacy `bd` Workflow (Deprecated)
 
----
+Historical docs may still mention `beads_viewer`/`bd` commands. For this repository, that workflow is deprecated.
 
-## Beads Workflow Integration
+Canonical issue workflow is:
+- `br` for task state and dependency management
+- `br sync --flush-only` for JSONL export (no git automation)
+- `bv --robot-*` for triage/planning (never bare `bv`)
 
-This project uses [beads_viewer](https://github.com/Dicklesworthstone/beads_viewer) for issue tracking. Issues are stored in `.beads/` and tracked in git.
+Do not run `bd`/`bd sync` for normal work. Only use legacy command names when reading old artifacts or translating historical instructions.
 
-### Essential Commands
+Quick translation from legacy docs:
 
-```bash
-# View issues (launches TUI - avoid in automated sessions)
-bv
-
-# CLI commands for agents (use these instead)
-bd ready              # Show issues ready to work (no blockers)
-bd list --status=open # All open issues
-bd show <id>          # Full issue details with dependencies
-bd create --title="..." --type=task --priority=2
-bd update <id> --status=in_progress
-bd close <id> --reason="Completed"
-bd close <id1> <id2>  # Close multiple issues at once
-bd sync               # Commit and push changes
-```
-
-### Workflow Pattern
-
-1. **Start**: Run `bd ready` to find actionable work
-2. **Claim**: Use `bd update <id> --status=in_progress`
-3. **Work**: Implement the task
-4. **Complete**: Use `bd close <id>`
-5. **Sync**: Always run `bd sync` at session end
-
-### Key Concepts
-
-- **Dependencies**: Issues can block other issues. `bd ready` shows only unblocked work.
-- **Priority**: P0=critical, P1=high, P2=medium, P3=low, P4=backlog (use numbers, not words)
-- **Types**: task, bug, feature, epic, question, docs
-- **Blocking**: `bd dep add <issue> <depends-on>` to add dependencies
-
-### Session Protocol
-
-**Before ending any session, run this checklist:**
-
-```bash
-git status              # Check what changed
-git add <files>         # Stage code changes
-bd sync                 # Commit beads changes
-git commit -m "..."     # Commit code
-bd sync                 # Commit any new beads changes
-git push                # Push to remote
-```
-
-### Best Practices
-
-- Check `bd ready` at session start to find available work
-- Update status as you work (in_progress → closed)
-- Create new issues with `bd create` when you discover tasks
-- Use descriptive titles and set appropriate priority/type
-- Always `bd sync` before ending session
-
-<!-- end-bv-agent-instructions -->
+| Legacy | Canonical |
+|--------|-----------|
+| `bd ready` | `br ready` |
+| `bd list --status=open` | `br list --status open` |
+| `bd show <id>` | `br show <id>` |
+| `bd update <id> --status=in_progress` | `br update <id> --status in_progress` |
+| `bd close <id>` | `br close <id> --reason "Completed"` |
+| `bd sync` | `br sync --flush-only` + manual git add/commit/push |
