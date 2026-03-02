@@ -30,7 +30,10 @@ TRANSCRIBE_APP_OUT_WAV ?= $(TRANSCRIBE_APP_ARTIFACT_ROOT)/$(TRANSCRIBE_APP_SESSI
 TRANSCRIBE_APP_OUT_JSONL ?= $(TRANSCRIBE_APP_ARTIFACT_ROOT)/$(TRANSCRIBE_APP_SESSION_STEM).jsonl
 TRANSCRIBE_APP_OUT_MANIFEST ?= $(TRANSCRIBE_APP_ARTIFACT_ROOT)/$(TRANSCRIBE_APP_SESSION_STEM).manifest.json
 TRANSCRIBE_APP_LIVE_STREAM_INPUT_WAV ?= $(TRANSCRIBE_APP_ARTIFACT_ROOT)/$(TRANSCRIBE_APP_SESSION_STEM).input.wav
+TRANSCRIBE_APP_STAGED_MODEL ?= $(TRANSCRIBE_APP_ARTIFACT_ROOT)/models/$(notdir $(ASR_MODEL))
 TRANSCRIBE_APP_LIVE_STREAM_ARGS ?=
+TRANSCRIBE_APP_AUTO_LIVE_INPUT_ARG := $(if $(and $(findstring --live-stream,$(TRANSCRIBE_ARGS)),$(if $(findstring --input-wav,$(TRANSCRIBE_ARGS)),,1)),--input-wav "$(TRANSCRIBE_APP_LIVE_STREAM_INPUT_WAV)")
+TRANSCRIBE_APP_RUN_ATTACHED = $(if $(or $(findstring --live-stream,$(TRANSCRIBE_ARGS)),$(findstring --live-chunked,$(TRANSCRIBE_ARGS))),1,0)
 TRANSCRIBE_APP_SHOW_LIVE_INPUT ?= 0
 WHISPERCPP_HELPER_BIN ?= /opt/homebrew/bin/whisper-cli
 WHISPERCPP_HELPER_LIB_GLOBS ?= libwhisper*.dylib libggml*.dylib
@@ -60,7 +63,7 @@ SMOKE_NEAR_LIVE_DETERMINISTIC_DIR ?= artifacts/smoke/near-live-deterministic
 SMOKE_NEAR_LIVE_INPUT_WAV ?= $(SMOKE_NEAR_LIVE_DIR)/capture.input.wav
 SMOKE_NEAR_LIVE_DETERMINISTIC_INPUT_WAV ?= artifacts/bench/corpus/gate_c/tts_phrase_stereo.wav
 
-.PHONY: help build build-release probe capture transcribe-live transcribe-live-stream capture-transcribe transcribe-preflight transcribe-model-doctor smoke smoke-offline smoke-near-live smoke-near-live-deterministic setup-whispercpp-model run-transcribe-app run-transcribe-live-stream-app run-transcribe-preflight-app run-transcribe-model-doctor-app bench-harness gate-backlog-pressure gate-transcript-completeness gate-v1-acceptance gate-packaged-live-smoke gate-d-soak bundle bundle-transcribe sign sign-transcribe verify run-app reset-perms clean
+.PHONY: help build build-release probe capture transcribe-live transcribe-live-stream capture-transcribe transcribe-preflight transcribe-model-doctor smoke smoke-offline smoke-near-live smoke-near-live-deterministic contracts-ci setup-whispercpp-model run-transcribe-app run-transcribe-live-stream-app run-transcribe-preflight-app run-transcribe-model-doctor-app bench-harness gate-backlog-pressure gate-transcript-completeness gate-v1-acceptance gate-packaged-live-smoke gate-d-soak bundle bundle-transcribe sign sign-transcribe verify run-app reset-perms clean
 
 help:
 	@echo "Targets:"
@@ -77,6 +80,7 @@ help:
 	@echo "  smoke-offline - Smoke the offline journey on representative fixture input"
 	@echo "  smoke-near-live - Smoke the host near-live journey via live capture (machine-dependent)"
 	@echo "  smoke-near-live-deterministic - CI-safe near-live fallback smoke using deterministic stereo fixture"
+	@echo "  contracts-ci  - Run machine-readable contract/schema enforcement suite"
 	@echo "  setup-whispercpp-model - Bootstrap default local whispercpp model asset"
 	@echo "  run-transcribe-app - Run signed transcribe-live app bundle (recommended packaged beta entrypoint)"
 	@echo "  run-transcribe-live-stream-app - Run signed transcribe-live app bundle with explicit --live-stream selector"
@@ -138,6 +142,9 @@ transcribe-model-doctor: TRANSCRIBE_ARGS += --model-doctor
 transcribe-model-doctor: transcribe-live
 
 smoke: smoke-offline smoke-near-live-deterministic
+
+contracts-ci:
+	scripts/ci_contracts.sh
 
 smoke-offline: build
 	@mkdir -p "$(abspath $(SMOKE_OFFLINE_DIR))"
@@ -243,22 +250,35 @@ run-transcribe-app: sign-transcribe
 	@echo "Signed app transcribe-live absolute artifact paths:"
 	@echo "  Root:     $(TRANSCRIBE_APP_ARTIFACT_ROOT)"
 	@echo "  Helper bin search prefix: $(abspath $(TRANSCRIBE_APP_HELPER_BIN_DIR))"
-	@if [ "$(TRANSCRIBE_APP_SHOW_LIVE_INPUT)" = "1" ]; then \
+	@if [ "$(TRANSCRIBE_APP_SHOW_LIVE_INPUT)" = "1" ] || [ -n "$(TRANSCRIBE_APP_AUTO_LIVE_INPUT_ARG)" ]; then \
 		echo "  Input WAV: $(TRANSCRIBE_APP_LIVE_STREAM_INPUT_WAV)"; \
 	fi
 	@echo "  WAV:      $(TRANSCRIBE_APP_OUT_WAV)"
 	@echo "  JSONL:    $(TRANSCRIBE_APP_OUT_JSONL)"
 	@echo "  Manifest: $(TRANSCRIBE_APP_OUT_MANIFEST)"
-	PATH="$(abspath $(TRANSCRIBE_APP_HELPER_BIN_DIR)):$$PATH" open -W $(TRANSCRIBE_APP_DIR) --args --duration-sec $(TRANSCRIBE_SECS) --out-wav "$(TRANSCRIBE_APP_OUT_WAV)" --out-jsonl "$(TRANSCRIBE_APP_OUT_JSONL)" --out-manifest "$(TRANSCRIBE_APP_OUT_MANIFEST)" --asr-model "$(ASR_MODEL)" $(TRANSCRIBE_ARGS)
+	@if [ "$(TRANSCRIBE_APP_RUN_ATTACHED)" = "1" ]; then \
+		staged_model="$(TRANSCRIBE_APP_STAGED_MODEL)"; \
+		mkdir -p "$$(dirname "$$staged_model")"; \
+		src_model="$(abspath $(ASR_MODEL))"; \
+		if [ "$$src_model" != "$$staged_model" ]; then \
+			cp "$$src_model" "$$staged_model"; \
+		fi; \
+		echo "  Launch mode: attached terminal (signed executable; live runtime output stays visible)"; \
+		echo "  Staged model: $$staged_model"; \
+		PATH="$(abspath $(TRANSCRIBE_APP_HELPER_BIN_DIR)):$$PATH" "$(TRANSCRIBE_APP_EXE)" --duration-sec $(TRANSCRIBE_SECS) --out-wav "$(TRANSCRIBE_APP_OUT_WAV)" --out-jsonl "$(TRANSCRIBE_APP_OUT_JSONL)" --out-manifest "$(TRANSCRIBE_APP_OUT_MANIFEST)" --asr-model "$$staged_model" $(TRANSCRIBE_APP_AUTO_LIVE_INPUT_ARG) $(TRANSCRIBE_ARGS); \
+	else \
+		echo "  Launch mode: LaunchServices (open -W)"; \
+		PATH="$(abspath $(TRANSCRIBE_APP_HELPER_BIN_DIR)):$$PATH" open -W $(TRANSCRIBE_APP_DIR) --args --duration-sec $(TRANSCRIBE_SECS) --out-wav "$(TRANSCRIBE_APP_OUT_WAV)" --out-jsonl "$(TRANSCRIBE_APP_OUT_JSONL)" --out-manifest "$(TRANSCRIBE_APP_OUT_MANIFEST)" --asr-model "$(abspath $(ASR_MODEL))" $(TRANSCRIBE_APP_AUTO_LIVE_INPUT_ARG) $(TRANSCRIBE_ARGS); \
+	fi
 	@echo "Signed app session summary:"
 	@echo "  Artifacts root: $(TRANSCRIBE_APP_ARTIFACT_ROOT)"
 	@echo "  Manifest:       $(TRANSCRIBE_APP_OUT_MANIFEST)"
 	@if [ -f "$(TRANSCRIBE_APP_OUT_MANIFEST)" ]; then \
 		echo "  Manifest present: true"; \
 		if command -v jq >/dev/null 2>&1; then \
-			echo "  Trust degraded mode: $$(jq -r '.trust.degraded_mode_active // false' \"$(TRANSCRIBE_APP_OUT_MANIFEST)\")"; \
-			echo "  Trust notice count:  $$(jq -r '.trust.notice_count // 0' \"$(TRANSCRIBE_APP_OUT_MANIFEST)\")"; \
-			echo "  Degradation events:  $$(jq -r '(.degradation_events // []) | length' \"$(TRANSCRIBE_APP_OUT_MANIFEST)\")"; \
+			echo "  Trust degraded mode: $$(jq -r '.trust.degraded_mode_active // false' "$(TRANSCRIBE_APP_OUT_MANIFEST)")"; \
+			echo "  Trust notice count:  $$(jq -r '.trust.notice_count // 0' "$(TRANSCRIBE_APP_OUT_MANIFEST)")"; \
+			echo "  Degradation events:  $$(jq -r '(.degradation_events // []) | length' "$(TRANSCRIBE_APP_OUT_MANIFEST)")"; \
 		else \
 			echo "  Install jq to print trust/degradation summary fields automatically."; \
 		fi; \

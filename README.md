@@ -16,13 +16,16 @@ Sequoia Capture is a macOS 15+ Rust project that records:
 - System audio and microphone arrive as separate ScreenCaptureKit output streams and are aligned by PTS in the recorder pipeline.
 
 ## Project Layout
-- `src/main.rs`: probe binary (stream/output/timestamp inspection)
+- `src/main.rs`: canonical `recordit` operator CLI shell
+- `src/bin/sck_probe.rs`: engineering probe binary (stream/output/timestamp inspection)
 - `src/bin/sequoia_capture.rs`: WAV recorder binary
 - `src/bin/transcribe_live.rs`: transcription CLI contract and config validation entrypoint
 - `packaging/Info.plist`: bundle metadata and privacy usage descriptions
 - `packaging/entitlements.plist`: sandbox and privacy entitlements
 - `docs/research.md`: API/TCC/platform research
 - `docs/architecture.md`: real-time pipeline and interleave spec
+- `docs/state-machine.md`: executable state-machine single source of truth (CLI/runtime/capture/queue/lifecycle)
+- `docs/operator-quickstart.md`: canonical first-run operator path for `recordit`
 - `docs/adr-001-backend-decision.md`: backend decision and explicit fallback triggers
 - `docs/adr-002-lock-free-transport.md`: callback transport architecture decision
 - `docs/adr-003-cleanup-boundary-policy.md`: cleanup isolation and policy decision
@@ -31,17 +34,39 @@ Sequoia Capture is a macOS 15+ Rust project that records:
 
 ## Commands
 
+### Operator Quickstart (canonical)
+Use the short happy path in [docs/operator-quickstart.md](docs/operator-quickstart.md).
+
+Fast path:
+```bash
+make setup-whispercpp-model
+cargo run --bin recordit -- preflight --mode live --json
+cargo run --bin recordit -- run --mode live --model artifacts/bench/models/whispercpp/ggml-tiny.en.bin --json
+cargo run --bin recordit -- replay --jsonl <session-root>/session.jsonl --format json
+```
+
+Deterministic local fallback:
+```bash
+cargo run --bin recordit -- run --mode offline --input-wav artifacts/bench/corpus/gate_c/tts_phrase_stereo.wav --model artifacts/bench/models/whispercpp/ggml-tiny.en.bin --json
+```
+
 ### Build
 ```bash
 make build
 ```
 Builds debug binaries.
 
+### Contract/Schema Enforcement Suite
+```bash
+make contracts-ci
+```
+Runs the machine-readable contract/schema enforcement suite used by CI (`scripts/ci_contracts.sh`).
+
 ### Probe (debug)
 ```bash
 make probe CAPTURE_SECS=8
 ```
-Runs `src/main.rs` and prints output-type/timestamp metadata.
+Runs `src/bin/sck_probe.rs` and prints output-type/timestamp metadata.
 
 ### Record WAV (debug)
 ```bash
@@ -49,16 +74,20 @@ make capture CAPTURE_SECS=10 OUT=artifacts/hello-world.wav SAMPLE_RATE=48000
 ```
 Runs the debug recorder binary directly.
 
-### Run Representative Transcription Runtime (debug)
+### Run Representative Transcription Runtime (debug, legacy compatibility surface)
 ```bash
 make transcribe-live ASR_MODEL=models/ggml-base.en.bin
 ```
+Compatibility note: prefer `recordit run --mode offline` for normal operator usage.
+
 Validates CLI flags, runs representative ASR transcription against `--input-wav` (auto-generated locally if missing), emits `partial`/`final` events to terminal + JSONL, computes VAD boundaries, and writes runtime manifest + mode-specific latency benchmark artifacts.
 
-### Run True Live-Stream Runtime (debug)
+### Run True Live-Stream Runtime (debug, legacy compatibility surface)
 ```bash
 make transcribe-live-stream ASR_MODEL=models/ggml-base.en.bin
 ```
+Compatibility note: prefer `recordit run --mode live` for normal operator usage.
+
 Runs the `--live-stream` runtime selector and prints absolute paths for captured input + emitted artifacts before execution. In this mode, `--input-wav` is the progressive scratch capture artifact that grows during runtime, while `--out-wav` is the canonical session WAV materialized on successful closeout.
 
 Common overrides:
@@ -82,14 +111,20 @@ Quick first-run path for true live mode:
 
 ```bash
 make setup-whispercpp-model
-make transcribe-live-stream ASR_MODEL=artifacts/bench/models/whispercpp/ggml-tiny.en.bin
+cargo run --bin recordit -- preflight --mode live --json
+cargo run --bin recordit -- run --mode live --model artifacts/bench/models/whispercpp/ggml-tiny.en.bin --json
+cargo run --bin recordit -- replay --jsonl <session-root>/session.jsonl --format json
 ```
 
 What to expect:
 
+- startup banner is deterministic and compact: `runtime_mode`, `runtime_mode_taxonomy`, `runtime_mode_selector`, `runtime_mode_status`, `channel_mode_requested`, `duration_sec`, `input_wav`, and canonical artifact paths.
+- when launched through `recordit`, the legacy verbose `Transcribe-live configuration` dump is suppressed by default so startup remains concise.
 - `warmup` lifecycle starts first; transcript lines are not expected until runtime reaches `active`.
 - once `active`, interactive terminals show low-noise partial updates and stable final lines as segments close.
 - close summary is deterministic; if stable lines were already shown live, duplicate replay is suppressed.
+- health interpretation is deterministic: `ok` (no trust notices), `degraded` (trust notices present), `failed` (non-zero exit before successful close-summary emission).
+- runtime result includes `remediation_hints` as a concise, deterministic top-hints line for common degradation/failure follow-ups.
 - if summary reports degraded trust/degradation counters, use `reconciled_final` plus manifest trust/reconciliation fields for canonical review.
 
 ### One-Command Capture then Transcribe (debug)
@@ -176,7 +211,9 @@ Post-implementation verification checklist and evidence index: `docs/post-implem
 ```bash
 make run-transcribe-app ASR_MODEL=models/ggml-base.en.bin
 ```
-Builds/signs `dist/SequoiaTranscribe.app` (signed app mode for `transcribe-live`) and launches it via `open -W`.
+Builds/signs `dist/SequoiaTranscribe.app` (signed app mode for `transcribe-live`).
+Default packaged runs launch via `open -W`; live selectors such as `--live-stream` and `--live-chunked` run the signed executable directly so terminal transcript output remains attached to the invoking shell.
+For those attached live runs, the explicit `--asr-model` asset is staged into the app container before launch so the signed runtime can read it under sandbox rules.
 This is the recommended packaged beta launch path and should be treated as the primary operator entrypoint.
 The target prints absolute container-scoped artifact destinations before launch and prints a concise post-run session summary after the signed app exits.
 
@@ -268,9 +305,22 @@ Removes build/output artifacts and runs `cargo clean`.
 
 ## Binary Arguments
 
-### Probe binary (`src/main.rs`)
+### Canonical operator CLI (`src/main.rs`)
 ```bash
-cargo run -- [duration_seconds]
+cargo run --bin recordit -- run --mode live
+cargo run --bin recordit -- run --mode offline --input-wav <path>
+cargo run --bin recordit -- doctor
+cargo run --bin recordit -- preflight --mode live
+cargo run --bin recordit -- replay --jsonl <path>
+cargo run --bin recordit -- inspect-contract cli --format json
+```
+- `recordit` is the recommended human-facing path for normal operator workflows.
+- The legacy `transcribe-live` contract remains stable for scripts, gates, and expert-only controls.
+- Contract/schema evolution policy: [`docs/schema-versioning-policy.md`](docs/schema-versioning-policy.md)
+
+### Probe binary (`src/bin/sck_probe.rs`)
+```bash
+cargo run --bin sck_probe -- [duration_seconds]
 ```
 - `duration_seconds` optional, default `8`
 
@@ -291,6 +341,10 @@ cargo run --bin sequoia_capture -- [duration_seconds] [output_path] [sample_rate
 ```bash
 cargo run --bin transcribe-live -- [--asr-model <local-model-path>] [flags...]
 ```
+- Migration note:
+  - prefer `recordit run --mode live` (or `--mode offline`) for normal operator usage
+  - keep using `transcribe-live` for legacy automation/gates and deep engineering controls
+  - `transcribe-live --help` now prints this migration guidance directly for operators
 - key flags currently validated:
   - `--duration-sec`
   - `--input-wav`
@@ -441,6 +495,8 @@ Benchmark artifacts are written under:
 - `make capture` / direct `cargo run --bin sequoia_capture`: output path is resolved from the current shell working directory.
 - `make run-app`: app is sandboxed, so relative paths resolve inside container storage.
 - `make transcribe-live`, `make transcribe-live-stream`, and `make run-transcribe-app`: all pass absolute artifact paths and print them before execution.
+- `make run-transcribe-app` keeps live selector runs (`--live-stream`, `--live-chunked`) attached to the current terminal so incremental transcript output can render during execution.
+- `make run-transcribe-app` stages explicit live-run model assets under the packaged container root before attached execution so the signed runtime can read them.
 - `make run-transcribe-app` also prints a post-run session summary (manifest presence + trust/degradation counters when `jq` is available).
 - `make transcribe-preflight` and `make run-transcribe-preflight-app`: run deterministic preflight checks and persist checklist outcomes in the manifest output.
 - `make transcribe-model-doctor` and `make run-transcribe-model-doctor-app`: run model/backend diagnostics in debug and packaged contexts with the same operator-facing contract.
