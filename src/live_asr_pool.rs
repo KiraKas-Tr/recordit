@@ -690,71 +690,85 @@ mod tests {
 
     #[test]
     fn service_final_submission_evicts_background_job_under_pressure() {
-        let executor = Arc::new(MockExecutor {
-            prewarm_ok: true,
-            fail_text: false,
-            sleep_ms: 5,
-            attempts: AtomicUsize::new(0),
-        });
-        let mut service = LiveAsrService::start(
-            executor,
-            LiveAsrPoolConfig {
-                worker_count: 1,
-                queue_capacity: 1,
-                retries: 0,
-                temp_audio_policy: TempAudioPolicy::RetainOnFailure,
-            },
-        );
+        for _attempt in 0..8 {
+            let executor = Arc::new(MockExecutor {
+                prewarm_ok: true,
+                fail_text: false,
+                sleep_ms: 5,
+                attempts: AtomicUsize::new(0),
+            });
+            let mut service = LiveAsrService::start(
+                executor,
+                LiveAsrPoolConfig {
+                    worker_count: 1,
+                    queue_capacity: 1,
+                    retries: 0,
+                    temp_audio_policy: TempAudioPolicy::RetainOnFailure,
+                },
+            );
 
-        {
-            let (lock, _) = &*service.queue_state;
-            let mut queue = lock.lock().expect("queue lock should not be poisoned");
-            queue.push_job(job(100, LiveAsrJobClass::Partial));
-        }
+            // Allow the worker thread to block on the condition variable before seeding
+            // queue state directly; otherwise it may race and consume the background job.
+            thread::sleep(Duration::from_millis(10));
 
-        let final_job = job(101, LiveAsrJobClass::Final);
-        assert!(
-            service.submit(final_job.clone()).is_ok(),
-            "final submission should evict background work instead of dropping"
-        );
-
-        let evicted = service
-            .try_recv_result()
-            .expect("evicted background job should be reported immediately");
-        assert_eq!(evicted.job.job_id, 100);
-        assert_eq!(evicted.job.class, LiveAsrJobClass::Partial);
-        assert!(!evicted.success());
-        assert!(
-            evicted
-                .error
-                .as_deref()
-                .unwrap_or_default()
-                .contains("evicted partial job in favor of final")
-        );
-
-        service.close();
-        let mut final_result = None;
-        for _ in 0..20 {
-            let Some(result) = service.recv_result_timeout(Duration::from_millis(100)) else {
-                continue;
-            };
-            if result.job.job_id == final_job.job_id {
-                final_result = Some(result);
-                break;
+            {
+                let (lock, _) = &*service.queue_state;
+                let mut queue = lock.lock().expect("queue lock should not be poisoned");
+                queue.push_job(job(100, LiveAsrJobClass::Partial));
+                assert_eq!(queue.total_len(), 1, "expected seeded background job");
             }
+
+            let final_job = job(101, LiveAsrJobClass::Final);
+            assert!(
+                service.submit(final_job.clone()).is_ok(),
+                "final submission should evict background work instead of dropping"
+            );
+
+            let evicted = service.try_recv_result();
+
+            service.close();
+            let mut final_result = None;
+            for _ in 0..20 {
+                let Some(result) = service.recv_result_timeout(Duration::from_millis(100)) else {
+                    continue;
+                };
+                if result.job.job_id == final_job.job_id {
+                    final_result = Some(result);
+                    break;
+                }
+            }
+            service.join();
+
+            let telemetry = service.telemetry();
+            if telemetry.dropped_queue_full == 0 {
+                continue;
+            }
+
+            let evicted =
+                evicted.expect("evicted background job should be reported immediately on eviction");
+            assert_eq!(evicted.job.job_id, 100);
+            assert_eq!(evicted.job.class, LiveAsrJobClass::Partial);
+            assert!(!evicted.success());
+            assert!(
+                evicted
+                    .error
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("evicted partial job in favor of final")
+            );
+
+            let final_result = final_result.expect("expected final result after eviction path");
+            assert!(final_result.success());
+            assert_eq!(final_result.job.class, LiveAsrJobClass::Final);
+            assert_eq!(telemetry.submitted, 1);
+            assert_eq!(telemetry.enqueued, 1);
+            assert_eq!(telemetry.dropped_queue_full, 1);
+            assert_eq!(telemetry.failed, 1);
+            assert_eq!(telemetry.succeeded, 1);
+            return;
         }
-        service.join();
 
-        let final_result = final_result.expect("expected final result after eviction path");
-        assert!(final_result.success());
-        assert_eq!(final_result.job.class, LiveAsrJobClass::Final);
-
-        let telemetry = service.telemetry();
-        assert_eq!(telemetry.submitted, 1);
-        assert_eq!(telemetry.enqueued, 1);
-        assert_eq!(telemetry.dropped_queue_full, 1);
-        assert_eq!(telemetry.failed, 1);
-        assert_eq!(telemetry.succeeded, 1);
+        panic!("expected to observe queue-pressure eviction path after retry attempts");
     }
 
     #[test]

@@ -26,10 +26,10 @@ use std::fs::{self, File};
 use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
-use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, TrySendError, sync_channel};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 mod artifacts;
 mod asr_backend;
@@ -57,6 +57,13 @@ const LIVE_CAPTURE_CALLBACK_CONTRACT_DEGRADED_CODE: &str =
 const LIVE_CHUNK_QUEUE_DROP_OLDEST_CODE: &str = "live_chunk_queue_drop_oldest";
 const LIVE_CHUNK_QUEUE_BACKPRESSURE_SEVERE_CODE: &str = "live_chunk_queue_backpressure_severe";
 const RECONCILIATION_APPLIED_CODE: &str = "reconciliation_applied_after_backpressure";
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ModelChecksumCacheKey {
+    canonical_path: PathBuf,
+    file_len: u64,
+    modified_unix_nanos: u128,
+}
 
 const LIVE_CAPTURE_TRANSPORT_SOURCES: [&str; 4] = [
     "slot_miss_drops",
@@ -1459,7 +1466,6 @@ impl LiveStreamIncrementalJsonlWriter {
                 };
                 self.stream
                     .write_line(&jsonl_transcript_event_line(&event, self.backend_id, 0))?;
-                self.stream.checkpoint()?;
             }
             RuntimeOutputEvent::CaptureEvent { .. } | RuntimeOutputEvent::AsrQueued { .. } => {}
         }
@@ -2685,7 +2691,28 @@ fn model_checksum_info(resolved_model: Option<&ResolvedModelPath>) -> ModelCheck
     }
 }
 
-fn sha256_file_hex(path: &Path) -> Result<String, CliError> {
+fn checksum_cache_key(path: &Path) -> Option<ModelChecksumCacheKey> {
+    let metadata = fs::metadata(path).ok()?;
+    let modified_unix_nanos = metadata
+        .modified()
+        .ok()?
+        .duration_since(UNIX_EPOCH)
+        .ok()?
+        .as_nanos();
+    let canonical_path = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    Some(ModelChecksumCacheKey {
+        canonical_path,
+        file_len: metadata.len(),
+        modified_unix_nanos,
+    })
+}
+
+fn model_checksum_cache() -> &'static Mutex<HashMap<ModelChecksumCacheKey, String>> {
+    static CACHE: OnceLock<Mutex<HashMap<ModelChecksumCacheKey, String>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn sha256_file_hex_uncached(path: &Path) -> Result<String, CliError> {
     let mut file = File::open(path).map_err(|err| {
         CliError::new(format!(
             "failed to open model for checksum {}: {err}",
@@ -2707,6 +2734,23 @@ fn sha256_file_hex(path: &Path) -> Result<String, CliError> {
         hasher.update(&buffer[..read]);
     }
     Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn sha256_file_hex(path: &Path) -> Result<String, CliError> {
+    if let Some(cache_key) = checksum_cache_key(path) {
+        if let Ok(cache) = model_checksum_cache().lock() {
+            if let Some(cached) = cache.get(&cache_key) {
+                return Ok(cached.clone());
+            }
+        }
+        let digest = sha256_file_hex_uncached(path)?;
+        if let Ok(mut cache) = model_checksum_cache().lock() {
+            cache.insert(cache_key, digest.clone());
+        }
+        return Ok(digest);
+    }
+
+    sha256_file_hex_uncached(path)
 }
 
 fn prepare_runtime_input_wav(config: &TranscribeConfig) -> Result<(), CliError> {
@@ -4593,23 +4637,23 @@ mod tests {
         RuntimeExecutionBranch, RuntimeJsonlStream, RuntimeOutputSink, TempAudioPolicy,
         TerminalRenderActionKind, TerminalRenderMode, TranscribeConfig, TranscriptEvent,
         VadBoundary, build_live_chunked_events_with_queue, build_live_close_summary_lines,
-        build_startup_banner_lines, remediation_hints_csv, top_remediation_hints,
         build_reconciliation_events, build_reconciliation_matrix, build_rolling_chunk_windows,
-        build_targeted_reconciliation_events, build_terminal_render_actions,
-        build_transcript_events, build_trust_notices, bundled_backend_program_from_exe,
-        chunk_queue_backpressure_is_severe, collect_live_capture_continuity_events,
-        detect_per_channel_vad_boundaries, detect_vad_boundaries,
-        emit_latest_lifecycle_transition_jsonl, input_wav_semantics,
+        build_startup_banner_lines, build_targeted_reconciliation_events,
+        build_terminal_render_actions, build_transcript_events, build_trust_notices,
+        bundled_backend_program_from_exe, chunk_queue_backpressure_is_severe,
+        collect_live_capture_continuity_events, detect_per_channel_vad_boundaries,
+        detect_vad_boundaries, emit_latest_lifecycle_transition_jsonl, input_wav_semantics,
         live_capture_materialization_paths, live_capture_output_path,
         live_capture_telemetry_path_candidates, live_stream_chunk_queue_telemetry,
         live_stream_vad_thresholds_per_mille, live_terminal_render_actions, materialize_out_wav,
         merge_channel_vad_boundaries, merge_transcript_events, model_checksum_info,
         parse_args_from, parse_replay_transcript_event, parse_trust_notice, reconstruct_transcript,
-        reconstruct_transcript_per_channel, replay_timeline, resolve_backend_program,
-        resolve_model_path, run_cleanup_queue_with, run_live_chunk_queue,
+        reconstruct_transcript_per_channel, remediation_hints_csv, replay_timeline,
+        resolve_backend_program, resolve_model_path, run_cleanup_queue_with, run_live_chunk_queue,
         run_streaming_capture_session, runtime_mode_compatibility_matrix,
-        select_runtime_execution_branch, transcript_events_from_runtime_output_events,
-        write_preflight_manifest, write_runtime_jsonl, write_runtime_manifest,
+        select_runtime_execution_branch, top_remediation_hints,
+        transcript_events_from_runtime_output_events, write_preflight_manifest,
+        write_runtime_jsonl, write_runtime_manifest,
     };
     use hound::{SampleFormat, WavSpec, WavWriter};
     use recordit::live_stream_runtime::{
@@ -7714,7 +7758,9 @@ mod tests {
             Some("--live-chunked")
         );
         assert_eq!(
-            config_obj.get("runtime_mode_status").and_then(Value::as_str),
+            config_obj
+                .get("runtime_mode_status")
+                .and_then(Value::as_str),
             Some("implemented")
         );
 
