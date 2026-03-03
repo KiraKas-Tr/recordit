@@ -106,7 +106,7 @@ build-release:
 	cargo build --release --bin $(BIN_NAME) --bin $(TRANSCRIBE_BIN)
 
 probe: build
-	DYLD_LIBRARY_PATH=/usr/lib/swift cargo run -- $(CAPTURE_SECS)
+	DYLD_LIBRARY_PATH=/usr/lib/swift cargo run --bin sck_probe -- $(CAPTURE_SECS)
 
 capture: build
 	DYLD_LIBRARY_PATH=/usr/lib/swift cargo run --bin $(BIN_NAME) -- $(CAPTURE_SECS) $(OUT) $(SAMPLE_RATE) $(CAPTURE_MISMATCH_POLICY) $(CAPTURE_CALLBACK_MODE)

@@ -37,6 +37,16 @@ Sequoia Capture is a macOS 15+ Rust project that records:
 ### Operator Quickstart (canonical)
 Use the short happy path in [docs/operator-quickstart.md](docs/operator-quickstart.md).
 
+New machine (one-time permission bootstrap on macOS):
+1. Run a short probe to trigger TCC prompts:
+```bash
+make probe CAPTURE_SECS=3
+```
+2. Grant permissions when prompted:
+   - Screen Recording (or Screen & System Audio Recording on newer macOS UI)
+   - Microphone
+3. If macOS does not auto-prompt, open System Settings and enable access for the terminal app you use (`Terminal`, `iTerm`, `Warp`, etc.), then re-run the probe command.
+
 Fast path:
 ```bash
 make setup-whispercpp-model
@@ -108,6 +118,12 @@ Migration note for selector naming compatibility:
 - [Legacy `--live-chunked` migration note](docs/live-chunked-migration.md)
 
 Quick first-run path for true live mode:
+
+New machine permission bootstrap (one-time):
+```bash
+make probe CAPTURE_SECS=3
+```
+Grant Screen Recording + Microphone access to your terminal when prompted, then continue.
 
 ```bash
 make setup-whispercpp-model
@@ -527,3 +543,146 @@ On Sequoia, direct screen/audio access may also show the private-window-picker b
 - The signed app exits automatically after `CAPTURE_SECS`; this is expected CLI behavior.
 - At least one display must be available for the ScreenCaptureKit content filter.
 # recordit
+
+## Deep Dive: What We Built and Why
+
+### Why This Project Exists
+`recordit` is built to solve a specific reliability problem in real-time transcription workflows on macOS:
+- capture system + microphone audio in one deterministic session
+- generate readable transcript output while the session is running
+- always emit machine-consumable artifacts that automation can trust
+- preserve degradation signals explicitly instead of silently hiding them
+
+The project is useful when humans and automation both need the same session output:
+- humans need concise terminal feedback and readable lines
+- automation needs stable schemas, stable event types, and stable exit semantics
+
+### What We Built
+At a system level, `recordit` is four cooperating layers:
+
+1. Operator shell (`recordit` CLI)
+- canonical command grammar for `run`, `preflight`, `doctor`, `replay`, and `inspect-contract`
+- mode mapping and guardrails before runtime starts
+
+2. Capture substrate (`live_capture`)
+- ScreenCaptureKit callback ingestion for system audio + microphone
+- non-blocking callback path with bounded lock-free transport
+- deterministic stereo output contract (`L=mic`, `R=system`)
+
+3. Runtime coordinator (`live_stream_runtime` + `live_asr_pool`)
+- lifecycle control (`warmup`, `active`, `draining`, `shutdown`)
+- bounded queueing and priority-aware scheduling for ASR work
+- transcript/event assembly with deterministic ordering
+
+4. Contract/artifact boundary
+- append-only runtime JSONL event stream
+- deterministic runtime/preflight manifests
+- machine-readable compatibility contracts in `contracts/*.json`
+
+### End-to-End Runtime Flow
+
+1. Parse and validate command intent
+- `recordit` enforces operator-facing mode rules before dispatching runtime work.
+
+2. Resolve runtime identity
+- runtime mode tuple is explicit in output (`runtime_mode`, `runtime_mode_taxonomy`, `runtime_mode_selector`, `runtime_mode_status`).
+
+3. Start capture and scheduler
+- callback thread ingests and queues audio chunks without blocking.
+- worker/runtime threads perform VAD-driven chunking and ASR submission.
+
+4. Emit progressive evidence
+- JSONL is written incrementally with transcript events and control events (`lifecycle_phase`, `chunk_queue`, `trust_notice`, etc.).
+
+5. Reconcile and close
+- runtime drains outstanding work, writes final artifacts, emits session summary, and classifies session as nominal/degraded/failed via manifest fields and exit semantics.
+
+### Core Algorithms and Scheduling Policies
+
+#### 1) PTS-based alignment and deterministic interleave
+- mic and system streams are anchored to a shared timeline using presentation timestamps (PTS).
+- output frame placement is deterministic relative to timeline origin.
+- channel mapping is fixed (`L=mic`, `R=system`) to keep downstream replay and analysis stable.
+
+#### 2) Streaming segmentation with bounded windows
+- live modes use chunk window/stride controls to generate rolling ASR work while recording continues.
+- VAD boundaries drive segment lifecycle and finalization timing.
+- deterministic replay surfaces are preserved by stable ordering metadata and event emission rules.
+
+#### 3) Priority-aware bounded queue under pressure
+- ASR queue classes are explicit: `final`, `reconcile`, `partial`.
+- scheduling preference is high-signal work first (`final` before background classes).
+- under pressure, eviction/drop behavior is intentional and deterministic rather than unbounded growth.
+- pressure/degradation is surfaced in queue + trust telemetry instead of hidden.
+
+#### 4) Reconciliation and cleanup as additive lanes
+- reconciliation can emit `reconciled_final` when backlog/ordering recovery is required.
+- readability cleanup (`llm_final`) is policy-bounded and lineage-linked to original `final` segments.
+- cleanup is isolated from core runtime correctness; core transcript completion does not depend on cleanup success.
+
+### Design Principles
+
+#### Contract-first external behavior
+Public surfaces are treated as compatibility boundaries:
+- runtime mode matrix: `contracts/runtime-mode-matrix.v1.json`
+- exit-code classes: `contracts/recordit-exit-code-contract.v1.json`
+- JSONL event schema: `contracts/runtime-jsonl.schema.v1.json`
+- session/preflight manifest schema: `contracts/session-manifest.schema.v1.json`
+
+#### Determinism over convenience
+- stable field vocabularies and deterministic summary ordering
+- explicit mode labels and selectors in artifacts
+- replayable JSONL + manifest pair as source-of-truth evidence
+
+#### Bounded real-time behavior
+- non-blocking callbacks
+- bounded queues with explicit eviction/drop semantics
+- explicit lifecycle phases and readiness transitions
+
+#### Degradation is observable, not implicit
+- degraded success is intentionally represented as `exit_code=0` plus trust/degradation signals
+- failure remains explicit (`exit_code=2`) for usage/config/runtime/preflight/replay failures
+
+### How to Read Session Health Correctly
+
+`recordit` intentionally separates "process exit" from "session quality":
+
+- `exit_code=0` can mean either:
+  - nominal success, or
+  - degraded success (artifacts produced, but trust/degradation review required)
+- `exit_code=2` means execution failure or invalid invocation path
+
+For automation, use both layers:
+1. exit code class from `contracts/recordit-exit-code-contract.v1.json`
+2. manifest trust/degradation fields (`trust.*`, `degradation_events`, `session_summary.session_status`)
+
+### Why This Is Useful in Practice
+
+- Reliable CI/gate inputs: machine-readable outputs stay stable across runs.
+- Better operator ergonomics: concise terminal path with deterministic closeout summaries.
+- Better postmortems: runtime JSONL + manifest preserve enough context to debug pressure/recovery behavior.
+- Safer rollout evolution: compatibility contracts make change impact explicit.
+
+### Implementation Anchors (Where Behavior Lives)
+
+- Operator shell and command mapping: `src/recordit_cli.rs`
+- Runtime compatibility shell: `src/bin/transcribe_live/app.rs`
+- Shared capture runtime: `src/live_capture.rs`
+- Live-stream coordinator and scheduler: `src/live_stream_runtime.rs`
+- Bounded ASR pool and queue policy: `src/live_asr_pool.rs`
+- Executable behavior model: `docs/state-machine.md`
+- Pipeline architecture narrative: `docs/architecture.md`
+
+### Use Cases
+
+1. Real-time meeting/session transcription with explicit confidence/degradation telemetry
+2. Regression/gate validation using deterministic artifacts and replay
+3. Packaged app smoke validation with the same runtime semantics as debug mode
+4. Automation pipelines that need strict schemas and stable interpretation rules
+
+### Non-Goals (Current Scope Boundary)
+
+- Not a general-purpose DAW/audio editor.
+- Not an unconstrained low-latency stream processor with unbounded buffering.
+- Not a "best effort but opaque" transcription tool; this project favors explicit contracts and telemetry.
+- Not tied to one ASR backend implementation strategy; backend selection is modular and policy-driven.
