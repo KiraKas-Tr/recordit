@@ -672,6 +672,46 @@ fn paint_chunks_timeline(
     (timeline, resample_stats)
 }
 
+#[derive(Debug, Default)]
+struct ProgressiveWavSnapshotState {
+    output_rate_hz: u32,
+    base_pts: f64,
+    mic_timeline: Vec<f32>,
+    sys_timeline: Vec<f32>,
+    mic_applied_chunks: usize,
+    sys_applied_chunks: usize,
+}
+
+fn apply_chunks_to_timeline(
+    timeline: &mut Vec<f32>,
+    chunks: &[TimedChunk],
+    start_chunk_idx: usize,
+    base_pts: f64,
+    sample_rate_hz: u32,
+) {
+    let rate = f64::from(sample_rate_hz);
+    for chunk in chunks.iter().skip(start_chunk_idx) {
+        let maybe_resampled = if chunk.sample_rate_hz == sample_rate_hz {
+            None
+        } else {
+            Some(resample_linear_mono(
+                &chunk.mono_samples,
+                chunk.sample_rate_hz,
+                sample_rate_hz,
+            ))
+        };
+
+        let chunk_samples = maybe_resampled.as_deref().unwrap_or(&chunk.mono_samples);
+        let start = ((chunk.pts_seconds - base_pts) * rate).round();
+        let start_index = if start <= 0.0 { 0usize } else { start as usize };
+        let end_index = start_index.saturating_add(chunk_samples.len());
+        if timeline.len() < end_index {
+            timeline.resize(end_index, 0.0);
+        }
+        timeline[start_index..end_index].copy_from_slice(chunk_samples);
+    }
+}
+
 fn write_interleaved_stereo_wav(
     path: &Path,
     sample_rate_hz: u32,
@@ -826,6 +866,7 @@ fn emit_runtime_event_deltas(
     Ok(())
 }
 
+#[cfg(test)]
 fn materialize_progressive_wav_snapshot(
     output: &Path,
     mic_chunks: &[TimedChunk],
@@ -846,6 +887,70 @@ fn materialize_progressive_wav_snapshot(
     let (sys, _) = paint_chunks_timeline(sys_chunks, base_pts, output_rate_hz);
     write_interleaved_stereo_wav(output, output_rate_hz, &mic, &sys)?;
 
+    Ok(Some(output_rate_hz))
+}
+
+fn materialize_progressive_wav_snapshot_incremental(
+    output: &Path,
+    mic_chunks: &[TimedChunk],
+    sys_chunks: &[TimedChunk],
+    target_rate_hz: u32,
+    mismatch_policy: SampleRateMismatchPolicy,
+    state: &mut Option<ProgressiveWavSnapshotState>,
+) -> Result<Option<u32>> {
+    if mic_chunks.is_empty() || sys_chunks.is_empty() {
+        return Ok(None);
+    }
+
+    let mic_rate = mic_chunks[0].sample_rate_hz;
+    let sys_rate = sys_chunks[0].sample_rate_hz;
+    let output_rate_hz =
+        resolve_output_sample_rate(target_rate_hz, mic_rate, sys_rate, mismatch_policy)?;
+    let base_pts = mic_chunks[0].pts_seconds.min(sys_chunks[0].pts_seconds);
+
+    let should_reset = match state.as_ref() {
+        Some(cached) => {
+            cached.output_rate_hz != output_rate_hz
+                || cached.base_pts.to_bits() != base_pts.to_bits()
+                || cached.mic_applied_chunks > mic_chunks.len()
+                || cached.sys_applied_chunks > sys_chunks.len()
+        }
+        None => true,
+    };
+    if should_reset {
+        *state = Some(ProgressiveWavSnapshotState {
+            output_rate_hz,
+            base_pts,
+            ..ProgressiveWavSnapshotState::default()
+        });
+    }
+
+    let snapshot = state
+        .as_mut()
+        .expect("progressive snapshot state initialized");
+    apply_chunks_to_timeline(
+        &mut snapshot.mic_timeline,
+        mic_chunks,
+        snapshot.mic_applied_chunks,
+        base_pts,
+        output_rate_hz,
+    );
+    apply_chunks_to_timeline(
+        &mut snapshot.sys_timeline,
+        sys_chunks,
+        snapshot.sys_applied_chunks,
+        base_pts,
+        output_rate_hz,
+    );
+    snapshot.mic_applied_chunks = mic_chunks.len();
+    snapshot.sys_applied_chunks = sys_chunks.len();
+
+    write_interleaved_stereo_wav(
+        output,
+        output_rate_hz,
+        &snapshot.mic_timeline,
+        &snapshot.sys_timeline,
+    )?;
     Ok(Some(output_rate_hz))
 }
 
@@ -1544,6 +1649,7 @@ fn run_fake_capture_session(
     let mut last_materialize_at = Instant::now();
     let mut materialized_chunk_total = 0usize;
     let mut progressive_materializations = 0usize;
+    let mut progressive_snapshot_state = None;
 
     if restart_count > 0 {
         sink.on_event(CaptureEvent {
@@ -1607,12 +1713,13 @@ fn run_fake_capture_session(
                 cadence_elapsed,
             )
         {
-            if materialize_progressive_wav_snapshot(
+            if materialize_progressive_wav_snapshot_incremental(
                 &config.output,
                 &mic_chunks,
                 &sys_chunks,
                 config.target_rate_hz,
                 config.mismatch_policy,
+                &mut progressive_snapshot_state,
             )?
             .is_some()
             {
@@ -1626,12 +1733,13 @@ fn run_fake_capture_session(
     }
 
     if progressive_materializations == 0 && !mic_chunks.is_empty() && !sys_chunks.is_empty() {
-        if materialize_progressive_wav_snapshot(
+        if materialize_progressive_wav_snapshot_incremental(
             &config.output,
             &mic_chunks,
             &sys_chunks,
             config.target_rate_hz,
             config.mismatch_policy,
+            &mut progressive_snapshot_state,
         )?
         .is_some()
         {
@@ -1730,7 +1838,10 @@ pub fn run_streaming_capture_session(
     }
 
     if duration_secs == 0 {
-        println!("Starting Sequoia capture until interrupted -> {}", output.display());
+        println!(
+            "Starting Sequoia capture until interrupted -> {}",
+            output.display()
+        );
     } else {
         println!(
             "Starting Sequoia capture for {}s -> {}",
@@ -1807,6 +1918,7 @@ pub fn run_streaming_capture_session(
     let mut last_materialize_at = Instant::now();
     let mut materialized_chunk_total = 0usize;
     let mut progressive_materializations = 0usize;
+    let mut progressive_snapshot_state = None;
     let mut runtime_event_cursor = RuntimeEventCursor::default();
 
     while deadline.is_none_or(|end| Instant::now() < end) {
@@ -1846,12 +1958,13 @@ pub fn run_streaming_capture_session(
                             last_materialize_at.elapsed(),
                         )
                     {
-                        if materialize_progressive_wav_snapshot(
+                        if materialize_progressive_wav_snapshot_incremental(
                             &output,
                             &mic_chunks,
                             &sys_chunks,
                             target_rate_hz,
                             mismatch_policy,
+                            &mut progressive_snapshot_state,
                         )?
                         .is_some()
                         {
@@ -2048,10 +2161,10 @@ mod tests {
         RuntimeEventCursor, SampleRateMismatchPolicy, TimedChunk, build_capture_run_summary,
         build_degradation_events, callback_recovery_breakdown, can_restart_capture,
         config_from_cli_args, emit_runtime_event_deltas, enforce_callback_contract,
-        materialize_progressive_wav_snapshot, maybe_sleep_for_replay, paint_chunks_timeline,
-        recovery_action_for_callback_violation, recovery_action_for_interruption,
-        resample_linear_mono, resolve_output_sample_rate, run_capture_session,
-        run_fake_capture_session, run_streaming_capture_session,
+        materialize_progressive_wav_snapshot, materialize_progressive_wav_snapshot_incremental,
+        maybe_sleep_for_replay, paint_chunks_timeline, recovery_action_for_callback_violation,
+        recovery_action_for_interruption, resample_linear_mono, resolve_output_sample_rate,
+        run_capture_session, run_fake_capture_session, run_streaming_capture_session,
         should_materialize_progressive_snapshot, telemetry_path_for_output, write_run_telemetry,
     };
     use crate::capture_api::{
@@ -2591,6 +2704,86 @@ mod tests {
         assert_eq!(reader.duration(), 3);
 
         let _ = fs::remove_file(output);
+    }
+
+    #[test]
+    fn incremental_progressive_snapshot_matches_full_repaint_output() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let incremental_output = std::env::temp_dir().join(format!(
+            "recordit-progressive-incremental-{}-{}.wav",
+            std::process::id(),
+            stamp
+        ));
+        let full_output = std::env::temp_dir().join(format!(
+            "recordit-progressive-full-{}-{}.wav",
+            std::process::id(),
+            stamp
+        ));
+        let mic_chunks = vec![
+            TimedChunk {
+                kind: SCStreamOutputType::Microphone,
+                pts_seconds: 0.0,
+                sample_rate_hz: 4,
+                mono_samples: vec![0.1, 0.2, 0.3],
+            },
+            TimedChunk {
+                kind: SCStreamOutputType::Microphone,
+                pts_seconds: 0.75,
+                sample_rate_hz: 4,
+                mono_samples: vec![0.7, 0.8],
+            },
+        ];
+        let sys_chunks = vec![
+            TimedChunk {
+                kind: SCStreamOutputType::Audio,
+                pts_seconds: 0.0,
+                sample_rate_hz: 4,
+                mono_samples: vec![0.4, 0.5, 0.6],
+            },
+            TimedChunk {
+                kind: SCStreamOutputType::Audio,
+                pts_seconds: 0.75,
+                sample_rate_hz: 4,
+                mono_samples: vec![0.9, 1.0],
+            },
+        ];
+
+        let mut state = None;
+        for end_idx in 1..=mic_chunks.len() {
+            let written = materialize_progressive_wav_snapshot_incremental(
+                &incremental_output,
+                &mic_chunks[..end_idx],
+                &sys_chunks[..end_idx],
+                4,
+                SampleRateMismatchPolicy::AdaptStreamRate,
+                &mut state,
+            )
+            .expect("incremental progressive snapshot should succeed");
+            assert_eq!(written, Some(4));
+        }
+
+        let written = materialize_progressive_wav_snapshot(
+            &full_output,
+            &mic_chunks,
+            &sys_chunks,
+            4,
+            SampleRateMismatchPolicy::AdaptStreamRate,
+        )
+        .expect("full progressive snapshot should succeed");
+        assert_eq!(written, Some(4));
+
+        let incremental_bytes = fs::read(&incremental_output).expect("incremental output readable");
+        let full_bytes = fs::read(&full_output).expect("full output readable");
+        assert_eq!(
+            incremental_bytes, full_bytes,
+            "incremental progressive materialization should match full repaint output"
+        );
+
+        let _ = fs::remove_file(incremental_output);
+        let _ = fs::remove_file(full_output);
     }
 
     #[test]
