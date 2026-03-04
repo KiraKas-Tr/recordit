@@ -112,6 +112,10 @@ fn transcribe_live_entrypoint_keeps_delegation_seams() {
     for required in [
         "mod asr_backend;",
         "mod cli_parse;",
+        "mod cleanup;",
+        "mod preflight;",
+        "mod reporting;",
+        "mod reconciliation;",
         "mod runtime_representative;",
         "mod runtime_live_stream;",
         "mod artifacts;",
@@ -128,6 +132,12 @@ fn transcribe_live_entrypoint_keeps_delegation_seams() {
         "runtime_representative::run_representative_offline_pipeline(config)",
         "runtime_representative::run_representative_chunked_pipeline(config)",
         "runtime_live_stream::run_live_stream_pipeline(config)",
+        "cleanup::run_cleanup_queue(config, events)",
+        "cleanup::run_cleanup_queue_with(config, events, invoke_cleanup)",
+        "cleanup::cleanup_content_from_response(stdout)",
+        "reconciliation::build_targeted_reconciliation_events(",
+        "reconciliation::build_reconciliation_matrix(vad_boundaries, degradation_events)",
+        "reporting::print_live_report(config, report, concise_only)",
     ] {
         assert!(
             app.contains(delegation),
@@ -140,6 +150,9 @@ fn transcribe_live_entrypoint_keeps_delegation_seams() {
         "struct AsrRequest<'a>",
         "fn resolve_backend_program(backend: AsrBackend, model_path: &Path) -> String",
         "fn run_standard_pipeline(config: &TranscribeConfig) -> Result<LiveRunReport, CliError>",
+        "fn check_model_path(config: &TranscribeConfig) -> PreflightCheck",
+        "fn cleanup_worker_loop<",
+        "fn runtime_failure_breadcrumbs(",
     ] {
         assert!(
             !app.contains(extracted_symbol),
@@ -210,6 +223,57 @@ fn extracted_module_files_expose_expected_boundaries() {
         artifacts.contains("pub(super) fn write_runtime_manifest"),
         "artifacts boundary missing write_runtime_manifest"
     );
+
+    let preflight = read_text(&root.join("src/bin/transcribe_live/preflight.rs"));
+    for needle in [
+        "pub(super) fn run_preflight",
+        "pub(super) fn run_model_doctor",
+        "pub(super) fn print_preflight_report",
+        "pub(super) fn print_model_doctor_report",
+    ] {
+        assert!(
+            preflight.contains(needle),
+            "preflight boundary missing expected symbol: {needle}"
+        );
+    }
+
+    let cleanup = read_text(&root.join("src/bin/transcribe_live/cleanup.rs"));
+    for needle in [
+        "pub(super) fn run_cleanup_queue",
+        "pub(super) fn run_cleanup_queue_with",
+        "pub(super) fn cleanup_content_from_response",
+    ] {
+        assert!(
+            cleanup.contains(needle),
+            "cleanup boundary missing expected symbol: {needle}"
+        );
+    }
+
+    let reporting = read_text(&root.join("src/bin/transcribe_live/reporting.rs"));
+    for needle in [
+        "pub(super) fn runtime_failure_breadcrumbs",
+        "pub(super) fn top_remediation_hints",
+        "pub(super) fn remediation_hints_csv",
+        "pub(super) fn build_live_close_summary_lines",
+        "pub(super) fn print_live_report",
+    ] {
+        assert!(
+            reporting.contains(needle),
+            "reporting boundary missing expected symbol: {needle}"
+        );
+    }
+
+    let reconciliation = read_text(&root.join("src/bin/transcribe_live/reconciliation.rs"));
+    for needle in [
+        "pub(super) fn build_reconciliation_events",
+        "pub(super) fn build_targeted_reconciliation_events",
+        "pub(super) fn build_reconciliation_matrix",
+    ] {
+        assert!(
+            reconciliation.contains(needle),
+            "reconciliation boundary missing expected symbol: {needle}"
+        );
+    }
 }
 
 #[test]

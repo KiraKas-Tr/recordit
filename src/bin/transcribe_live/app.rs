@@ -1,21 +1,21 @@
 use hound::{SampleFormat, WavReader};
 use recordit::capture_api::{
-    CaptureChunk, CaptureEvent, CaptureSink, capture_telemetry_path_for_output,
+    capture_telemetry_path_for_output, CaptureChunk, CaptureEvent, CaptureSink,
 };
 use recordit::live_asr_pool::{
     LiveAsrExecutor, LiveAsrJob, LiveAsrJobClass, LiveAsrJobResult, LiveAsrPoolConfig,
-    LiveAsrPoolTelemetry, LiveAsrService, TempAudioPolicy,
+    LiveAsrPoolTelemetry, LiveAsrRequest, LiveAsrService, TempAudioPolicy,
 };
 use recordit::live_capture::{
+    run_capture_session, run_streaming_capture_session,
     CallbackContractMode as LiveCaptureCallbackMode, LiveCaptureConfig,
-    SampleRateMismatchPolicy as LiveCaptureSampleRateMismatchPolicy, run_capture_session,
-    run_streaming_capture_session,
+    SampleRateMismatchPolicy as LiveCaptureSampleRateMismatchPolicy,
 };
 use recordit::live_stream_runtime::{
-    LiveAsrJobClass as RuntimeAsrJobClass, LiveAsrJobSpec as RuntimeAsrJobSpec, LiveAsrResult,
-    LiveRuntimePhase, LiveRuntimeSummary, LiveStreamCoordinator, RuntimeFinalizer,
-    RuntimeOutputEvent, RuntimeOutputSink, StreamingSchedulerConfig, StreamingVadConfig,
-    StreamingVadScheduler,
+    BackpressureMode, BackpressureTransitionReason, LiveAsrJobClass as RuntimeAsrJobClass,
+    LiveAsrJobSpec as RuntimeAsrJobSpec, LiveAsrResult, LiveRuntimePhase, LiveRuntimeSummary,
+    LiveStreamCoordinator, RuntimeFinalizer, RuntimeOutputEvent, RuntimeOutputSink,
+    StreamingSchedulerConfig, StreamingVadConfig, StreamingVadScheduler,
 };
 use screencapturekit::prelude::*;
 use sha2::{Digest, Sha256};
@@ -26,7 +26,7 @@ use std::fs::{self, File};
 use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, TrySendError, sync_channel};
+use std::sync::mpsc::{self, sync_channel, Receiver, RecvTimeoutError, TrySendError};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, UNIX_EPOCH};
@@ -34,11 +34,20 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 mod artifacts;
 mod asr_backend;
 use asr_backend::*;
+mod cleanup;
 mod cli_parse;
+mod contracts_models;
+mod preflight;
+mod reconciliation;
+mod reporting;
 mod runtime_events;
 mod runtime_live_stream;
+mod runtime_manifest_models;
 mod runtime_representative;
 mod transcript_flow;
+use preflight::{
+    print_model_doctor_report, print_preflight_report, run_model_doctor, run_preflight,
+};
 
 const PARTIAL_LATENCY_SLO_MS: f64 = 1_500.0;
 const FINAL_LATENCY_SLO_MS: f64 = 2_500.0;
@@ -122,6 +131,7 @@ Options:
   --chunk-queue-cap <n>           Bounded near-live ASR work queue capacity (default: 4; requires --live-chunked)
   --live-asr-workers <n>          Dedicated live ASR worker pool concurrency (default: 2; live modes only)
   --keep-temp-audio               Retain live temp audio shards/probe WAVs for debug inspection
+  --disable-adaptive-backpressure Kill-switch: pin backpressure behavior to normal mode (live modes only)
   --transcribe-channels <mode>    Channel mode: separate | mixed | mixed-fallback (default: separate)
   --speaker-labels <mic,system>   Comma-separated labels for the two channels (default: mic,system)
   --benchmark-runs <n>            Number of representative latency benchmark runs (default: 3)
@@ -386,6 +396,7 @@ struct TranscribeConfig {
     chunk_queue_cap: usize,
     live_asr_workers: usize,
     keep_temp_audio: bool,
+    adaptive_backpressure_enabled: bool,
     channel_mode: ChannelMode,
     speaker_labels: SpeakerLabels,
     benchmark_runs: usize,
@@ -425,6 +436,7 @@ impl Default for TranscribeConfig {
             chunk_queue_cap: DEFAULT_CHUNK_QUEUE_CAP,
             live_asr_workers: DEFAULT_LIVE_ASR_WORKERS,
             keep_temp_audio: false,
+            adaptive_backpressure_enabled: true,
             channel_mode: ChannelMode::Separate,
             speaker_labels: SpeakerLabels {
                 mic: "mic".to_owned(),
@@ -610,6 +622,11 @@ impl TranscribeConfig {
                 "`--live-stream` cannot be combined with `--replay-jsonl`; replay reads a completed artifact instead of configuring a live runtime",
             ));
         }
+        if !self.live_chunked && !self.live_stream && !self.adaptive_backpressure_enabled {
+            return Err(CliError::new(
+                "`--disable-adaptive-backpressure` requires `--live-chunked` or `--live-stream`",
+            ));
+        }
 
         Ok(())
     }
@@ -657,6 +674,15 @@ impl TranscribeConfig {
                 self.live_asr_workers, inactive_suffix
             ),
             format!("  keep_temp_audio: {}", self.keep_temp_audio),
+            format!(
+                "  adaptive_backpressure: {}{}",
+                if self.adaptive_backpressure_enabled {
+                    "enabled"
+                } else {
+                    "disabled (kill-switch active)"
+                },
+                inactive_suffix
+            ),
         ]
     }
 
@@ -950,9 +976,73 @@ struct LiveRunReport {
     final_buffering: FinalBufferingTelemetry,
     chunk_queue: LiveChunkQueueTelemetry,
     cleanup_queue: CleanupQueueTelemetry,
+    hot_path_diagnostics: HotPathDiagnostics,
     benchmark: BenchmarkSummary,
     benchmark_summary_csv: PathBuf,
     benchmark_runs_csv: PathBuf,
+}
+
+#[derive(Debug, Clone, Default)]
+struct HotPathDiagnostics {
+    transport: TransportInputDiagnostics,
+    scratch: ScratchLifecycleDiagnostics,
+    backpressure: BackpressureDiagnostics,
+    pump: PumpCadenceDiagnostics,
+}
+
+#[derive(Debug, Clone, Default)]
+struct TransportInputDiagnostics {
+    path_requests: usize,
+    pcm_window_requests: usize,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ScratchLifecycleDiagnostics {
+    worker_scratch_paths_upper_bound: usize,
+    write_attempts_estimate: usize,
+    reuse_overwrites_estimate: usize,
+    retained_for_review_hint: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ChannelPressureSnapshot {
+    channel: String,
+    partial_events: usize,
+    stable_events: usize,
+    processed_events: usize,
+    pending_estimate: usize,
+    dropped_oldest_estimate: usize,
+}
+
+#[derive(Debug, Clone)]
+struct BackpressureDiagnostics {
+    mode: BackpressureMode,
+    transition_count: usize,
+    last_transition_reason: Option<BackpressureTransitionReason>,
+    pending_jobs: u64,
+    pending_final_jobs: u64,
+    channel_snapshots: Vec<ChannelPressureSnapshot>,
+}
+
+impl Default for BackpressureDiagnostics {
+    fn default() -> Self {
+        Self {
+            mode: BackpressureMode::Normal,
+            transition_count: 0,
+            last_transition_reason: None,
+            pending_jobs: 0,
+            pending_final_jobs: 0,
+            channel_snapshots: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct PumpCadenceDiagnostics {
+    chunk_decisions: u64,
+    forced_decisions: u64,
+    forced_capture_event_triggers: u64,
+    forced_shutdown_triggers: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -1797,41 +1887,7 @@ fn build_reconciliation_events(
     channel_transcripts: &[ChannelTranscriptSummary],
     vad_boundaries: &[VadBoundary],
 ) -> Vec<TranscriptEvent> {
-    let ordered_transcripts = ordered_channel_transcripts(channel_transcripts);
-    let ordered_boundaries = ordered_vad_boundaries_for_segments(vad_boundaries);
-    let items = ordered_transcripts
-        .iter()
-        .flat_map(|transcript| {
-            build_transcript_events(
-                &transcript.text,
-                &ordered_boundaries,
-                &transcript.label,
-                transcript.role,
-                false,
-                DEFAULT_CHUNK_WINDOW_MS,
-                DEFAULT_CHUNK_STRIDE_MS,
-            )
-        })
-        .filter_map(|event| {
-            if event.event_type != "final" {
-                return None;
-            }
-            Some(AsrWorkItem {
-                class: AsrWorkClass::Reconcile,
-                tick_index: 0,
-                channel: event.channel,
-                segment_id: format!("{}-reconciled", event.segment_id),
-                start_ms: event.start_ms,
-                end_ms: event.end_ms,
-                text: event.text,
-                source_final_segment_id: Some(event.segment_id),
-            })
-        })
-        .collect::<Vec<_>>();
-    items
-        .into_iter()
-        .flat_map(emit_asr_work_item_events)
-        .collect()
+    reconciliation::build_reconciliation_events(channel_transcripts, vad_boundaries)
 }
 
 fn build_targeted_reconciliation_events(
@@ -1840,146 +1896,19 @@ fn build_targeted_reconciliation_events(
     live_events: &[TranscriptEvent],
     reconciliation: &ReconciliationMatrix,
 ) -> Vec<TranscriptEvent> {
-    let ordered_transcripts = ordered_channel_transcripts(channel_transcripts);
-    let ordered_boundaries = ordered_vad_boundaries_for_segments(vad_boundaries);
-    if ordered_transcripts.is_empty() || ordered_boundaries.is_empty() || !reconciliation.required {
-        return Vec::new();
-    }
-
-    let trigger_codes = reconciliation
-        .triggers
-        .iter()
-        .map(|trigger| trigger.code)
-        .collect::<HashSet<_>>();
-    let live_final_ids = live_events
-        .iter()
-        .filter(|event| event.event_type == "final")
-        .map(|event| event.segment_id.clone())
-        .collect::<HashSet<_>>();
-
-    let capture_integrity_triggered = trigger_codes.contains("continuity_recovered_with_gaps")
-        || trigger_codes.contains("continuity_unverified")
-        || trigger_codes.contains("capture_transport_degraded")
-        || trigger_codes.contains("capture_callback_contract_degraded");
-    let queue_drop_triggered = trigger_codes.contains("chunk_queue_drop_oldest");
-    let shutdown_flush_triggered = trigger_codes.contains("shutdown_flush_boundary");
-
-    let mut targeted_boundary_indexes = BTreeSet::new();
-    if capture_integrity_triggered {
-        targeted_boundary_indexes.extend(0..ordered_boundaries.len());
-    }
-
-    if shutdown_flush_triggered {
-        for (boundary_idx, boundary) in ordered_boundaries.iter().enumerate() {
-            if boundary.source == "shutdown_flush" {
-                targeted_boundary_indexes.insert(boundary_idx);
-            }
-        }
-    }
-
-    if queue_drop_triggered {
-        for (boundary_idx, boundary) in ordered_boundaries.iter().enumerate() {
-            let missing_final = ordered_transcripts.iter().any(|transcript| {
-                let expected_segment_id = near_live_boundary_segment_id(
-                    transcript.role,
-                    boundary_idx,
-                    boundary.start_ms,
-                    boundary.end_ms,
-                );
-                !live_final_ids.contains(&expected_segment_id)
-            });
-            if missing_final {
-                targeted_boundary_indexes.insert(boundary_idx);
-            }
-        }
-    }
-
-    if targeted_boundary_indexes.is_empty() {
-        targeted_boundary_indexes.extend(0..ordered_boundaries.len());
-    }
-
-    let boundary_count = ordered_boundaries.len();
-    let mut items = Vec::new();
-    for boundary_idx in targeted_boundary_indexes {
-        let boundary = &ordered_boundaries[boundary_idx];
-        for transcript in &ordered_transcripts {
-            let source_final_segment_id = near_live_boundary_segment_id(
-                transcript.role,
-                boundary_idx,
-                boundary.start_ms,
-                boundary.end_ms,
-            );
-            let segment_text = chunk_scoped_text(&transcript.text, boundary_idx, boundary_count);
-            if segment_text.trim().is_empty() {
-                continue;
-            }
-            items.push(AsrWorkItem {
-                class: AsrWorkClass::Reconcile,
-                tick_index: 0,
-                channel: transcript.label.clone(),
-                segment_id: format!("{source_final_segment_id}-reconciled"),
-                start_ms: boundary.start_ms,
-                end_ms: boundary.end_ms,
-                text: segment_text,
-                source_final_segment_id: Some(source_final_segment_id),
-            });
-        }
-    }
-
-    items
-        .into_iter()
-        .flat_map(emit_asr_work_item_events)
-        .collect()
+    reconciliation::build_targeted_reconciliation_events(
+        channel_transcripts,
+        vad_boundaries,
+        live_events,
+        reconciliation,
+    )
 }
 
 fn build_reconciliation_matrix(
     vad_boundaries: &[VadBoundary],
     degradation_events: &[ModeDegradationEvent],
 ) -> ReconciliationMatrix {
-    let mut triggers = Vec::new();
-    let mut seen_codes = HashSet::new();
-
-    for degradation in degradation_events {
-        let trigger_code = match degradation.code {
-            LIVE_CHUNK_QUEUE_DROP_OLDEST_CODE => Some("chunk_queue_drop_oldest"),
-            LIVE_CAPTURE_INTERRUPTION_RECOVERED_CODE => Some("continuity_recovered_with_gaps"),
-            LIVE_CAPTURE_CONTINUITY_UNVERIFIED_CODE => Some("continuity_unverified"),
-            LIVE_CAPTURE_TRANSPORT_DEGRADED_CODE => Some("capture_transport_degraded"),
-            LIVE_CAPTURE_CALLBACK_CONTRACT_DEGRADED_CODE => {
-                Some("capture_callback_contract_degraded")
-            }
-            _ => None,
-        };
-        if let Some(code) = trigger_code {
-            if seen_codes.insert(code) {
-                triggers.push(ReconciliationTrigger { code });
-            }
-        }
-    }
-
-    if vad_boundaries
-        .iter()
-        .any(|boundary| boundary.source == "shutdown_flush")
-        && seen_codes.insert("shutdown_flush_boundary")
-    {
-        triggers.push(ReconciliationTrigger {
-            code: "shutdown_flush_boundary",
-        });
-    }
-
-    ReconciliationMatrix {
-        required: !triggers.is_empty(),
-        applied: false,
-        triggers,
-    }
-}
-
-fn reconciliation_trigger_codes_json(triggers: &[ReconciliationTrigger]) -> String {
-    triggers
-        .iter()
-        .map(|trigger| format!("\"{}\"", json_escape(trigger.code)))
-        .collect::<Vec<_>>()
-        .join(",")
+    reconciliation::build_reconciliation_matrix(vad_boundaries, degradation_events)
 }
 
 fn run_live_chunk_queue(
@@ -2295,9 +2224,10 @@ fn build_trust_notices(
 }
 
 fn run_cleanup_queue(config: &TranscribeConfig, events: &[TranscriptEvent]) -> CleanupRunResult {
-    run_cleanup_queue_with(config, events, invoke_cleanup_endpoint)
+    cleanup::run_cleanup_queue(config, events)
 }
 
+#[cfg(test)]
 fn run_cleanup_queue_with<F>(
     config: &TranscribeConfig,
     events: &[TranscriptEvent],
@@ -2306,245 +2236,12 @@ fn run_cleanup_queue_with<F>(
 where
     F: Fn(&CleanupClientConfig, &CleanupRequest) -> CleanupAttemptOutcome + Send + Sync + 'static,
 {
-    if !config.llm_cleanup {
-        return CleanupRunResult {
-            telemetry: CleanupQueueTelemetry::disabled(config),
-            llm_events: Vec::new(),
-        };
-    }
-
-    let mut telemetry = CleanupQueueTelemetry {
-        enabled: true,
-        max_queue: config.llm_max_queue,
-        timeout_ms: config.llm_timeout_ms,
-        retries: config.llm_retries,
-        submitted: 0,
-        enqueued: 0,
-        dropped_queue_full: 0,
-        processed: 0,
-        succeeded: 0,
-        timed_out: 0,
-        failed: 0,
-        retry_attempts: 0,
-        pending: 0,
-        drain_budget_ms: config.llm_timeout_ms,
-        drain_completed: true,
-    };
-    let mut llm_events = Vec::new();
-
-    let Some(endpoint) = config.llm_endpoint.clone() else {
-        return CleanupRunResult {
-            telemetry,
-            llm_events,
-        };
-    };
-    let Some(model) = config.llm_model.clone() else {
-        return CleanupRunResult {
-            telemetry,
-            llm_events,
-        };
-    };
-
-    let requests = cleanup_requests_from_events(events);
-    telemetry.submitted = requests.len();
-    if requests.is_empty() {
-        return CleanupRunResult {
-            telemetry,
-            llm_events,
-        };
-    }
-
-    let client = CleanupClientConfig {
-        endpoint,
-        model,
-        timeout_ms: config.llm_timeout_ms,
-        retries: config.llm_retries,
-    };
-    let (request_tx, request_rx) = sync_channel::<CleanupRequest>(config.llm_max_queue);
-    let (result_tx, result_rx) = mpsc::channel::<CleanupTaskResult>();
-    let invoke_cleanup = Arc::new(invoke_cleanup);
-    let worker_invoke = Arc::clone(&invoke_cleanup);
-    let worker_handle = thread::spawn(move || {
-        cleanup_worker_loop(request_rx, result_tx, client, worker_invoke);
-    });
-
-    for request in requests {
-        match request_tx.try_send(request) {
-            Ok(()) => telemetry.enqueued += 1,
-            Err(TrySendError::Full(_)) => telemetry.dropped_queue_full += 1,
-            Err(TrySendError::Disconnected(_)) => telemetry.failed += 1,
-        }
-    }
-    drop(request_tx);
-
-    let drain_deadline = Instant::now() + Duration::from_millis(config.llm_timeout_ms);
-    while telemetry.processed < telemetry.enqueued {
-        let now = Instant::now();
-        if now >= drain_deadline {
-            break;
-        }
-        let remaining = drain_deadline.saturating_duration_since(now);
-        let wait_for = remaining.min(Duration::from_millis(5));
-        match result_rx.recv_timeout(wait_for) {
-            Ok(result) => {
-                telemetry.processed += 1;
-                telemetry.retry_attempts += result.retry_attempts;
-                match result.status {
-                    CleanupTaskStatus::Succeeded => {
-                        telemetry.succeeded += 1;
-                        if let Some(cleaned_text) = result.cleaned_text {
-                            let source_segment_id = result.request.segment_id.clone();
-                            llm_events.push(TranscriptEvent {
-                                event_type: "llm_final",
-                                channel: result.request.channel.clone(),
-                                segment_id: format!("{source_segment_id}-llm"),
-                                start_ms: result.request.start_ms,
-                                end_ms: result.request.end_ms,
-                                text: cleaned_text,
-                                source_final_segment_id: Some(source_segment_id),
-                            });
-                        }
-                    }
-                    CleanupTaskStatus::TimedOut => telemetry.timed_out += 1,
-                    CleanupTaskStatus::Failed => telemetry.failed += 1,
-                }
-            }
-            Err(RecvTimeoutError::Timeout) => {}
-            Err(RecvTimeoutError::Disconnected) => break,
-        }
-    }
-
-    telemetry.pending = telemetry.enqueued.saturating_sub(telemetry.processed);
-    telemetry.drain_completed = telemetry.pending == 0;
-    if telemetry.drain_completed {
-        let _ = worker_handle.join();
-    }
-    CleanupRunResult {
-        telemetry,
-        llm_events,
-    }
+    cleanup::run_cleanup_queue_with(config, events, invoke_cleanup)
 }
 
-fn cleanup_requests_from_events(events: &[TranscriptEvent]) -> Vec<CleanupRequest> {
-    events
-        .iter()
-        .filter(|event| event.event_type == "final")
-        .map(|event| CleanupRequest {
-            segment_id: event.segment_id.clone(),
-            channel: event.channel.clone(),
-            start_ms: event.start_ms,
-            end_ms: event.end_ms,
-            text: event.text.clone(),
-        })
-        .collect()
-}
-
-fn cleanup_worker_loop<F>(
-    request_rx: Receiver<CleanupRequest>,
-    result_tx: mpsc::Sender<CleanupTaskResult>,
-    client: CleanupClientConfig,
-    invoke_cleanup: Arc<F>,
-) where
-    F: Fn(&CleanupClientConfig, &CleanupRequest) -> CleanupAttemptOutcome + Send + Sync + 'static,
-{
-    while let Ok(request) = request_rx.recv() {
-        let mut status = CleanupTaskStatus::Failed;
-        let mut retry_attempts = 0usize;
-        let mut cleaned_text = None;
-
-        for attempt in 0..=client.retries {
-            let outcome = invoke_cleanup(&client, &request);
-            status = outcome.status;
-            cleaned_text = outcome.cleaned_text;
-            if status == CleanupTaskStatus::Succeeded {
-                break;
-            }
-            if attempt < client.retries {
-                retry_attempts += 1;
-            }
-        }
-
-        if result_tx
-            .send(CleanupTaskResult {
-                request,
-                status,
-                retry_attempts,
-                cleaned_text,
-            })
-            .is_err()
-        {
-            break;
-        }
-    }
-}
-
-fn invoke_cleanup_endpoint(
-    client: &CleanupClientConfig,
-    request: &CleanupRequest,
-) -> CleanupAttemptOutcome {
-    let timeout_secs = format!("{:.3}", (client.timeout_ms as f64 / 1_000.0).max(0.001));
-    let prompt = format!(
-        "Polish this transcript segment for readability without changing meaning. Return only cleaned text.\nsegment_id={}\nchannel={}\ntext={}",
-        request.segment_id, request.channel, request.text
-    );
-    let payload = format!(
-        "{{\"model\":\"{}\",\"messages\":[{{\"role\":\"system\",\"content\":\"{}\"}},{{\"role\":\"user\",\"content\":\"{}\"}}],\"stream\":false}}",
-        json_escape(&client.model),
-        json_escape("You clean transcript text. Do not add content."),
-        json_escape(&prompt)
-    );
-
-    let output = Command::new("curl")
-        .arg("-sS")
-        .arg("--fail-with-body")
-        .arg("--max-time")
-        .arg(&timeout_secs)
-        .arg("-X")
-        .arg("POST")
-        .arg(&client.endpoint)
-        .arg("-H")
-        .arg("Content-Type: application/json")
-        .arg("-d")
-        .arg(&payload)
-        .output();
-
-    match output {
-        Ok(output) if output.status.success() => {
-            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            let cleaned_text = extract_json_string_field(&stdout, "content")
-                .or_else(|| {
-                    if stdout.is_empty() {
-                        None
-                    } else {
-                        Some(stdout.clone())
-                    }
-                })
-                .map(|value| value.trim().to_string())
-                .filter(|value| !value.is_empty());
-            match cleaned_text {
-                Some(text) => CleanupAttemptOutcome {
-                    status: CleanupTaskStatus::Succeeded,
-                    cleaned_text: Some(text),
-                },
-                None => CleanupAttemptOutcome {
-                    status: CleanupTaskStatus::Failed,
-                    cleaned_text: None,
-                },
-            }
-        }
-        Ok(output) if output.status.code() == Some(28) => CleanupAttemptOutcome {
-            status: CleanupTaskStatus::TimedOut,
-            cleaned_text: None,
-        },
-        Ok(_) => CleanupAttemptOutcome {
-            status: CleanupTaskStatus::Failed,
-            cleaned_text: None,
-        },
-        Err(_) => CleanupAttemptOutcome {
-            status: CleanupTaskStatus::Failed,
-            cleaned_text: None,
-        },
-    }
+#[cfg(test)]
+fn cleanup_content_from_response(stdout: &str) -> Option<String> {
+    cleanup::cleanup_content_from_response(stdout)
 }
 
 fn benchmark_track(channel_mode: ChannelMode) -> &'static str {
@@ -2900,22 +2597,32 @@ fn load_live_capture_telemetry_signals(
             display_path(telemetry_path)
         ))
     })?;
-    let restart_count = extract_json_u64_field(&payload, "restart_count").ok_or_else(|| {
+    let parsed_payload: serde_json::Value = serde_json::from_str(&payload).map_err(|err| {
         CliError::new(format!(
-            "live capture telemetry {} is missing `restart_count`",
+            "failed to parse live capture telemetry {} as json: {err}",
             display_path(telemetry_path)
         ))
     })?;
+    let restart_count = parsed_payload
+        .get("restart_count")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| {
+            CliError::new(format!(
+                "live capture telemetry {} is missing `restart_count`",
+                display_path(telemetry_path)
+            ))
+        })?;
+    let source_values = json_string_field_values(&parsed_payload, "source");
 
     let transport_sources = LIVE_CAPTURE_TRANSPORT_SOURCES
         .iter()
         .copied()
-        .filter(|source| payload_has_json_string_field_value(&payload, "source", source))
+        .filter(|source| source_values.contains(*source))
         .collect::<Vec<_>>();
     let callback_sources = LIVE_CAPTURE_CALLBACK_SOURCES
         .iter()
         .copied()
-        .filter(|source| payload_has_json_string_field_value(&payload, "source", source))
+        .filter(|source| source_values.contains(*source))
         .collect::<Vec<_>>();
 
     Ok(LiveCaptureTelemetrySignals {
@@ -2925,9 +2632,50 @@ fn load_live_capture_telemetry_signals(
     })
 }
 
-fn payload_has_json_string_field_value(payload: &str, key: &str, value: &str) -> bool {
-    payload.contains(&format!("\"{key}\":\"{value}\""))
-        || payload.contains(&format!("\"{key}\": \"{value}\""))
+fn find_first_json_string_field(value: &serde_json::Value, key: &str) -> Option<String> {
+    match value {
+        serde_json::Value::Object(object) => {
+            if let Some(found) = object.get(key).and_then(serde_json::Value::as_str) {
+                return Some(found.to_string());
+            }
+            object
+                .values()
+                .find_map(|nested| find_first_json_string_field(nested, key))
+        }
+        serde_json::Value::Array(items) => items
+            .iter()
+            .find_map(|nested| find_first_json_string_field(nested, key)),
+        _ => None,
+    }
+}
+
+fn collect_json_string_field_values(
+    value: &serde_json::Value,
+    key: &str,
+    values: &mut BTreeSet<String>,
+) {
+    match value {
+        serde_json::Value::Object(object) => {
+            if let Some(found) = object.get(key).and_then(serde_json::Value::as_str) {
+                values.insert(found.to_string());
+            }
+            for nested in object.values() {
+                collect_json_string_field_values(nested, key, values);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for nested in items {
+                collect_json_string_field_values(nested, key, values);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn json_string_field_values(value: &serde_json::Value, key: &str) -> BTreeSet<String> {
+    let mut values = BTreeSet::new();
+    collect_json_string_field_values(value, key, &mut values);
+    values
 }
 
 fn prepare_input_wav(path: &Path) -> Result<(), CliError> {
@@ -3326,14 +3074,6 @@ fn active_channel_mode_from_transcripts(
     runtime_events::active_channel_mode_from_transcripts(config, channel_transcripts)
 }
 
-fn stable_terminal_summary_lines(events: &[TranscriptEvent]) -> Vec<String> {
-    build_terminal_render_actions(events, TerminalRenderMode::DeterministicNonTty)
-        .into_iter()
-        .filter(|action| action.kind == TerminalRenderActionKind::StableLine)
-        .map(|action| action.line)
-        .collect()
-}
-
 #[derive(Debug, Clone, Copy, Default)]
 struct FirstEmitTiming {
     first_any_end_ms: Option<u64>,
@@ -3369,17 +3109,125 @@ fn first_emit_timing(events: &[TranscriptEvent]) -> FirstEmitTiming {
     timing
 }
 
-fn json_optional_u64(value: Option<u64>) -> String {
-    value
-        .map(|number| number.to_string())
-        .unwrap_or_else(|| "null".to_string())
+fn stable_terminal_summary_lines(events: &[TranscriptEvent]) -> Vec<String> {
+    reporting::stable_terminal_summary_lines(events)
 }
 
 fn transcript_event_count(events: &[TranscriptEvent], event_type: &str) -> usize {
-    events
-        .iter()
-        .filter(|event| event.event_type == event_type)
-        .count()
+    reporting::transcript_event_count(events, event_type)
+}
+
+fn distributed_bucket(total: usize, buckets: usize, index: usize) -> usize {
+    if buckets == 0 {
+        return 0;
+    }
+    let base = total / buckets;
+    let remainder = total % buckets;
+    base + usize::from(index < remainder)
+}
+
+fn build_channel_pressure_snapshots(
+    events: &[TranscriptEvent],
+    channel_transcripts: &[ChannelTranscriptSummary],
+    chunk_queue: &LiveChunkQueueTelemetry,
+) -> Vec<ChannelPressureSnapshot> {
+    let mut channel_set = BTreeSet::new();
+    for event in events {
+        channel_set.insert(event.channel.clone());
+    }
+    for channel in channel_transcripts {
+        channel_set.insert(channel.label.clone());
+    }
+    let channels = channel_set.into_iter().collect::<Vec<_>>();
+    if channels.is_empty() {
+        return Vec::new();
+    }
+
+    let mut partial_counts = HashMap::<String, usize>::new();
+    let mut stable_counts = HashMap::<String, usize>::new();
+    for event in events {
+        if event.event_type == "partial" {
+            *partial_counts.entry(event.channel.clone()).or_default() += 1;
+        }
+        if is_stable_terminal_event(event.event_type) {
+            *stable_counts.entry(event.channel.clone()).or_default() += 1;
+        }
+    }
+
+    let channel_count = channels.len();
+    channels
+        .into_iter()
+        .enumerate()
+        .map(|(index, channel)| {
+            let partial_events = partial_counts.get(&channel).copied().unwrap_or(0);
+            let stable_events = stable_counts.get(&channel).copied().unwrap_or(0);
+            ChannelPressureSnapshot {
+                channel,
+                partial_events,
+                stable_events,
+                processed_events: partial_events + stable_events,
+                pending_estimate: distributed_bucket(chunk_queue.pending, channel_count, index),
+                dropped_oldest_estimate: distributed_bucket(
+                    chunk_queue.dropped_oldest,
+                    channel_count,
+                    index,
+                ),
+            }
+        })
+        .collect()
+}
+
+fn build_hot_path_diagnostics(
+    config: &TranscribeConfig,
+    events: &[TranscriptEvent],
+    channel_transcripts: &[ChannelTranscriptSummary],
+    chunk_queue: &LiveChunkQueueTelemetry,
+    runtime_summary: &LiveRuntimeSummary,
+    asr_worker_pool: &LiveAsrPoolTelemetry,
+) -> HotPathDiagnostics {
+    let write_attempts_estimate = asr_worker_pool
+        .processed
+        .saturating_add(asr_worker_pool.retry_attempts);
+    let worker_scratch_paths_upper_bound = config.live_asr_workers.max(1);
+    let reuse_overwrites_estimate =
+        write_attempts_estimate.saturating_sub(worker_scratch_paths_upper_bound);
+    let forced_capture_event_triggers = runtime_summary.capture_events_seen;
+    let forced_shutdown_triggers = 4;
+    let forced_decisions = forced_capture_event_triggers.saturating_add(forced_shutdown_triggers);
+    HotPathDiagnostics {
+        transport: TransportInputDiagnostics {
+            // live-stream request path is now in-memory PCM windows only.
+            path_requests: 0,
+            pcm_window_requests: asr_worker_pool.submitted,
+        },
+        scratch: ScratchLifecycleDiagnostics {
+            worker_scratch_paths_upper_bound,
+            write_attempts_estimate,
+            reuse_overwrites_estimate,
+            retained_for_review_hint: asr_worker_pool.failed > 0,
+        },
+        backpressure: BackpressureDiagnostics {
+            mode: runtime_summary.backpressure_mode,
+            transition_count: runtime_summary.backpressure_transitions.len(),
+            last_transition_reason: runtime_summary
+                .backpressure_transitions
+                .last()
+                .map(|transition| transition.reason),
+            pending_jobs: runtime_summary.pending_jobs,
+            pending_final_jobs: runtime_summary.pending_final_jobs,
+            channel_snapshots: build_channel_pressure_snapshots(
+                events,
+                channel_transcripts,
+                chunk_queue,
+            ),
+        },
+        pump: PumpCadenceDiagnostics {
+            chunk_decisions: runtime_summary.capture_chunks_seen,
+            forced_decisions,
+            forced_capture_event_triggers,
+            forced_shutdown_triggers,
+        },
+    }
 }
 
 fn build_startup_banner_lines(config: &TranscribeConfig) -> Vec<String> {
@@ -3407,348 +3255,18 @@ fn build_startup_banner_lines(config: &TranscribeConfig) -> Vec<String> {
 }
 
 fn session_status(report: &LiveRunReport) -> &'static str {
-    if report.trust_notices.is_empty() {
-        "ok"
-    } else {
-        "degraded"
-    }
+    reporting::session_status(report)
 }
 
 fn top_codes<I>(codes: I, limit: usize) -> Vec<String>
 where
     I: IntoIterator<Item = String>,
 {
-    let mut sorted = codes.into_iter().collect::<Vec<_>>();
-    sorted.sort();
-    sorted.dedup();
-    sorted.into_iter().take(limit).collect()
-}
-
-fn top_codes_csv(codes: &[String]) -> String {
-    if codes.is_empty() {
-        "<none>".to_string()
-    } else {
-        codes.join("|")
-    }
-}
-
-fn top_remediation_hints(report: &LiveRunReport, limit: usize) -> Vec<String> {
-    let mut hints = BTreeSet::new();
-    for notice in &report.trust_notices {
-        let guidance = notice.guidance.trim();
-        if !guidance.is_empty() {
-            hints.insert(guidance.to_string());
-        }
-    }
-
-    if hints.is_empty() && !report.degradation_events.is_empty() {
-        for event in &report.degradation_events {
-            hints.insert(format!(
-                "inspect degradation code `{}` in the runtime manifest",
-                event.code
-            ));
-            if hints.len() >= limit {
-                break;
-            }
-        }
-    }
-
-    hints.into_iter().take(limit).collect()
-}
-
-fn remediation_hints_csv(hints: &[String]) -> String {
-    if hints.is_empty() {
-        "<none>".to_string()
-    } else {
-        hints.join(" | ")
-    }
-}
-
-fn top_codes_json(codes: &[String]) -> String {
-    codes
-        .iter()
-        .map(|code| format!("\"{}\"", json_escape(code)))
-        .collect::<Vec<_>>()
-        .join(",")
-}
-
-fn build_live_close_summary_lines(
-    config: &TranscribeConfig,
-    report: &LiveRunReport,
-) -> Vec<String> {
-    let trust_top_codes = top_codes(
-        report
-            .trust_notices
-            .iter()
-            .map(|notice| notice.code.clone()),
-        3,
-    );
-    let degradation_top_codes = top_codes(
-        report
-            .degradation_events
-            .iter()
-            .map(|event| event.code.to_string()),
-        3,
-    );
-
-    vec![
-        format!("session_status={}", session_status(report)),
-        format!("duration_sec={}", config.duration_sec),
-        format!("channel_mode_requested={}", report.channel_mode),
-        format!("channel_mode_active={}", report.active_channel_mode),
-        format!(
-            "transcript_events=partial:{} final:{} llm_final:{} reconciled_final:{}",
-            transcript_event_count(&report.events, "partial"),
-            transcript_event_count(&report.events, "final"),
-            transcript_event_count(&report.events, "llm_final"),
-            transcript_event_count(&report.events, "reconciled_final"),
-        ),
-        format!(
-            "chunk_queue=submitted:{} enqueued:{} dropped_oldest:{} processed:{} pending:{} high_water:{} drain_completed:{}",
-            report.chunk_queue.submitted,
-            report.chunk_queue.enqueued,
-            report.chunk_queue.dropped_oldest,
-            report.chunk_queue.processed,
-            report.chunk_queue.pending,
-            report.chunk_queue.high_water,
-            report.chunk_queue.drain_completed,
-        ),
-        format!(
-            "chunk_lag=lag_sample_count:{} lag_p50_ms:{} lag_p95_ms:{} lag_max_ms:{}",
-            report.chunk_queue.lag_sample_count,
-            report.chunk_queue.lag_p50_ms,
-            report.chunk_queue.lag_p95_ms,
-            report.chunk_queue.lag_max_ms,
-        ),
-        format!(
-            "trust_notices=count:{} top_codes:{}",
-            report.trust_notices.len(),
-            top_codes_csv(&trust_top_codes),
-        ),
-        format!(
-            "degradation_events=count:{} top_codes:{}",
-            report.degradation_events.len(),
-            top_codes_csv(&degradation_top_codes),
-        ),
-        format!(
-            "cleanup_queue=enabled:{} submitted:{} enqueued:{} dropped_queue_full:{} processed:{} succeeded:{} timed_out:{} failed:{} retry_attempts:{} pending:{} drain_completed:{}",
-            report.cleanup_queue.enabled,
-            report.cleanup_queue.submitted,
-            report.cleanup_queue.enqueued,
-            report.cleanup_queue.dropped_queue_full,
-            report.cleanup_queue.processed,
-            report.cleanup_queue.succeeded,
-            report.cleanup_queue.timed_out,
-            report.cleanup_queue.failed,
-            report.cleanup_queue.retry_attempts,
-            report.cleanup_queue.pending,
-            report.cleanup_queue.drain_completed,
-        ),
-        format!(
-            "artifacts=out_wav:{} out_jsonl:{} out_manifest:{}",
-            display_path(&config.out_wav),
-            display_path(&config.out_jsonl),
-            display_path(&config.out_manifest),
-        ),
-    ]
+    reporting::top_codes(codes, limit)
 }
 
 fn print_live_report(config: &TranscribeConfig, report: &LiveRunReport, concise_only: bool) {
-    let model_checksum = model_checksum_info(Some(&ResolvedModelPath {
-        path: report.resolved_model_path.clone(),
-        source: report.resolved_model_source.clone(),
-    }));
-    let remediation_hints = top_remediation_hints(report, 3);
-
-    println!();
-    println!("Runtime result");
-    println!("  runtime_mode: {}", config.runtime_mode_label());
-    println!(
-        "  runtime_mode_taxonomy: {}",
-        config.runtime_mode_taxonomy_label()
-    );
-    println!(
-        "  runtime_mode_selector: {}",
-        config.runtime_mode_selector_label()
-    );
-    println!(
-        "  runtime_mode_status: {}",
-        config.runtime_mode_status_label()
-    );
-    println!("  generated_at_utc: {}", report.generated_at_utc);
-    println!("  backend: {}", report.backend_id);
-    println!(
-        "  asr_model_resolved: {}",
-        report.resolved_model_path.display()
-    );
-    println!("  asr_model_source: {}", report.resolved_model_source);
-    println!("  asr_model_checksum_sha256: {}", model_checksum.sha256);
-    println!("  asr_model_checksum_status: {}", model_checksum.status);
-    println!("  run_status: {}", session_status(report));
-    println!(
-        "  remediation_hints: {}",
-        remediation_hints_csv(&remediation_hints)
-    );
-    println!("  channel_mode_requested: {}", report.channel_mode);
-    println!("  channel_mode_active: {}", report.active_channel_mode);
-    println!("  close_summary:");
-    for line in build_live_close_summary_lines(config, report) {
-        println!("    {line}");
-    }
-    if concise_only {
-        println!(
-            "  telemetry_manifest: {}",
-            display_path(&config.out_manifest)
-        );
-        println!("  telemetry_jsonl: {}", display_path(&config.out_jsonl));
-        return;
-    }
-
-    let per_channel_defaults = reconstruct_transcript_per_channel(&report.events);
-    println!(
-        "  lifecycle: current_phase={} ready_for_transcripts={} transition_count={}",
-        report.lifecycle.current_phase,
-        report.lifecycle.ready_for_transcripts,
-        report.lifecycle.transitions.len()
-    );
-    println!("  lifecycle_transitions:");
-    for transition in &report.lifecycle.transitions {
-        println!(
-            "    - phase={} entered_at_utc={} detail={}",
-            transition.phase, transition.entered_at_utc, transition.detail
-        );
-    }
-    println!("  transcript_default_line_format: [MM:SS.mmm-MM:SS.mmm] <channel>: <text>");
-    println!(
-        "  transcript_overlap_policy: adjacent cross-channel finals within {OVERLAP_WINDOW_MS}ms keep sort order and add overlap annotation"
-    );
-    println!("  transcript_text:");
-    for line in report.transcript_text.lines() {
-        println!("    {line}");
-    }
-    println!("  transcript_per_channel:");
-    for channel in &per_channel_defaults {
-        println!("    - channel={}", channel.channel);
-        for line in channel.text.lines() {
-            println!("      {line}");
-        }
-    }
-    println!("  channel_transcripts:");
-    for channel in &report.channel_transcripts {
-        println!(
-            "    - role={} label={} text={}",
-            channel.role, channel.label, channel.text
-        );
-    }
-    println!(
-        "  benchmark_wall_ms: p50={:.2} p95={:.2} (runs={})",
-        report.benchmark.wall_ms_p50, report.benchmark.wall_ms_p95, report.benchmark.run_count
-    );
-    println!(
-        "  slo_check: partial_p95<=1500ms={} final_p95<=2500ms={}",
-        report.benchmark.partial_slo_met, report.benchmark.final_slo_met
-    );
-    println!(
-        "  benchmark_summary_csv: {}",
-        report.benchmark_summary_csv.display()
-    );
-    println!(
-        "  benchmark_runs_csv: {}",
-        report.benchmark_runs_csv.display()
-    );
-    println!("  input_wav_semantics: {}", input_wav_semantics(config));
-    println!("  out_wav_semantics: {OUT_WAV_SEMANTICS}");
-    println!("  vad_boundaries: {}", report.vad_boundaries.len());
-    for boundary in &report.vad_boundaries {
-        println!(
-            "    - id={} start_ms={} end_ms={} source={}",
-            boundary.id, boundary.start_ms, boundary.end_ms, boundary.source
-        );
-    }
-    println!("  terminal_transcript_stream:");
-    let live_mode = report.chunk_queue.enabled;
-    let stable_terminal_lines = stable_terminal_summary_lines(&report.events);
-    if live_mode {
-        println!(
-            "    <rendered during active runtime; summary suppresses duplicate stable-line replay>"
-        );
-    } else {
-        if stable_terminal_lines.is_empty() {
-            println!("    <no stable transcript events>");
-        } else {
-            for line in stable_terminal_lines {
-                println!("    {line}");
-            }
-        }
-    }
-    println!("  degradation_events: {}", report.degradation_events.len());
-    for event in &report.degradation_events {
-        println!("    - code={} detail={}", event.code, event.detail);
-    }
-    println!("  trust_notices: {}", report.trust_notices.len());
-    if report.trust_notices.is_empty() {
-        println!("    - none (runtime trust posture: nominal)");
-    } else {
-        println!("  degraded_mode_notices:");
-        for notice in &report.trust_notices {
-            println!(
-                "    - [{}] code={} cause={} | impact={} | next={}",
-                notice.severity, notice.code, notice.cause, notice.impact, notice.guidance
-            );
-        }
-    }
-    println!(
-        "  reconciliation_matrix: required={} applied={} trigger_count={} trigger_codes={}",
-        report.reconciliation.required,
-        report.reconciliation.applied,
-        report.reconciliation.triggers.len(),
-        report.reconciliation.trigger_codes_csv()
-    );
-    println!(
-        "  asr_worker_pool: prewarm_ok={} submitted={} enqueued={} dropped_queue_full={} processed={} succeeded={} failed={} retry_attempts={} temp_audio_deleted={} temp_audio_retained={}",
-        report.asr_worker_pool.prewarm_ok,
-        report.asr_worker_pool.submitted,
-        report.asr_worker_pool.enqueued,
-        report.asr_worker_pool.dropped_queue_full,
-        report.asr_worker_pool.processed,
-        report.asr_worker_pool.succeeded,
-        report.asr_worker_pool.failed,
-        report.asr_worker_pool.retry_attempts,
-        report.asr_worker_pool.temp_audio_deleted,
-        report.asr_worker_pool.temp_audio_retained
-    );
-    println!(
-        "  chunk_queue: enabled={} max_queue={} submitted={} enqueued={} dropped_oldest={} processed={} pending={} high_water={} drain_completed={} lag_sample_count={} lag_p50_ms={} lag_p95_ms={} lag_max_ms={}",
-        report.chunk_queue.enabled,
-        report.chunk_queue.max_queue,
-        report.chunk_queue.submitted,
-        report.chunk_queue.enqueued,
-        report.chunk_queue.dropped_oldest,
-        report.chunk_queue.processed,
-        report.chunk_queue.pending,
-        report.chunk_queue.high_water,
-        report.chunk_queue.drain_completed,
-        report.chunk_queue.lag_sample_count,
-        report.chunk_queue.lag_p50_ms,
-        report.chunk_queue.lag_p95_ms,
-        report.chunk_queue.lag_max_ms
-    );
-    println!(
-        "  cleanup_queue: enabled={} submitted={} enqueued={} dropped_queue_full={} processed={} succeeded={} timed_out={} failed={} retry_attempts={} pending={} drain_completed={}",
-        report.cleanup_queue.enabled,
-        report.cleanup_queue.submitted,
-        report.cleanup_queue.enqueued,
-        report.cleanup_queue.dropped_queue_full,
-        report.cleanup_queue.processed,
-        report.cleanup_queue.succeeded,
-        report.cleanup_queue.timed_out,
-        report.cleanup_queue.failed,
-        report.cleanup_queue.retry_attempts,
-        report.cleanup_queue.pending,
-        report.cleanup_queue.drain_completed
-    );
-    println!("  jsonl_written: true");
-    println!("  manifest_written: true");
+    reporting::print_live_report(config, report, concise_only)
 }
 
 fn emit_latest_lifecycle_transition_jsonl(
@@ -3832,13 +3350,8 @@ fn replay_timeline(path: &Path) -> Result<(), CliError> {
         if trimmed.is_empty() {
             continue;
         }
-        let Some(event_type) = extract_json_string_field(trimmed, "event_type") else {
-            continue;
-        };
-        if event_type == "trust_notice" {
-            if let Some(notice) = parse_trust_notice(trimmed) {
-                trust_notices.push(notice);
-            }
+        if let Some(notice) = parse_replay_trust_notice(trimmed, line_no + 1)? {
+            trust_notices.push(notice);
             continue;
         }
         if let Some(event) = parse_replay_transcript_event(trimmed, line_no + 1)? {
@@ -3883,123 +3396,133 @@ fn replay_timeline(path: &Path) -> Result<(), CliError> {
     Ok(())
 }
 
+const REPLAY_JSONL_MAX_LINE_BYTES: usize = 1_048_576;
+const REPLAY_TRANSCRIPT_TEXT_MAX_BYTES: usize = 262_144;
+
+fn replay_line_error(line_no: usize, category: &str, detail: impl AsRef<str>) -> CliError {
+    CliError::new(format!(
+        "invalid replay line {line_no} [{category}]: {}",
+        detail.as_ref()
+    ))
+}
+
+fn ensure_replay_line_within_bounds(line: &str, line_no: usize) -> Result<(), CliError> {
+    let byte_len = line.len();
+    if byte_len > REPLAY_JSONL_MAX_LINE_BYTES {
+        return Err(replay_line_error(
+            line_no,
+            "line_too_large",
+            format!("line has {byte_len} bytes; max allowed is {REPLAY_JSONL_MAX_LINE_BYTES}"),
+        ));
+    }
+    Ok(())
+}
+
+fn replay_parse_reason_category(err: &str) -> &'static str {
+    if err.starts_with("invalid json line") {
+        "json_decode"
+    } else if err.contains("payload mismatch") {
+        "payload_mismatch"
+    } else if err.contains("unknown event_type") {
+        "unknown_event_type"
+    } else {
+        "parse_error"
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct ReplayEventTypeProbe {
+    event_type: Option<String>,
+}
+
+fn replay_event_type(line: &str, line_no: usize) -> Result<Option<String>, CliError> {
+    let parsed: ReplayEventTypeProbe = serde_json::from_str(line).map_err(|err| {
+        let err_text = format!("invalid json line: {err}");
+        replay_line_error(line_no, replay_parse_reason_category(&err_text), err_text)
+    })?;
+    Ok(parsed.event_type)
+}
+
 fn parse_replay_transcript_event(
     line: &str,
     line_no: usize,
 ) -> Result<Option<TranscriptEvent>, CliError> {
-    let Some(event_type) = extract_json_string_field(line, "event_type") else {
+    ensure_replay_line_within_bounds(line, line_no)?;
+    let Some(event_type) = replay_event_type(line, line_no)? else {
         return Ok(None);
     };
-    if event_type != "partial"
-        && event_type != "final"
-        && event_type != "llm_final"
-        && event_type != "reconciled_final"
-    {
+    if !contracts_models::runtime_jsonl::TRANSCRIPT_EVENT_TYPES.contains(&event_type.as_str()) {
         return Ok(None);
     }
 
-    let segment_id = extract_json_string_field(line, "segment_id").ok_or_else(|| {
-        CliError::new(format!(
-            "invalid replay line {}: missing segment_id",
-            line_no
-        ))
-    })?;
-    let channel =
-        extract_json_string_field(line, "channel").unwrap_or_else(|| "merged".to_string());
-    let text = extract_json_string_field(line, "text").unwrap_or_default();
-    let start_ms = extract_json_u64_field(line, "start_ms").ok_or_else(|| {
-        CliError::new(format!("invalid replay line {}: missing start_ms", line_no))
-    })?;
-    let end_ms = extract_json_u64_field(line, "end_ms")
-        .ok_or_else(|| CliError::new(format!("invalid replay line {}: missing end_ms", line_no)))?;
-    let event_name = match event_type.as_str() {
-        "partial" => "partial",
-        "llm_final" => "llm_final",
-        "reconciled_final" => "reconciled_final",
-        _ => "final",
+    let parsed =
+        contracts_models::runtime_jsonl::parse_runtime_jsonl_event_line(line).map_err(|err| {
+            let err_text = err.to_string();
+            replay_line_error(line_no, replay_parse_reason_category(&err_text), err_text)
+        })?;
+    let (event_name, payload) = match parsed {
+        contracts_models::runtime_jsonl::RuntimeJsonlEvent::Partial(payload) => ("partial", payload),
+        contracts_models::runtime_jsonl::RuntimeJsonlEvent::Final(payload) => ("final", payload),
+        contracts_models::runtime_jsonl::RuntimeJsonlEvent::LlmFinal(payload) => {
+            ("llm_final", payload)
+        }
+        contracts_models::runtime_jsonl::RuntimeJsonlEvent::ReconciledFinal(payload) => {
+            ("reconciled_final", payload)
+        }
+        _ => {
+            return Err(CliError::new(format!(
+                "invalid replay line {line_no}: event_type `{event_type}` decoded as non-transcript variant"
+            )))
+        }
     };
+    if payload.text.len() > REPLAY_TRANSCRIPT_TEXT_MAX_BYTES {
+        return Err(replay_line_error(
+            line_no,
+            "text_too_large",
+            format!(
+                "transcript text has {} bytes; max allowed is {REPLAY_TRANSCRIPT_TEXT_MAX_BYTES}",
+                payload.text.len()
+            ),
+        ));
+    }
     Ok(Some(TranscriptEvent {
         event_type: event_name,
-        channel,
-        segment_id,
-        start_ms,
-        end_ms,
-        text,
-        source_final_segment_id: extract_json_string_field(line, "source_final_segment_id"),
+        channel: payload.channel,
+        segment_id: payload.segment_id,
+        start_ms: payload.start_ms,
+        end_ms: payload.end_ms,
+        text: payload.text,
+        source_final_segment_id: payload.source_final_segment_id,
     }))
 }
 
-fn parse_trust_notice(line: &str) -> Option<TrustNotice> {
-    Some(TrustNotice {
-        code: extract_json_string_field(line, "code")?,
-        severity: extract_json_string_field(line, "severity")?,
-        cause: extract_json_string_field(line, "cause")?,
-        impact: extract_json_string_field(line, "impact")?,
-        guidance: extract_json_string_field(line, "guidance")?,
-    })
-}
-
-fn extract_json_string_field(line: &str, key: &str) -> Option<String> {
-    let needle = format!("\"{key}\"");
-    let bytes = line.as_bytes();
-    let mut start = line.find(&needle)? + needle.len();
-    while start < bytes.len() && bytes[start].is_ascii_whitespace() {
-        start += 1;
+fn parse_replay_trust_notice(line: &str, line_no: usize) -> Result<Option<TrustNotice>, CliError> {
+    ensure_replay_line_within_bounds(line, line_no)?;
+    let Some(event_type) = replay_event_type(line, line_no)? else {
+        return Ok(None);
+    };
+    if event_type != contracts_models::runtime_jsonl::EVENT_TYPE_TRUST_NOTICE {
+        return Ok(None);
     }
-    if start >= bytes.len() || bytes[start] != b':' {
-        return None;
-    }
-    start += 1;
-    while start < bytes.len() && bytes[start].is_ascii_whitespace() {
-        start += 1;
-    }
-    if start >= bytes.len() || bytes[start] != b'"' {
-        return None;
-    }
-    start += 1;
-    let mut escaped = false;
-    let mut result = String::new();
-    for ch in line[start..].chars() {
-        if escaped {
-            let decoded = match ch {
-                '"' => '"',
-                '\\' => '\\',
-                'n' => '\n',
-                'r' => '\r',
-                't' => '\t',
-                other => other,
-            };
-            result.push(decoded);
-            escaped = false;
-            continue;
-        }
-        if ch == '\\' {
-            escaped = true;
-            continue;
-        }
-        if ch == '"' {
-            return Some(result);
-        }
-        result.push(ch);
-    }
-    None
-}
-
-fn extract_json_u64_field(line: &str, key: &str) -> Option<u64> {
-    let needle = format!("\"{}\":", key);
-    let start = line.find(&needle)? + needle.len();
-    let mut digits = String::new();
-    for ch in line[start..].chars() {
-        if ch.is_ascii_digit() {
-            digits.push(ch);
-            continue;
-        }
-        if digits.is_empty() {
-            continue;
-        }
-        break;
-    }
-    digits.parse::<u64>().ok()
+    let parsed =
+        contracts_models::runtime_jsonl::parse_runtime_jsonl_event_line(line).map_err(|err| {
+            let err_text = err.to_string();
+            replay_line_error(line_no, replay_parse_reason_category(&err_text), err_text)
+        })?;
+    let contracts_models::runtime_jsonl::RuntimeJsonlEvent::TrustNotice(notice) = parsed else {
+        return Err(replay_line_error(
+            line_no,
+            "variant_mismatch",
+            "trust_notice event decoded as a non-trust variant",
+        ));
+    };
+    Ok(Some(TrustNotice {
+        code: notice.code,
+        severity: notice.severity,
+        cause: notice.cause,
+        impact: notice.impact,
+        guidance: notice.guidance,
+    }))
 }
 
 #[allow(dead_code)]
@@ -4163,417 +3686,6 @@ fn display_path(path: &Path) -> String {
     }
 }
 
-fn run_model_doctor(config: &TranscribeConfig) -> Result<PreflightReport, CliError> {
-    let mut checks = Vec::new();
-    checks.push(check_backend_runtime(config.asr_backend));
-
-    match validate_model_path_for_backend(config) {
-        Ok(resolved) => {
-            let expected_kind = expected_model_kind(config.asr_backend);
-            checks.push(PreflightCheck::pass(
-                "model_path",
-                format!(
-                    "model path resolved: {} via {} (expected {expected_kind} for backend {})",
-                    display_path(&resolved.path),
-                    resolved.source,
-                    config.asr_backend,
-                ),
-            ));
-            checks.push(check_model_asset_readability(&resolved));
-        }
-        Err(err) => {
-            checks.push(PreflightCheck::fail(
-                "model_path",
-                err.to_string(),
-                "Pass --asr-model, set RECORDIT_ASR_MODEL, or install the backend default asset in the documented location.",
-            ));
-            checks.push(PreflightCheck::fail(
-                "model_readability",
-                "skipped because model_path did not validate".to_string(),
-                "Fix model_path first, then rerun --model-doctor.",
-            ));
-        }
-    }
-
-    let generated_at_utc = command_stdout("date", &["-u", "+%Y-%m-%dT%H:%M:%SZ"])
-        .unwrap_or_else(|_| "unknown".to_string());
-
-    Ok(PreflightReport {
-        generated_at_utc,
-        checks,
-    })
-}
-
-fn check_model_asset_readability(resolved: &ResolvedModelPath) -> PreflightCheck {
-    if resolved.path.is_file() {
-        return match File::open(&resolved.path) {
-            Ok(_) => PreflightCheck::pass(
-                "model_readability",
-                format!("model file is readable: {}", display_path(&resolved.path)),
-            ),
-            Err(err) => PreflightCheck::fail(
-                "model_readability",
-                format!(
-                    "cannot read model file {}: {err}",
-                    display_path(&resolved.path)
-                ),
-                "Fix file permissions or pass a different readable model path.",
-            ),
-        };
-    }
-
-    if resolved.path.is_dir() {
-        return match fs::read_dir(&resolved.path) {
-            Ok(_) => PreflightCheck::pass(
-                "model_readability",
-                format!(
-                    "model directory is readable: {}",
-                    display_path(&resolved.path)
-                ),
-            ),
-            Err(err) => PreflightCheck::fail(
-                "model_readability",
-                format!(
-                    "cannot read model directory {}: {err}",
-                    display_path(&resolved.path)
-                ),
-                "Fix directory permissions or pass a different readable model path.",
-            ),
-        };
-    }
-
-    PreflightCheck::fail(
-        "model_readability",
-        format!(
-            "model path is neither a file nor directory: {}",
-            display_path(&resolved.path)
-        ),
-        "Use a readable file/directory path matching backend expectations.",
-    )
-}
-
-fn run_preflight(config: &TranscribeConfig) -> Result<PreflightReport, CliError> {
-    let mut checks = Vec::new();
-    checks.push(check_model_path(config));
-    checks.push(check_output_target("out_wav", &config.out_wav));
-    checks.push(check_output_target("out_jsonl", &config.out_jsonl));
-    checks.push(check_output_target("out_manifest", &config.out_manifest));
-    checks.push(check_sample_rate(config.sample_rate_hz));
-    checks.push(check_screen_capture_access());
-    checks.push(check_microphone_stream(config.sample_rate_hz));
-    checks.push(check_backend_runtime(config.asr_backend));
-
-    let generated_at_utc = command_stdout("date", &["-u", "+%Y-%m-%dT%H:%M:%SZ"])
-        .unwrap_or_else(|_| "unknown".to_string());
-
-    Ok(PreflightReport {
-        generated_at_utc,
-        checks,
-    })
-}
-
-fn check_model_path(config: &TranscribeConfig) -> PreflightCheck {
-    match validate_model_path_for_backend(config) {
-        Ok(resolved) => {
-            let expected_kind = expected_model_kind(config.asr_backend);
-            PreflightCheck::pass(
-                "model_path",
-                format!(
-                    "model path resolved: {} via {} (expected {expected_kind} for backend {})",
-                    display_path(&resolved.path),
-                    resolved.source,
-                    config.asr_backend,
-                ),
-            )
-        }
-        Err(err) => PreflightCheck::fail(
-            "model_path",
-            err.to_string(),
-            "Pass --asr-model, set RECORDIT_ASR_MODEL, or install the backend default asset in the documented location.",
-        ),
-    }
-}
-
-fn check_output_target(id: &'static str, path: &Path) -> PreflightCheck {
-    let absolute = display_path(path);
-    let parent = path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from("."));
-
-    if path.exists() && path.is_dir() {
-        return PreflightCheck::fail(
-            id,
-            format!("target path is a directory: {absolute}"),
-            "Provide a file path, not a directory.",
-        );
-    }
-
-    if let Err(err) = fs::create_dir_all(&parent) {
-        return PreflightCheck::fail(
-            id,
-            format!("cannot create parent directory {}: {err}", parent.display()),
-            "Choose an output location in a writable directory.",
-        );
-    }
-
-    let probe = parent.join(format!(
-        ".recordit-preflight-write-{}-{}",
-        id,
-        std::process::id()
-    ));
-    match File::create(&probe).and_then(|mut file| file.write_all(b"ok")) {
-        Ok(()) => {
-            let _ = fs::remove_file(&probe);
-            PreflightCheck::pass(id, format!("writable output target: {absolute}"))
-        }
-        Err(err) => PreflightCheck::fail(
-            id,
-            format!("cannot write under {}: {err}", parent.display()),
-            "Choose an output path in a writable directory.",
-        ),
-    }
-}
-
-fn check_sample_rate(sample_rate_hz: u32) -> PreflightCheck {
-    if sample_rate_hz == 48_000 {
-        return PreflightCheck::pass("sample_rate", "sample rate is 48000 Hz");
-    }
-
-    PreflightCheck::warn(
-        "sample_rate",
-        format!("non-default sample rate configured: {sample_rate_hz} Hz"),
-        "Use --sample-rate 48000 unless you intentionally need a different rate.",
-    )
-}
-
-fn check_screen_capture_access() -> PreflightCheck {
-    let content = match SCShareableContent::get() {
-        Ok(content) => content,
-        Err(err) => {
-            return PreflightCheck::fail(
-                "screen_capture_access",
-                format!("failed to query ScreenCaptureKit content: {err}"),
-                "Grant Screen Recording permission and ensure at least one active display.",
-            );
-        }
-    };
-
-    let displays = content.displays();
-    if displays.is_empty() {
-        return PreflightCheck::fail(
-            "display_availability",
-            "ScreenCaptureKit returned no displays".to_string(),
-            "Connect/enable a display and retry. Closed-lid headless mode is unsupported.",
-        );
-    }
-
-    PreflightCheck::pass(
-        "screen_capture_access",
-        format!(
-            "ScreenCaptureKit access OK; displays available={}",
-            displays.len()
-        ),
-    )
-}
-
-fn check_microphone_stream(sample_rate_hz: u32) -> PreflightCheck {
-    let content = match SCShareableContent::get() {
-        Ok(content) => content,
-        Err(err) => {
-            return PreflightCheck::fail(
-                "microphone_access",
-                format!("cannot initialize microphone preflight (shareable content error): {err}"),
-                "Grant Screen Recording first, then rerun preflight.",
-            );
-        }
-    };
-
-    let displays = content.displays();
-    if displays.is_empty() {
-        return PreflightCheck::fail(
-            "microphone_access",
-            "cannot run microphone preflight without an active display".to_string(),
-            "Connect/enable a display and rerun preflight.",
-        );
-    }
-
-    let filter = SCContentFilter::create()
-        .with_display(&displays[0])
-        .with_excluding_windows(&[])
-        .build();
-
-    let config = SCStreamConfiguration::new()
-        .with_width(2)
-        .with_height(2)
-        .with_captures_audio(false)
-        .with_captures_microphone(true)
-        .with_excludes_current_process_audio(true)
-        .with_sample_rate(sample_rate_hz as i32)
-        .with_channel_count(1);
-
-    let queue = DispatchQueue::new(
-        "com.recordit.transcribe.preflight",
-        DispatchQoS::UserInteractive,
-    );
-    let (tx, rx) = sync_channel::<()>(1);
-
-    let mut stream = SCStream::new(&filter, &config);
-    let tx_mic = tx.clone();
-    if stream
-        .add_output_handler_with_queue(
-            move |_sample, _kind| {
-                let _ = tx_mic.try_send(());
-            },
-            SCStreamOutputType::Microphone,
-            Some(&queue),
-        )
-        .is_none()
-    {
-        return PreflightCheck::fail(
-            "microphone_access",
-            "failed to register microphone output handler".to_string(),
-            "Retry preflight; if it persists, restart the app/session.",
-        );
-    }
-
-    if let Err(err) = stream.start_capture() {
-        return PreflightCheck::fail(
-            "microphone_access",
-            format!("failed to start microphone capture: {err}"),
-            "Grant Microphone permission and verify an input device is connected and enabled.",
-        );
-    }
-
-    let deadline = Instant::now() + Duration::from_secs(2);
-    let mut observed_mic = false;
-    while Instant::now() < deadline {
-        match rx.recv_timeout(Duration::from_millis(200)) {
-            Ok(_) => {
-                observed_mic = true;
-                break;
-            }
-            Err(RecvTimeoutError::Timeout) => {}
-            Err(RecvTimeoutError::Disconnected) => break,
-        }
-    }
-
-    let stop_result = stream.stop_capture();
-    if let Err(err) = stop_result {
-        return PreflightCheck::warn(
-            "microphone_access",
-            format!("microphone stream started but stop_capture reported: {err}"),
-            "Retry preflight; if repeated, restart the app/session.",
-        );
-    }
-
-    if observed_mic {
-        PreflightCheck::pass(
-            "microphone_access",
-            "observed at least one microphone sample buffer".to_string(),
-        )
-    } else {
-        PreflightCheck::fail(
-            "microphone_access",
-            "no microphone sample buffer observed within 2s".to_string(),
-            "Grant Microphone permission, unmute/select input device, and speak briefly during preflight.",
-        )
-    }
-}
-
-fn check_backend_runtime(backend: AsrBackend) -> PreflightCheck {
-    let tool_name = match backend {
-        AsrBackend::WhisperCpp => "whisper-cli",
-        AsrBackend::WhisperKit => "whisperkit-cli",
-        AsrBackend::Moonshine => "moonshine",
-    };
-
-    match command_stdout("which", &[tool_name]) {
-        Ok(path) => PreflightCheck::pass(
-            "backend_runtime",
-            format!("detected backend helper binary `{tool_name}` at {path}"),
-        ),
-        Err(_) => PreflightCheck::warn(
-            "backend_runtime",
-            format!("backend helper binary `{tool_name}` not found in PATH"),
-            "Install backend tooling or keep using Rust-native integration once wired.",
-        ),
-    }
-}
-
-fn print_preflight_report(report: &PreflightReport) {
-    let mut pass_count = 0usize;
-    let mut warn_count = 0usize;
-    let mut fail_count = 0usize;
-
-    println!("Transcribe-live preflight diagnostics");
-    println!("  generated_at_utc: {}", report.generated_at_utc);
-    println!("  overall_status: {}", report.overall_status());
-    println!();
-    println!("id\tstatus\tdetail\tremediation");
-
-    for check in &report.checks {
-        match check.status {
-            CheckStatus::Pass => pass_count += 1,
-            CheckStatus::Warn => warn_count += 1,
-            CheckStatus::Fail => fail_count += 1,
-        }
-        println!(
-            "{}\t{}\t{}\t{}",
-            check.id,
-            check.status,
-            clean_field(&check.detail),
-            clean_field(check.remediation.as_deref().unwrap_or("-")),
-        );
-    }
-
-    println!();
-    println!(
-        "summary\t{}\tpass={}\twarn={}\tfail={}",
-        report.overall_status(),
-        pass_count,
-        warn_count,
-        fail_count
-    );
-}
-
-fn print_model_doctor_report(report: &PreflightReport) {
-    let mut pass_count = 0usize;
-    let mut warn_count = 0usize;
-    let mut fail_count = 0usize;
-
-    println!("Transcribe-live model doctor");
-    println!("  generated_at_utc: {}", report.generated_at_utc);
-    println!("  overall_status: {}", report.overall_status());
-    println!();
-    println!("id\tstatus\tdetail\tremediation");
-
-    for check in &report.checks {
-        match check.status {
-            CheckStatus::Pass => pass_count += 1,
-            CheckStatus::Warn => warn_count += 1,
-            CheckStatus::Fail => fail_count += 1,
-        }
-        println!(
-            "{}\t{}\t{}\t{}",
-            check.id,
-            check.status,
-            clean_field(&check.detail),
-            clean_field(check.remediation.as_deref().unwrap_or("-")),
-        );
-    }
-
-    println!();
-    println!(
-        "summary\t{}\tpass={}\twarn={}\tfail={}",
-        report.overall_status(),
-        pass_count,
-        warn_count,
-        fail_count
-    );
-}
-
 fn write_preflight_manifest(
     config: &TranscribeConfig,
     report: &PreflightReport,
@@ -4621,22 +3733,13 @@ fn command_stdout(program: &str, args: &[&str]) -> Result<String, CliError> {
 
 #[cfg(test)]
 mod tests {
+    use super::contracts_models::runtime_jsonl;
+    use super::reporting::{
+        build_live_close_summary_lines, remediation_hints_csv, runtime_failure_breadcrumbs,
+        top_remediation_hints,
+    };
     use super::{
-        AsrBackend, AsrWorkClass, AsrWorkItem, BenchmarkSummary, CaptureChunk, CaptureEvent,
-        CaptureSink, ChannelMode, ChannelVadBoundary, CheckStatus, CleanupAttemptOutcome,
-        CleanupQueueTelemetry, CleanupTaskStatus, CollectingRuntimeOutputSink,
-        FinalBufferingTelemetry, HELP_TEXT, IncrementalVadTracker,
-        LIVE_CAPTURE_CALLBACK_CONTRACT_DEGRADED_CODE, LIVE_CAPTURE_CONTINUITY_UNVERIFIED_CODE,
-        LIVE_CAPTURE_INTERRUPTION_RECOVERED_CODE, LIVE_CAPTURE_TRANSPORT_DEGRADED_CODE,
-        LIVE_CHUNK_QUEUE_BACKPRESSURE_SEVERE_CODE, LIVE_CHUNK_QUEUE_DROP_OLDEST_CODE,
-        LiveAsrExecutor, LiveAsrJob, LiveAsrJobClass, LiveAsrPoolConfig, LiveAsrPoolTelemetry,
-        LiveCaptureCallbackMode, LiveCaptureConfig, LiveCaptureSampleRateMismatchPolicy,
-        LiveChunkQueueTelemetry, LiveLifecyclePhase, LiveLifecycleTelemetry, LiveRunReport,
-        ModeDegradationEvent, ParseOutcome, PreflightCheck, PreflightReport,
-        RECONCILIATION_APPLIED_CODE, ReconciliationMatrix, ResolvedModelPath,
-        RuntimeExecutionBranch, RuntimeJsonlStream, RuntimeOutputSink, TempAudioPolicy,
-        TerminalRenderActionKind, TerminalRenderMode, TranscribeConfig, TranscriptEvent,
-        VadBoundary, build_live_chunked_events_with_queue, build_live_close_summary_lines,
+        build_hot_path_diagnostics, build_live_chunked_events_with_queue,
         build_reconciliation_events, build_reconciliation_matrix, build_rolling_chunk_windows,
         build_startup_banner_lines, build_targeted_reconciliation_events,
         build_terminal_render_actions, build_transcript_events, build_trust_notices,
@@ -4647,16 +3750,31 @@ mod tests {
         live_capture_telemetry_path_candidates, live_stream_chunk_queue_telemetry,
         live_stream_vad_thresholds_per_mille, live_terminal_render_actions, materialize_out_wav,
         merge_channel_vad_boundaries, merge_transcript_events, model_checksum_info,
-        parse_args_from, parse_replay_transcript_event, parse_trust_notice, reconstruct_transcript,
-        reconstruct_transcript_per_channel, remediation_hints_csv, replay_timeline,
+        parse_args_from, parse_replay_transcript_event, parse_replay_trust_notice,
+        reconstruct_transcript, reconstruct_transcript_per_channel, replay_timeline,
         resolve_backend_program, resolve_model_path, run_cleanup_queue_with, run_live_chunk_queue,
         run_streaming_capture_session, runtime_mode_compatibility_matrix,
-        select_runtime_execution_branch, top_remediation_hints,
-        transcript_events_from_runtime_output_events, write_preflight_manifest,
-        write_runtime_jsonl, write_runtime_manifest,
+        select_runtime_execution_branch, transcript_events_from_runtime_output_events,
+        write_preflight_manifest, write_runtime_jsonl, write_runtime_manifest, AsrBackend,
+        AsrWorkClass, AsrWorkItem, BenchmarkSummary, CaptureChunk, CaptureEvent, CaptureSink,
+        ChannelMode, ChannelVadBoundary, CheckStatus, CleanupAttemptOutcome, CleanupQueueTelemetry,
+        CleanupTaskStatus, CollectingRuntimeOutputSink, FinalBufferingTelemetry,
+        HotPathDiagnostics, IncrementalVadTracker, LiveAsrExecutor, LiveAsrJob, LiveAsrJobClass,
+        LiveAsrPoolConfig, LiveAsrPoolTelemetry, LiveAsrRequest, LiveCaptureCallbackMode,
+        LiveCaptureConfig, LiveCaptureSampleRateMismatchPolicy, LiveChunkQueueTelemetry,
+        LiveLifecyclePhase, LiveLifecycleTelemetry, LiveRunReport, ModeDegradationEvent,
+        ParseOutcome, PreflightCheck, PreflightReport, ReconciliationMatrix, ResolvedModelPath,
+        RuntimeExecutionBranch, RuntimeJsonlStream, RuntimeOutputSink, TempAudioPolicy,
+        TerminalRenderActionKind, TerminalRenderMode, TranscribeConfig, TranscriptEvent,
+        VadBoundary, HELP_TEXT, LIVE_CAPTURE_CALLBACK_CONTRACT_DEGRADED_CODE,
+        LIVE_CAPTURE_CONTINUITY_UNVERIFIED_CODE, LIVE_CAPTURE_INTERRUPTION_RECOVERED_CODE,
+        LIVE_CAPTURE_TRANSPORT_DEGRADED_CODE, LIVE_CHUNK_QUEUE_BACKPRESSURE_SEVERE_CODE,
+        LIVE_CHUNK_QUEUE_DROP_OLDEST_CODE, RECONCILIATION_APPLIED_CODE,
+        REPLAY_JSONL_MAX_LINE_BYTES, REPLAY_TRANSCRIPT_TEXT_MAX_BYTES,
     };
     use hound::{SampleFormat, WavSpec, WavWriter};
     use recordit::live_stream_runtime::{
+        BackpressureMode, BackpressureTransition, BackpressureTransitionReason,
         LiveAsrJobClass as RuntimeAsrJobClass, LiveAsrJobSpec as RuntimeAsrJobSpec,
         LiveAsrResult as RuntimeAsrResult, LiveRuntimePhase, LiveRuntimeSummary,
         RuntimeOutputEvent,
@@ -4681,8 +3799,12 @@ mod tests {
             Ok(())
         }
 
-        fn transcribe(&self, audio_path: &Path) -> Result<String, String> {
+        fn transcribe(&self, request: &LiveAsrRequest) -> Result<String, String> {
             self.transcribe_calls.fetch_add(1, Ordering::Relaxed);
+            let audio_path = request
+                .audio_input
+                .as_path()
+                .ok_or_else(|| "mock executor requires path-backed input".to_string())?;
             if self.sleep_ms > 0 {
                 std::thread::sleep(Duration::from_millis(self.sleep_ms));
             }
@@ -4739,6 +3861,7 @@ mod tests {
         assert!(HELP_TEXT.contains("--chunk-queue-cap"));
         assert!(HELP_TEXT.contains("--live-asr-workers"));
         assert!(HELP_TEXT.contains("--keep-temp-audio"));
+        assert!(HELP_TEXT.contains("--disable-adaptive-backpressure"));
     }
 
     #[test]
@@ -4760,11 +3883,9 @@ mod tests {
     fn runtime_mode_compatibility_matrix_includes_live_stream_implemented_row() {
         let matrix = runtime_mode_compatibility_matrix();
         assert_eq!(matrix.len(), 3);
-        assert!(
-            matrix
-                .iter()
-                .any(|row| row.taxonomy_mode == "live-stream" && row.status == "implemented")
-        );
+        assert!(matrix
+            .iter()
+            .any(|row| row.taxonomy_mode == "live-stream" && row.status == "implemented"));
     }
 
     #[test]
@@ -4815,10 +3936,9 @@ mod tests {
         ];
         match parse_args_from(args.into_iter()) {
             Ok(_) => panic!("expected parse failure"),
-            Err(err) => assert!(
-                err.to_string()
-                    .contains("require `--live-chunked` or `--live-stream`")
-            ),
+            Err(err) => assert!(err
+                .to_string()
+                .contains("require `--live-chunked` or `--live-stream`")),
         }
     }
 
@@ -4831,10 +3951,9 @@ mod tests {
         ];
         match parse_args_from(args.into_iter()) {
             Ok(_) => panic!("expected parse failure"),
-            Err(err) => assert!(
-                err.to_string()
-                    .contains("cannot be combined with `--replay-jsonl`")
-            ),
+            Err(err) => assert!(err
+                .to_string()
+                .contains("cannot be combined with `--replay-jsonl`")),
         }
     }
 
@@ -4847,10 +3966,9 @@ mod tests {
         ];
         match parse_args_from(args.into_iter()) {
             Ok(_) => panic!("expected parse failure"),
-            Err(err) => assert!(
-                err.to_string()
-                    .contains("cannot be combined with `--replay-jsonl`")
-            ),
+            Err(err) => assert!(err
+                .to_string()
+                .contains("cannot be combined with `--replay-jsonl`")),
         }
     }
 
@@ -4873,10 +3991,9 @@ mod tests {
         let args = vec!["--live-stream".to_string(), "--live-chunked".to_string()];
         match parse_args_from(args.into_iter()) {
             Ok(_) => panic!("expected parse failure"),
-            Err(err) => assert!(
-                err.to_string()
-                    .contains("cannot be combined with `--live-chunked`")
-            ),
+            Err(err) => assert!(err
+                .to_string()
+                .contains("cannot be combined with `--live-chunked`")),
         }
     }
 
@@ -4946,6 +4063,32 @@ mod tests {
                 assert_eq!(config.live_asr_workers, 3);
                 assert!(config.keep_temp_audio);
             }
+        }
+    }
+
+    #[test]
+    fn parse_accepts_live_kill_switch_flag() {
+        let args = vec![
+            "--live-stream".to_string(),
+            "--disable-adaptive-backpressure".to_string(),
+        ];
+        match parse_args_from(args.into_iter()).unwrap() {
+            ParseOutcome::Help => panic!("expected config parse outcome"),
+            ParseOutcome::Config(config) => {
+                assert!(config.live_stream);
+                assert!(!config.adaptive_backpressure_enabled);
+            }
+        }
+    }
+
+    #[test]
+    fn parse_rejects_kill_switch_without_live_mode() {
+        let args = vec!["--disable-adaptive-backpressure".to_string()];
+        match parse_args_from(args.into_iter()) {
+            Ok(_) => panic!("expected parse failure"),
+            Err(err) => assert!(err
+                .to_string()
+                .contains("requires `--live-chunked` or `--live-stream`")),
         }
     }
 
@@ -5068,10 +4211,9 @@ mod tests {
         ];
         match parse_args_from(args.into_iter()) {
             Ok(_) => panic!("expected parse failure"),
-            Err(err) => assert!(
-                err.to_string()
-                    .contains("`--model-doctor` cannot be combined with `--replay-jsonl`")
-            ),
+            Err(err) => assert!(err
+                .to_string()
+                .contains("`--model-doctor` cannot be combined with `--replay-jsonl`")),
         }
     }
 
@@ -5080,24 +4222,23 @@ mod tests {
         let args = vec!["--model-doctor".to_string(), "--preflight".to_string()];
         match parse_args_from(args.into_iter()) {
             Ok(_) => panic!("expected parse failure"),
-            Err(err) => assert!(
-                err.to_string()
-                    .contains("`--model-doctor` cannot be combined with `--preflight`")
-            ),
+            Err(err) => assert!(err
+                .to_string()
+                .contains("`--model-doctor` cannot be combined with `--preflight`")),
         }
     }
 
     #[test]
-    fn extract_json_string_field_accepts_whitespace_after_colon() {
+    fn cleanup_content_parser_accepts_whitespace_after_colon() {
         let payload = "{\"choices\":[{\"message\":{\"content\": \"cleaned local segment\"}}]}";
-        let parsed = super::extract_json_string_field(payload, "content");
+        let parsed = super::cleanup_content_from_response(payload);
         assert_eq!(parsed.as_deref(), Some("cleaned local segment"));
     }
 
     #[test]
     fn trust_notice_parser_reads_replay_context() {
         let line = "{\"event_type\":\"trust_notice\",\"channel\":\"control\",\"code\":\"mode_degradation\",\"severity\":\"warn\",\"cause\":\"requested mixed-fallback but input had 1 channel\",\"impact\":\"channel attribution reduced\",\"guidance\":\"use stereo input\"}";
-        let notice = parse_trust_notice(line).unwrap();
+        let notice = parse_replay_trust_notice(line, 1).unwrap().unwrap();
         assert_eq!(notice.code, "mode_degradation");
         assert_eq!(notice.severity, "warn");
         assert_eq!(notice.impact, "channel attribution reduced");
@@ -5122,6 +4263,52 @@ mod tests {
     }
 
     #[test]
+    fn replay_parser_reports_transcript_payload_mismatch_with_line_context() {
+        let line =
+            "{\"event_type\":\"partial\",\"channel\":\"mic\",\"segment_id\":\"mic-chunk-0000\"}";
+        let err = parse_replay_transcript_event(line, 42).unwrap_err();
+        let rendered = err.to_string();
+        assert!(rendered.contains("invalid replay line 42"));
+        assert!(rendered.contains("[payload_mismatch]"));
+        assert!(rendered.contains("event_type `partial` payload mismatch"));
+        assert!(rendered.contains("missing field"));
+    }
+
+    #[test]
+    fn replay_parser_reports_trust_notice_payload_mismatch_with_line_context() {
+        let line = "{\"event_type\":\"trust_notice\",\"channel\":\"control\",\"code\":\"mode_degradation\"}";
+        let err = parse_replay_trust_notice(line, 7).unwrap_err();
+        let rendered = err.to_string();
+        assert!(rendered.contains("invalid replay line 7"));
+        assert!(rendered.contains("[payload_mismatch]"));
+        assert!(rendered.contains("event_type `trust_notice` payload mismatch"));
+    }
+
+    #[test]
+    fn replay_parser_rejects_oversized_line_with_reason_category() {
+        let oversized = "x".repeat(REPLAY_JSONL_MAX_LINE_BYTES + 1);
+        let line = format!(
+            "{{\"event_type\":\"partial\",\"segment_id\":\"s\",\"start_ms\":0,\"end_ms\":1,\"text\":\"{oversized}\"}}"
+        );
+        let err = parse_replay_transcript_event(&line, 9).unwrap_err();
+        let rendered = err.to_string();
+        assert!(rendered.contains("invalid replay line 9"));
+        assert!(rendered.contains("[line_too_large]"));
+    }
+
+    #[test]
+    fn replay_parser_rejects_oversized_transcript_text_with_reason_category() {
+        let oversized_text = "x".repeat(REPLAY_TRANSCRIPT_TEXT_MAX_BYTES + 1);
+        let line = format!(
+            "{{\"event_type\":\"partial\",\"segment_id\":\"s\",\"start_ms\":0,\"end_ms\":1,\"text\":\"{oversized_text}\"}}"
+        );
+        let err = parse_replay_transcript_event(&line, 11).unwrap_err();
+        let rendered = err.to_string();
+        assert!(rendered.contains("invalid replay line 11"));
+        assert!(rendered.contains("[text_too_large]"));
+    }
+
+    #[test]
     fn trust_notice_builder_emits_mode_and_cleanup_notices() {
         let config = TranscribeConfig::default();
         let mut cleanup = CleanupQueueTelemetry::disabled(&config);
@@ -5143,26 +4330,18 @@ mod tests {
             &chunk_queue,
         );
 
-        assert!(
-            notices
-                .iter()
-                .any(|notice| notice.code == "mode_degradation")
-        );
-        assert!(
-            notices
-                .iter()
-                .any(|notice| notice.code == "cleanup_queue_drop")
-        );
-        assert!(
-            notices
-                .iter()
-                .any(|notice| notice.code == "cleanup_processing_failure")
-        );
-        assert!(
-            notices
-                .iter()
-                .any(|notice| notice.code == "cleanup_drain_incomplete")
-        );
+        assert!(notices
+            .iter()
+            .any(|notice| notice.code == "mode_degradation"));
+        assert!(notices
+            .iter()
+            .any(|notice| notice.code == "cleanup_queue_drop"));
+        assert!(notices
+            .iter()
+            .any(|notice| notice.code == "cleanup_processing_failure"));
+        assert!(notices
+            .iter()
+            .any(|notice| notice.code == "cleanup_drain_incomplete"));
     }
 
     #[test]
@@ -5182,11 +4361,9 @@ mod tests {
             &chunk_queue,
         );
 
-        assert!(
-            notices
-                .iter()
-                .any(|notice| notice.code == "continuity_recovered_with_gaps")
-        );
+        assert!(notices
+            .iter()
+            .any(|notice| notice.code == "continuity_recovered_with_gaps"));
     }
 
     #[test]
@@ -5210,11 +4387,9 @@ mod tests {
             .find(|notice| notice.code == "continuity_unverified")
             .expect("expected continuity_unverified trust notice");
         assert_eq!(notice.severity, "warn");
-        assert!(
-            notice
-                .guidance
-                .contains("Ensure capture telemetry is writable/readable")
-        );
+        assert!(notice
+            .guidance
+            .contains("Ensure capture telemetry is writable/readable"));
     }
 
     #[test]
@@ -5788,16 +4963,12 @@ mod tests {
 
         assert_eq!(finals.len(), 1);
         assert_eq!(finals[0].segment_id, "mic-segment-0000-0-2600");
-        assert!(
-            partial_ids
-                .iter()
-                .any(|id| id == "mic-segment-0000-partial-0000-0-2000")
-        );
-        assert!(
-            partial_ids
-                .iter()
-                .any(|id| id == "mic-segment-0000-partial-0001-500-2500")
-        );
+        assert!(partial_ids
+            .iter()
+            .any(|id| id == "mic-segment-0000-partial-0000-0-2000"));
+        assert!(partial_ids
+            .iter()
+            .any(|id| id == "mic-segment-0000-partial-0001-500-2500"));
         assert!(partial_ids.iter().any(|id| id == "mic-segment-0000-0-2600"));
     }
 
@@ -5857,11 +5028,9 @@ mod tests {
         let events = collect_live_capture_continuity_events(&config);
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].code, "live_capture_interruption_recovered");
-        assert!(
-            events[0]
-                .detail
-                .contains("2 stream interruption restart(s)")
-        );
+        assert!(events[0]
+            .detail
+            .contains("2 stream interruption restart(s)"));
 
         let _ = fs::remove_file(input_wav);
         let _ = fs::remove_file(telemetry_path);
@@ -5999,14 +5168,20 @@ mod tests {
         ];
 
         let events = transcript_events_from_runtime_output_events(&config, &runtime_events);
-        assert_eq!(events.len(), 3);
+        assert_eq!(events.len(), 4);
         assert_eq!(events[0].event_type, "partial");
         assert_eq!(events[0].channel, config.speaker_labels.mic);
-        assert_eq!(events[1].event_type, "final");
+        assert_eq!(events[1].event_type, "partial");
         assert_eq!(events[1].channel, config.speaker_labels.system);
-        assert_eq!(events[2].event_type, "reconciled_final");
-        assert_eq!(events[2].segment_id, "seg-c-reconciled");
-        assert_eq!(events[2].source_final_segment_id.as_deref(), Some("seg-c"));
+        assert_eq!(events[1].segment_id, "seg-b");
+        assert_eq!(events[1].start_ms, 500);
+        assert_eq!(events[1].end_ms, 750);
+        assert_eq!(events[1].text, "final text");
+        assert_eq!(events[2].event_type, "final");
+        assert_eq!(events[2].channel, config.speaker_labels.system);
+        assert_eq!(events[3].event_type, "reconciled_final");
+        assert_eq!(events[3].segment_id, "seg-c-reconciled");
+        assert_eq!(events[3].source_final_segment_id.as_deref(), Some("seg-c"));
     }
 
     #[test]
@@ -6027,6 +5202,8 @@ mod tests {
             pending_final_jobs: 0,
             shutdown_abandoned_jobs: 0,
             shutdown_abandoned_final_jobs: 0,
+            backpressure_mode: BackpressureMode::Normal,
+            backpressure_transitions: Vec::new(),
         };
         let pool = LiveAsrPoolTelemetry {
             prewarm_ok: true,
@@ -6061,16 +5238,12 @@ mod tests {
 
         let candidates = live_capture_telemetry_path_candidates(&config);
         assert_eq!(candidates.len(), 2);
-        assert!(
-            candidates[0]
-                .to_string_lossy()
-                .ends_with("artifacts/live-output.telemetry.json")
-        );
-        assert!(
-            candidates[1]
-                .to_string_lossy()
-                .ends_with("artifacts/live-input.telemetry.json")
-        );
+        assert!(candidates[0]
+            .to_string_lossy()
+            .ends_with("artifacts/live-output.telemetry.json"));
+        assert!(candidates[1]
+            .to_string_lossy()
+            .ends_with("artifacts/live-input.telemetry.json"));
     }
 
     #[test]
@@ -6494,6 +5667,7 @@ mod tests {
             final_buffering: FinalBufferingTelemetry::default(),
             chunk_queue: LiveChunkQueueTelemetry::disabled(&config),
             cleanup_queue: CleanupQueueTelemetry::disabled(&config),
+            hot_path_diagnostics: HotPathDiagnostics::default(),
             benchmark: BenchmarkSummary {
                 run_count: 1,
                 wall_ms_p50: 1.0,
@@ -6523,10 +5697,225 @@ mod tests {
                 "trust_notices",
                 "degradation_events",
                 "cleanup_queue",
+                "diagnostics_transport",
+                "diagnostics_scratch",
+                "diagnostics_backpressure",
+                "diagnostics_pump",
                 "artifacts",
             ]
         );
         assert!(lines[0].contains("degraded"));
+    }
+
+    #[test]
+    fn hot_path_diagnostics_builder_covers_all_control_surfaces() {
+        let mut config = TranscribeConfig::default();
+        config.live_stream = true;
+        config.live_asr_workers = 2;
+
+        let events = vec![
+            TranscriptEvent {
+                event_type: "partial",
+                channel: "mic".to_string(),
+                segment_id: "mic-0".to_string(),
+                start_ms: 0,
+                end_ms: 200,
+                text: "hel".to_string(),
+                source_final_segment_id: None,
+            },
+            final_event("mic-0", "mic", "hello"),
+            final_event("sys-0", "system", "world"),
+        ];
+        let channel_transcripts = vec![
+            super::ChannelTranscriptSummary {
+                role: "mic",
+                label: "mic".to_string(),
+                text: "hello".to_string(),
+            },
+            super::ChannelTranscriptSummary {
+                role: "system",
+                label: "system".to_string(),
+                text: "world".to_string(),
+            },
+        ];
+        let chunk_queue = LiveChunkQueueTelemetry {
+            enabled: true,
+            max_queue: 4,
+            submitted: 10,
+            enqueued: 10,
+            dropped_oldest: 3,
+            processed: 8,
+            pending: 2,
+            high_water: 4,
+            drain_completed: false,
+            lag_sample_count: 0,
+            lag_p50_ms: 0,
+            lag_p95_ms: 0,
+            lag_max_ms: 0,
+        };
+        let runtime_summary = LiveRuntimeSummary {
+            final_phase: LiveRuntimePhase::Shutdown,
+            ready_for_transcripts: true,
+            transition_count: 4,
+            capture_chunks_seen: 20,
+            capture_events_seen: 3,
+            asr_jobs_queued: 10,
+            asr_results_emitted: 8,
+            pending_jobs: 2,
+            pending_final_jobs: 1,
+            shutdown_abandoned_jobs: 0,
+            shutdown_abandoned_final_jobs: 0,
+            backpressure_mode: BackpressureMode::Pressure,
+            backpressure_transitions: vec![BackpressureTransition {
+                from_mode: BackpressureMode::Normal,
+                to_mode: BackpressureMode::Pressure,
+                observed_at_ms: 4_000,
+                reason: BackpressureTransitionReason::PendingJobsSustained,
+                detail: "entered pressure mode".to_string(),
+            }],
+        };
+        let asr_worker_pool = LiveAsrPoolTelemetry {
+            prewarm_ok: true,
+            submitted: 10,
+            enqueued: 10,
+            dropped_queue_full: 2,
+            processed: 8,
+            succeeded: 7,
+            failed: 1,
+            retry_attempts: 2,
+            temp_audio_retained: 0,
+            temp_audio_deleted: 0,
+        };
+
+        let diagnostics = build_hot_path_diagnostics(
+            &config,
+            &events,
+            &channel_transcripts,
+            &chunk_queue,
+            &runtime_summary,
+            &asr_worker_pool,
+        );
+
+        assert_eq!(diagnostics.transport.path_requests, 0);
+        assert_eq!(diagnostics.transport.pcm_window_requests, 10);
+        assert_eq!(diagnostics.scratch.worker_scratch_paths_upper_bound, 2);
+        assert_eq!(diagnostics.scratch.write_attempts_estimate, 10);
+        assert_eq!(diagnostics.scratch.reuse_overwrites_estimate, 8);
+        assert!(diagnostics.scratch.retained_for_review_hint);
+        assert_eq!(diagnostics.backpressure.mode, BackpressureMode::Pressure);
+        assert_eq!(diagnostics.backpressure.transition_count, 1);
+        assert_eq!(
+            diagnostics.backpressure.last_transition_reason,
+            Some(BackpressureTransitionReason::PendingJobsSustained)
+        );
+        assert_eq!(diagnostics.backpressure.pending_jobs, 2);
+        assert_eq!(diagnostics.backpressure.pending_final_jobs, 1);
+        assert_eq!(diagnostics.backpressure.channel_snapshots.len(), 2);
+        assert_eq!(
+            diagnostics
+                .backpressure
+                .channel_snapshots
+                .iter()
+                .map(|snapshot| snapshot.pending_estimate)
+                .sum::<usize>(),
+            2
+        );
+        assert_eq!(diagnostics.pump.chunk_decisions, 20);
+        assert_eq!(diagnostics.pump.forced_capture_event_triggers, 3);
+        assert_eq!(diagnostics.pump.forced_shutdown_triggers, 4);
+        assert_eq!(diagnostics.pump.forced_decisions, 7);
+    }
+
+    #[test]
+    fn runtime_failure_breadcrumbs_include_artifact_paths_and_hot_path_counters() {
+        let mut config = TranscribeConfig::default();
+        config.out_wav = PathBuf::from("artifacts/test.session.wav");
+        config.out_jsonl = PathBuf::from("artifacts/test.runtime.jsonl");
+        config.out_manifest = PathBuf::from("artifacts/test.runtime.manifest.json");
+        let report = LiveRunReport {
+            generated_at_utc: "2026-03-01T00:00:00Z".to_string(),
+            backend_id: "whispercpp",
+            resolved_model_path: PathBuf::from("models/test.bin"),
+            resolved_model_source: "test".to_string(),
+            channel_mode: ChannelMode::Separate,
+            active_channel_mode: ChannelMode::Separate,
+            transcript_text: "hello".to_string(),
+            channel_transcripts: vec![super::ChannelTranscriptSummary {
+                role: "mic",
+                label: "mic".to_string(),
+                text: "hello".to_string(),
+            }],
+            vad_boundaries: vec![VadBoundary {
+                id: 0,
+                start_ms: 0,
+                end_ms: 1_000,
+                source: "energy_threshold",
+            }],
+            events: vec![final_event("mic-0", "mic", "hello")],
+            degradation_events: Vec::new(),
+            trust_notices: Vec::new(),
+            lifecycle: sample_lifecycle(),
+            reconciliation: ReconciliationMatrix::none(),
+            asr_worker_pool: LiveAsrPoolTelemetry::default(),
+            final_buffering: FinalBufferingTelemetry::default(),
+            chunk_queue: LiveChunkQueueTelemetry::disabled(&config),
+            cleanup_queue: CleanupQueueTelemetry::disabled(&config),
+            hot_path_diagnostics: HotPathDiagnostics {
+                transport: super::TransportInputDiagnostics {
+                    path_requests: 0,
+                    pcm_window_requests: 4,
+                },
+                scratch: super::ScratchLifecycleDiagnostics {
+                    worker_scratch_paths_upper_bound: 2,
+                    write_attempts_estimate: 4,
+                    reuse_overwrites_estimate: 2,
+                    retained_for_review_hint: false,
+                },
+                backpressure: super::BackpressureDiagnostics {
+                    mode: BackpressureMode::Pressure,
+                    transition_count: 1,
+                    last_transition_reason: Some(
+                        BackpressureTransitionReason::PendingJobsSustained,
+                    ),
+                    pending_jobs: 0,
+                    pending_final_jobs: 0,
+                    channel_snapshots: Vec::new(),
+                },
+                pump: super::PumpCadenceDiagnostics {
+                    chunk_decisions: 10,
+                    forced_decisions: 6,
+                    forced_capture_event_triggers: 2,
+                    forced_shutdown_triggers: 4,
+                },
+            },
+            benchmark: BenchmarkSummary {
+                run_count: 1,
+                wall_ms_p50: 1.0,
+                wall_ms_p95: 1.0,
+                partial_slo_met: true,
+                final_slo_met: true,
+            },
+            benchmark_summary_csv: PathBuf::from("artifacts/summary.csv"),
+            benchmark_runs_csv: PathBuf::from("artifacts/runs.csv"),
+        };
+
+        let breadcrumbs = runtime_failure_breadcrumbs(&config, &report);
+        assert!(
+            breadcrumbs.contains("artifacts/test.runtime.jsonl"),
+            "expected JSONL path in breadcrumbs: {breadcrumbs}"
+        );
+        assert!(
+            breadcrumbs.contains("pcm_window:4"),
+            "expected transport counters in breadcrumbs: {breadcrumbs}"
+        );
+        assert!(
+            breadcrumbs.contains("mode:pressure"),
+            "expected backpressure mode in breadcrumbs: {breadcrumbs}"
+        );
+        assert!(
+            breadcrumbs.contains("forced_decisions:6"),
+            "expected pump counters in breadcrumbs: {breadcrumbs}"
+        );
     }
 
     #[test]
@@ -6634,6 +6023,7 @@ mod tests {
             final_buffering: FinalBufferingTelemetry::default(),
             chunk_queue: LiveChunkQueueTelemetry::disabled(&config),
             cleanup_queue: CleanupQueueTelemetry::disabled(&config),
+            hot_path_diagnostics: HotPathDiagnostics::default(),
             benchmark: BenchmarkSummary {
                 run_count: 1,
                 wall_ms_p50: 1.0,
@@ -6758,16 +6148,12 @@ mod tests {
         );
 
         assert!(!reconciliation.is_empty());
-        assert!(
-            reconciliation
-                .iter()
-                .all(|event| event.event_type == "reconciled_final")
-        );
-        assert!(
-            reconciliation
-                .iter()
-                .all(|event| event.segment_id.ends_with("-reconciled"))
-        );
+        assert!(reconciliation
+            .iter()
+            .all(|event| event.event_type == "reconciled_final"));
+        assert!(reconciliation
+            .iter()
+            .all(|event| event.segment_id.ends_with("-reconciled")));
     }
 
     #[test]
@@ -6902,11 +6288,9 @@ mod tests {
         );
 
         assert_eq!(events.len(), 2);
-        assert!(
-            events
-                .iter()
-                .all(|event| event.event_type == "reconciled_final")
-        );
+        assert!(events
+            .iter()
+            .all(|event| event.event_type == "reconciled_final"));
         assert!(events.iter().all(|event| event.start_ms == 1_700));
         let lineage = events
             .iter()
@@ -6992,18 +6376,14 @@ mod tests {
         let merged = merge_transcript_events(merged);
         let reconciled_text = reconstruct_transcript(&merged);
 
-        assert!(
-            merged
-                .iter()
-                .any(|event| event.event_type == "reconciled_final")
-        );
+        assert!(merged
+            .iter()
+            .any(|event| event.event_type == "reconciled_final"));
         assert!(merged.iter().any(|event| event.event_type == "final"));
-        assert!(
-            merged
-                .iter()
-                .filter(|event| event.event_type == "reconciled_final")
-                .all(|event| event.source_final_segment_id.is_some())
-        );
+        assert!(merged
+            .iter()
+            .filter(|event| event.event_type == "reconciled_final")
+            .all(|event| event.source_final_segment_id.is_some()));
         assert!(reconciled_text.len() >= baseline_text.len());
         assert!(reconciled_text.contains("mic complete transcript"));
         assert!(reconciled_text.contains("system complete transcript"));
@@ -7623,6 +7003,7 @@ mod tests {
             final_buffering: FinalBufferingTelemetry::default(),
             chunk_queue,
             cleanup_queue: CleanupQueueTelemetry::disabled(&config),
+            hot_path_diagnostics: HotPathDiagnostics::default(),
             benchmark: BenchmarkSummary {
                 run_count: 1,
                 wall_ms_p50: 1.0,
@@ -7636,59 +7017,208 @@ mod tests {
 
         write_runtime_manifest(&config, &report).unwrap();
         let manifest = fs::read_to_string(&out_manifest).unwrap();
-        assert!(manifest.contains("\"events\": ["));
-        assert!(manifest.contains("\"event_type\":\"final\""));
-        assert!(manifest.contains("\"segment_id\":\"mic-0\""));
-        assert!(
-            manifest
-                .contains("\"input_wav_semantics\": \"representative offline fixture input path\"")
+        let parsed: Value = serde_json::from_str(&manifest).unwrap();
+        assert_eq!(
+            parsed.get("runtime_mode").and_then(Value::as_str),
+            Some("representative-offline")
         );
-        assert!(manifest.contains("\"out_wav_materialized\": true"));
-        assert!(manifest.contains("\"out_wav_bytes\": 0"));
-        assert!(manifest.contains("\"runtime_mode\": \"representative-offline\""));
-        assert!(manifest.contains("\"runtime_mode_taxonomy\": \"representative-offline\""));
-        assert!(manifest.contains("\"runtime_mode_selector\": \"<default>\""));
-        assert!(manifest.contains("\"runtime_mode_status\": \"implemented\""));
-        assert!(manifest.contains("\"lifecycle\": {"));
-        assert!(manifest.contains("\"current_phase\":\"shutdown\""));
-        assert!(manifest.contains("\"phase\":\"warmup\""));
-        assert!(manifest.contains("\"phase\":\"active\""));
-        assert!(manifest.contains("\"phase\":\"draining\""));
-        assert!(manifest.contains("\"phase\":\"shutdown\""));
-        assert!(manifest.contains("\"reconciliation\": {"));
-        assert!(manifest.contains("\"asr_worker_pool\": {"));
-        assert!(manifest.contains("\"temp_audio_deleted\":1"));
-        assert!(manifest.contains("\"temp_audio_retained\":1"));
-        assert!(manifest.contains("\"terminal_summary\": {"));
-        assert!(manifest.contains("\"render_mode\":\"deterministic-non-tty\""));
-        assert!(manifest.contains("\"stable_line_policy\":\"final-only\""));
-        assert!(manifest.contains("\"stable_line_count\":1"));
-        assert!(manifest.contains("\"stable_lines_replayed\":false"));
-        assert!(manifest.contains("\"first_emit_timing_ms\": {"));
-        assert!(manifest.contains("\"first_any\":100"));
-        assert!(manifest.contains("\"first_partial\":null"));
-        assert!(manifest.contains("\"first_final\":100"));
-        assert!(manifest.contains("\"first_stable\":100"));
-        assert!(manifest.contains("\"queue_defer\": {"));
-        assert!(manifest.contains("\"deferred_final_submissions\":0"));
-        assert!(manifest.contains("\"ordering_metadata\": {"));
-        assert!(manifest.contains("\"event_sort_key\":\"start_ms,end_ms,event_type,channel,segment_id,source_final_segment_id,text\""));
-        assert!(manifest.contains("\"event_counts\": {"));
-        assert!(manifest.contains("\"partial\":0"));
-        assert!(manifest.contains("\"final\":1"));
-        assert!(manifest.contains("\"llm_final\":0"));
-        assert!(manifest.contains("\"reconciled_final\":0"));
-        assert!(manifest.contains("\"session_summary\": {"));
-        assert!(manifest.contains("\"session_status\":\"ok\""));
-        assert!(manifest.contains("\"duration_sec\":10"));
-        assert!(manifest.contains("\"transcript_events\":{"));
-        assert!(manifest.contains("\"trust_notices\":{\"count\":0"));
-        assert!(manifest.contains("\"degradation_events\":{\"count\":0"));
-        assert!(manifest.contains("\"artifacts\":{\"out_wav\":"));
-        assert!(manifest.contains("\"lag_sample_count\":4"));
-        assert!(manifest.contains("\"lag_p50_ms\":1000"));
-        assert!(manifest.contains("\"lag_p95_ms\":2000"));
-        assert!(manifest.contains("\"lag_max_ms\":2000"));
+        assert_eq!(
+            parsed.get("runtime_mode_taxonomy").and_then(Value::as_str),
+            Some("representative-offline")
+        );
+        assert_eq!(
+            parsed.get("runtime_mode_selector").and_then(Value::as_str),
+            Some("<default>")
+        );
+        assert_eq!(
+            parsed.get("runtime_mode_status").and_then(Value::as_str),
+            Some("implemented")
+        );
+        assert_eq!(
+            parsed.get("input_wav_semantics").and_then(Value::as_str),
+            Some("representative offline fixture input path")
+        );
+        assert_eq!(
+            parsed.get("out_wav_materialized").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(parsed.get("out_wav_bytes").and_then(Value::as_u64), Some(0));
+        let events = parsed.get("events").and_then(Value::as_array).unwrap();
+        assert!(
+            events.iter().any(|event| {
+                event.get("event_type").and_then(Value::as_str) == Some("final")
+                    && event.get("segment_id").and_then(Value::as_str) == Some("mic-0")
+            }),
+            "expected final mic-0 event in manifest events"
+        );
+        let lifecycle = parsed.get("lifecycle").and_then(Value::as_object).unwrap();
+        assert_eq!(
+            lifecycle.get("current_phase").and_then(Value::as_str),
+            Some("shutdown")
+        );
+        let lifecycle_phases: Vec<&str> = lifecycle
+            .get("transitions")
+            .and_then(Value::as_array)
+            .unwrap()
+            .iter()
+            .filter_map(|entry| entry.get("phase").and_then(Value::as_str))
+            .collect();
+        assert_eq!(
+            lifecycle_phases,
+            vec!["warmup", "active", "draining", "shutdown"]
+        );
+        let asr_worker_pool = parsed
+            .get("asr_worker_pool")
+            .and_then(Value::as_object)
+            .unwrap();
+        assert_eq!(
+            asr_worker_pool
+                .get("temp_audio_deleted")
+                .and_then(Value::as_u64),
+            Some(1)
+        );
+        assert_eq!(
+            asr_worker_pool
+                .get("temp_audio_retained")
+                .and_then(Value::as_u64),
+            Some(1)
+        );
+        let terminal_summary = parsed
+            .get("terminal_summary")
+            .and_then(Value::as_object)
+            .unwrap();
+        assert_eq!(
+            terminal_summary.get("render_mode").and_then(Value::as_str),
+            Some("deterministic-non-tty")
+        );
+        assert_eq!(
+            terminal_summary
+                .get("stable_line_policy")
+                .and_then(Value::as_str),
+            Some("final-only")
+        );
+        assert_eq!(
+            terminal_summary
+                .get("stable_line_count")
+                .and_then(Value::as_u64),
+            Some(1)
+        );
+        assert_eq!(
+            terminal_summary
+                .get("stable_lines_replayed")
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+        let first_emit = parsed
+            .get("first_emit_timing_ms")
+            .and_then(Value::as_object)
+            .unwrap();
+        assert_eq!(
+            first_emit.get("first_any").and_then(Value::as_u64),
+            Some(100)
+        );
+        assert_eq!(first_emit.get("first_partial"), Some(&Value::Null));
+        assert_eq!(
+            first_emit.get("first_final").and_then(Value::as_u64),
+            Some(100)
+        );
+        assert_eq!(
+            first_emit.get("first_stable").and_then(Value::as_u64),
+            Some(100)
+        );
+        let queue_defer = parsed
+            .get("queue_defer")
+            .and_then(Value::as_object)
+            .unwrap();
+        assert_eq!(
+            queue_defer
+                .get("deferred_final_submissions")
+                .and_then(Value::as_u64),
+            Some(0)
+        );
+        let ordering_metadata = parsed
+            .get("ordering_metadata")
+            .and_then(Value::as_object)
+            .unwrap();
+        assert_eq!(
+            ordering_metadata
+                .get("event_sort_key")
+                .and_then(Value::as_str),
+            Some("start_ms,end_ms,event_type,channel,segment_id,source_final_segment_id,text")
+        );
+        let event_counts = parsed
+            .get("event_counts")
+            .and_then(Value::as_object)
+            .unwrap();
+        assert_eq!(event_counts.get("partial").and_then(Value::as_u64), Some(0));
+        assert_eq!(event_counts.get("final").and_then(Value::as_u64), Some(1));
+        assert_eq!(
+            event_counts.get("llm_final").and_then(Value::as_u64),
+            Some(0)
+        );
+        assert_eq!(
+            event_counts.get("reconciled_final").and_then(Value::as_u64),
+            Some(0)
+        );
+        let session_summary = parsed
+            .get("session_summary")
+            .and_then(Value::as_object)
+            .unwrap();
+        assert_eq!(
+            session_summary
+                .get("session_status")
+                .and_then(Value::as_str),
+            Some("ok")
+        );
+        assert_eq!(
+            session_summary.get("duration_sec").and_then(Value::as_u64),
+            Some(10)
+        );
+        let transcript_events = session_summary
+            .get("transcript_events")
+            .and_then(Value::as_object)
+            .unwrap();
+        assert_eq!(
+            transcript_events.get("final").and_then(Value::as_u64),
+            Some(1)
+        );
+        let trust_notices = session_summary
+            .get("trust_notices")
+            .and_then(Value::as_object)
+            .unwrap();
+        assert_eq!(trust_notices.get("count").and_then(Value::as_u64), Some(0));
+        let degradation_events = session_summary
+            .get("degradation_events")
+            .and_then(Value::as_object)
+            .unwrap();
+        assert_eq!(
+            degradation_events.get("count").and_then(Value::as_u64),
+            Some(0)
+        );
+        let chunk_lag = session_summary
+            .get("chunk_lag")
+            .and_then(Value::as_object)
+            .unwrap();
+        assert_eq!(
+            chunk_lag.get("lag_sample_count").and_then(Value::as_u64),
+            Some(4)
+        );
+        assert_eq!(
+            chunk_lag.get("lag_p50_ms").and_then(Value::as_u64),
+            Some(1000)
+        );
+        assert_eq!(
+            chunk_lag.get("lag_p95_ms").and_then(Value::as_u64),
+            Some(2000)
+        );
+        assert_eq!(
+            chunk_lag.get("lag_max_ms").and_then(Value::as_u64),
+            Some(2000)
+        );
+        assert!(session_summary
+            .get("artifacts")
+            .and_then(Value::as_object)
+            .is_some());
 
         let _ = fs::remove_dir_all(temp_dir);
     }
@@ -7720,11 +7250,16 @@ mod tests {
         let manifest = fs::read_to_string(out_manifest).unwrap();
         let parsed: Value = serde_json::from_str(&manifest).unwrap();
         let config_obj = parsed.get("config").and_then(Value::as_object).unwrap();
-        assert!(manifest.contains("\"input_wav\": \""));
-        assert!(manifest.contains("tts_phrase.wav"));
-        assert!(manifest.contains(
-            "\"input_wav_semantics\": \"representative live scratch artifact mirrored from canonical out_wav after capture\""
-        ));
+        let input_wav = config_obj.get("input_wav").and_then(Value::as_str).unwrap();
+        assert!(input_wav.ends_with("tts_phrase.wav"));
+        assert_eq!(
+            config_obj
+                .get("input_wav_semantics")
+                .and_then(Value::as_str),
+            Some(
+                "representative live scratch artifact mirrored from canonical out_wav after capture"
+            )
+        );
         assert_eq!(
             parsed.get("runtime_mode").and_then(Value::as_str),
             Some("live-chunked")
@@ -7868,6 +7403,7 @@ mod tests {
                 final_buffering: FinalBufferingTelemetry::default(),
                 chunk_queue,
                 cleanup_queue: CleanupQueueTelemetry::disabled(&config),
+                hot_path_diagnostics: HotPathDiagnostics::default(),
                 benchmark: BenchmarkSummary {
                     run_count: 1,
                     wall_ms_p50: 1.0,
@@ -7884,24 +7420,55 @@ mod tests {
             replay_timeline(&out_jsonl).unwrap();
 
             let manifest = fs::read_to_string(out_manifest).unwrap();
-            assert!(manifest.contains(&format!("\"runtime_mode\": \"{runtime_mode}\"")));
-            assert!(manifest.contains(&format!(
-                "\"runtime_mode_taxonomy\": \"{runtime_taxonomy}\""
-            )));
-            assert!(manifest.contains(&format!(
-                "\"runtime_mode_selector\": \"{runtime_selector}\""
-            )));
-            assert!(manifest.contains("\"runtime_mode_status\": \"implemented\""));
-            assert!(manifest.contains(&format!("\"live_mode\":{terminal_live_mode}")));
-            assert!(manifest.contains(&format!(
-                "\"stable_lines_replayed\":{stable_lines_replayed}"
-            )));
-            assert!(manifest.contains(&format!(
-                "\"input_wav_semantics\": \"{}\"",
-                expected_input_wav_semantics
-            )));
-            assert!(manifest.contains("\"event_type\":\"final\""));
-            assert!(manifest.contains("\"session_summary\": {"));
+            let parsed: Value = serde_json::from_str(&manifest).unwrap();
+            assert_eq!(
+                parsed.get("runtime_mode").and_then(Value::as_str),
+                Some(runtime_mode)
+            );
+            assert_eq!(
+                parsed.get("runtime_mode_taxonomy").and_then(Value::as_str),
+                Some(runtime_taxonomy)
+            );
+            assert_eq!(
+                parsed.get("runtime_mode_selector").and_then(Value::as_str),
+                Some(runtime_selector)
+            );
+            assert_eq!(
+                parsed.get("runtime_mode_status").and_then(Value::as_str),
+                Some("implemented")
+            );
+            let terminal_summary = parsed
+                .get("terminal_summary")
+                .and_then(Value::as_object)
+                .unwrap();
+            assert_eq!(
+                terminal_summary.get("live_mode").and_then(Value::as_bool),
+                Some(terminal_live_mode)
+            );
+            assert_eq!(
+                terminal_summary
+                    .get("stable_lines_replayed")
+                    .and_then(Value::as_bool),
+                Some(stable_lines_replayed)
+            );
+            assert_eq!(
+                parsed.get("input_wav_semantics").and_then(Value::as_str),
+                Some(expected_input_wav_semantics)
+            );
+            let has_final = parsed
+                .get("events")
+                .and_then(Value::as_array)
+                .unwrap()
+                .iter()
+                .any(|event| {
+                    event.get("event_type").and_then(Value::as_str)
+                        == Some(runtime_jsonl::EVENT_TYPE_FINAL)
+                });
+            assert!(has_final);
+            assert!(parsed
+                .get("session_summary")
+                .and_then(Value::as_object)
+                .is_some());
         }
 
         let _ = fs::remove_dir_all(temp_dir);
@@ -7972,6 +7539,7 @@ mod tests {
             final_buffering: FinalBufferingTelemetry::default(),
             chunk_queue,
             cleanup_queue: CleanupQueueTelemetry::disabled(&config),
+            hot_path_diagnostics: HotPathDiagnostics::default(),
             benchmark: BenchmarkSummary {
                 run_count: 1,
                 wall_ms_p50: 1.0,
@@ -8053,6 +7621,7 @@ mod tests {
             final_buffering: FinalBufferingTelemetry::default(),
             chunk_queue: LiveChunkQueueTelemetry::disabled(&config),
             cleanup_queue: CleanupQueueTelemetry::disabled(&config),
+            hot_path_diagnostics: HotPathDiagnostics::default(),
             benchmark: BenchmarkSummary {
                 run_count: 1,
                 wall_ms_p50: 1.0,
@@ -8125,6 +7694,7 @@ mod tests {
             final_buffering: FinalBufferingTelemetry::default(),
             chunk_queue: LiveChunkQueueTelemetry::disabled(&config),
             cleanup_queue: CleanupQueueTelemetry::disabled(&config),
+            hot_path_diagnostics: HotPathDiagnostics::default(),
             benchmark: BenchmarkSummary {
                 run_count: 1,
                 wall_ms_p50: 1.0,
@@ -8407,6 +7977,7 @@ mod tests {
             final_buffering: FinalBufferingTelemetry::default(),
             chunk_queue,
             cleanup_queue: CleanupQueueTelemetry::disabled(&config),
+            hot_path_diagnostics: HotPathDiagnostics::default(),
             benchmark: BenchmarkSummary {
                 run_count: 1,
                 wall_ms_p50: 1.0,
@@ -8434,18 +8005,33 @@ mod tests {
                 && line.contains("\"segment_id\":\"mic-reconciled-0000\"")
                 && line.contains("\"source_final_segment_id\":\"mic-chunk-0000-0-4000\"")
         }));
-        assert!(
-            jsonl
-                .lines()
-                .any(|line| line.contains("\"event_type\":\"chunk_queue\""))
-        );
+        assert!(jsonl
+            .lines()
+            .any(|line| line.contains("\"event_type\":\"chunk_queue\"")));
 
         let manifest = fs::read_to_string(&out_manifest).unwrap();
-        assert!(manifest.contains("\"events\": ["));
-        assert!(manifest.contains("\"event_type\":\"reconciled_final\""));
-        assert!(manifest.contains("\"source_final_segment_id\":\"mic-chunk-0000-0-4000\""));
-        assert!(manifest.contains("\"chunk_queue\": {"));
-        assert!(manifest.contains("\"jsonl_path\":"));
+        let parsed: Value = serde_json::from_str(&manifest).unwrap();
+        let reconciled = parsed
+            .get("events")
+            .and_then(Value::as_array)
+            .unwrap()
+            .iter()
+            .find(|event| {
+                event.get("event_type").and_then(Value::as_str)
+                    == Some(runtime_jsonl::EVENT_TYPE_RECONCILED_FINAL)
+            })
+            .unwrap();
+        assert_eq!(
+            reconciled
+                .get("source_final_segment_id")
+                .and_then(Value::as_str),
+            Some("mic-chunk-0000-0-4000")
+        );
+        assert!(parsed
+            .get("chunk_queue")
+            .and_then(Value::as_object)
+            .is_some());
+        assert!(parsed.get("jsonl_path").and_then(Value::as_str).is_some());
 
         replay_timeline(&out_jsonl).unwrap();
 

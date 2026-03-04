@@ -75,6 +75,10 @@ fn transcribe_live_declares_expected_module_seams() {
         "mod cli_parse;",
         "mod asr_backend;",
         "mod artifacts;",
+        "mod cleanup;",
+        "mod preflight;",
+        "mod reporting;",
+        "mod reconciliation;",
         "mod runtime_representative;",
         "mod runtime_live_stream;",
     ];
@@ -90,6 +94,10 @@ fn transcribe_live_declares_expected_module_seams() {
         "src/bin/transcribe_live/cli_parse.rs",
         "src/bin/transcribe_live/asr_backend.rs",
         "src/bin/transcribe_live/artifacts.rs",
+        "src/bin/transcribe_live/cleanup.rs",
+        "src/bin/transcribe_live/preflight.rs",
+        "src/bin/transcribe_live/reporting.rs",
+        "src/bin/transcribe_live/reconciliation.rs",
         "src/bin/transcribe_live/runtime_representative.rs",
         "src/bin/transcribe_live/runtime_live_stream.rs",
     ] {
@@ -111,6 +119,12 @@ fn transcribe_live_keeps_thin_wrapper_delegation_to_extracted_modules() {
         "runtime_representative::run_representative_offline_pipeline(config)",
         "runtime_representative::run_representative_chunked_pipeline(config)",
         "runtime_live_stream::run_live_stream_pipeline(config)",
+        "cleanup::run_cleanup_queue(config, events)",
+        "cleanup::run_cleanup_queue_with(config, events, invoke_cleanup)",
+        "cleanup::cleanup_content_from_response(stdout)",
+        "reconciliation::build_targeted_reconciliation_events(",
+        "reconciliation::build_reconciliation_matrix(vad_boundaries, degradation_events)",
+        "reporting::print_live_report(config, report, concise_only)",
         "artifacts::write_runtime_jsonl(config, report)",
         "artifacts::write_runtime_manifest(config, report)",
         "artifacts::write_preflight_manifest(config, report)",
@@ -163,6 +177,57 @@ fn extracted_modules_expose_expected_entrypoints() {
         live_stream.contains("pub(super) fn run_live_stream_pipeline"),
         "missing live-stream runtime entrypoint"
     );
+
+    let preflight = read_text(&root.join("src/bin/transcribe_live/preflight.rs"));
+    for symbol in [
+        "pub(super) fn run_preflight",
+        "pub(super) fn run_model_doctor",
+        "pub(super) fn print_preflight_report",
+        "pub(super) fn print_model_doctor_report",
+    ] {
+        assert!(
+            preflight.contains(symbol),
+            "missing preflight entrypoint: {symbol}"
+        );
+    }
+
+    let cleanup = read_text(&root.join("src/bin/transcribe_live/cleanup.rs"));
+    for symbol in [
+        "pub(super) fn run_cleanup_queue",
+        "pub(super) fn run_cleanup_queue_with",
+        "pub(super) fn cleanup_content_from_response",
+    ] {
+        assert!(
+            cleanup.contains(symbol),
+            "missing cleanup entrypoint: {symbol}"
+        );
+    }
+
+    let reporting = read_text(&root.join("src/bin/transcribe_live/reporting.rs"));
+    for symbol in [
+        "pub(super) fn runtime_failure_breadcrumbs",
+        "pub(super) fn top_remediation_hints",
+        "pub(super) fn remediation_hints_csv",
+        "pub(super) fn build_live_close_summary_lines",
+        "pub(super) fn print_live_report",
+    ] {
+        assert!(
+            reporting.contains(symbol),
+            "missing reporting entrypoint: {symbol}"
+        );
+    }
+
+    let reconciliation = read_text(&root.join("src/bin/transcribe_live/reconciliation.rs"));
+    for symbol in [
+        "pub(super) fn build_reconciliation_events",
+        "pub(super) fn build_targeted_reconciliation_events",
+        "pub(super) fn build_reconciliation_matrix",
+    ] {
+        assert!(
+            reconciliation.contains(symbol),
+            "missing reconciliation entrypoint: {symbol}"
+        );
+    }
 }
 
 #[test]

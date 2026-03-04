@@ -1,4 +1,5 @@
 use super::*;
+use recordit::live_asr_pool::LiveAsrAudioInput;
 
 struct LiveStreamRuntimeOutcome {
     output_events: Vec<RuntimeOutputEvent>,
@@ -9,7 +10,6 @@ struct LiveStreamRuntimeOutcome {
 struct LiveStreamRuntimeExecution {
     channel_mode: ChannelMode,
     speaker_labels: SpeakerLabels,
-    segment_dir: PathBuf,
     terminal_stream: LiveTerminalStream,
     coordinator: LiveStreamCoordinator<
         StreamingVadScheduler,
@@ -23,6 +23,7 @@ struct LiveStreamRuntimeExecution {
     next_job_id: usize,
     submitted_specs: HashMap<usize, RuntimeAsrJobSpec>,
     audio_by_channel: HashMap<String, RuntimeChannelAudio>,
+    pump_cadence: PumpCadenceController,
 }
 
 #[derive(Debug, Default)]
@@ -74,6 +75,116 @@ impl RuntimeChannelAudio {
             return Vec::new();
         }
         self.samples[start_index..end_index].to_vec()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PumpDecisionReason {
+    CadenceDue,
+    CadenceDeferred,
+    ForcedCaptureEvent,
+    ForcedPhaseTransition,
+    ForcedCaptureEnd,
+    ForcedFlush,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PumpDecision {
+    Run(PumpDecisionReason),
+    Skip(PumpDecisionReason),
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct PumpCadenceTelemetry {
+    cadence_ms: u64,
+    decisions: u64,
+    full_pumps: u64,
+    deferred_pumps: u64,
+    forced_pumps: u64,
+    last_reason: Option<PumpDecisionReason>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PumpCadenceController {
+    cadence_ms: u64,
+    next_due_pts_ms: Option<u64>,
+    fallback_pts_ms: u64,
+    telemetry: PumpCadenceTelemetry,
+}
+
+impl PumpCadenceController {
+    fn new(cadence_ms: u64) -> Self {
+        let cadence_ms = cadence_ms.max(1);
+        Self {
+            cadence_ms,
+            next_due_pts_ms: None,
+            fallback_pts_ms: 0,
+            telemetry: PumpCadenceTelemetry {
+                cadence_ms,
+                ..PumpCadenceTelemetry::default()
+            },
+        }
+    }
+
+    #[cfg(test)]
+    fn telemetry(&self) -> PumpCadenceTelemetry {
+        self.telemetry
+    }
+
+    fn on_chunk(&mut self, pts_ms: Option<u64>, phase: LiveRuntimePhase) -> PumpDecision {
+        self.telemetry.decisions += 1;
+        if phase != LiveRuntimePhase::Active {
+            self.next_due_pts_ms = None;
+            self.telemetry.full_pumps += 1;
+            self.telemetry.forced_pumps += 1;
+            self.telemetry.last_reason = Some(PumpDecisionReason::ForcedPhaseTransition);
+            return PumpDecision::Run(PumpDecisionReason::ForcedPhaseTransition);
+        }
+
+        let observed_pts_ms = self.normalize_pts_ms(pts_ms);
+        let should_run = self
+            .next_due_pts_ms
+            .map(|next_due| observed_pts_ms >= next_due)
+            .unwrap_or(true);
+        if should_run {
+            self.next_due_pts_ms = Some(observed_pts_ms.saturating_add(self.cadence_ms));
+            self.telemetry.full_pumps += 1;
+            self.telemetry.last_reason = Some(PumpDecisionReason::CadenceDue);
+            PumpDecision::Run(PumpDecisionReason::CadenceDue)
+        } else {
+            self.telemetry.deferred_pumps += 1;
+            self.telemetry.last_reason = Some(PumpDecisionReason::CadenceDeferred);
+            PumpDecision::Skip(PumpDecisionReason::CadenceDeferred)
+        }
+    }
+
+    fn force(&mut self, reason: PumpDecisionReason) -> PumpDecision {
+        self.telemetry.decisions += 1;
+        self.telemetry.full_pumps += 1;
+        self.telemetry.forced_pumps += 1;
+        self.telemetry.last_reason = Some(reason);
+        if matches!(
+            reason,
+            PumpDecisionReason::ForcedPhaseTransition
+                | PumpDecisionReason::ForcedCaptureEnd
+                | PumpDecisionReason::ForcedFlush
+        ) {
+            self.next_due_pts_ms = None;
+        }
+        PumpDecision::Run(reason)
+    }
+
+    fn normalize_pts_ms(&mut self, pts_ms: Option<u64>) -> u64 {
+        match pts_ms {
+            Some(ms) => {
+                self.fallback_pts_ms = self.fallback_pts_ms.max(ms);
+                ms
+            }
+            _ => {
+                self.fallback_pts_ms = self.fallback_pts_ms.saturating_add(self.cadence_ms);
+                self.fallback_pts_ms
+            }
+        }
     }
 }
 
@@ -158,11 +269,54 @@ pub(super) fn live_stream_vad_thresholds_per_mille(vad_threshold: f32) -> (u16, 
     (open, close)
 }
 
+fn live_stream_backpressure_config(
+    config: &TranscribeConfig,
+) -> recordit::live_stream_runtime::AdaptiveBackpressureConfig {
+    let mut backpressure = recordit::live_stream_runtime::AdaptiveBackpressureConfig::default();
+    if !config.adaptive_backpressure_enabled {
+        // Kill-switch path: keep scheduler in normal mode by making pressure thresholds unreachable.
+        backpressure.pressure_pending_jobs_threshold = u64::MAX;
+        backpressure.severe_pending_jobs_threshold = u64::MAX;
+        backpressure.severe_pending_final_jobs_threshold = u64::MAX;
+        backpressure.pressure_min_observations = usize::MAX;
+        backpressure.severe_min_observations = usize::MAX;
+        backpressure.pressure_stride_multiplier = 1;
+    }
+    backpressure
+}
+
+fn build_live_asr_request_for_spec(
+    channel_mode: ChannelMode,
+    speaker_labels: &SpeakerLabels,
+    channel_audio: &RuntimeChannelAudio,
+    job_id: usize,
+    spec: &RuntimeAsrJobSpec,
+) -> LiveAsrRequest {
+    let mut mono_samples = channel_audio.render_window(spec.start_ms, spec.end_ms);
+    if mono_samples.is_empty() {
+        // Keep zero-sample fallback semantics deterministic for empty windows.
+        mono_samples.push(0.0);
+    }
+    LiveAsrRequest {
+        job_id,
+        class: runtime_job_class_to_pool_job_class(spec.job_class),
+        role: runtime_channel_role(spec.channel.as_str()),
+        label: runtime_channel_label(channel_mode, speaker_labels, spec.channel.as_str()),
+        segment_id: spec.segment_id.clone(),
+        audio_input: LiveAsrAudioInput::pcm_window(
+            channel_audio.sample_rate_hz.max(1),
+            spec.start_ms,
+            spec.end_ms,
+            mono_samples,
+        ),
+    }
+}
+
 impl LiveStreamRuntimeExecution {
     fn new(
         config: &TranscribeConfig,
         resolved_model_path: &Path,
-        stamp: &str,
+        _stamp: &str,
     ) -> Result<Self, CliError> {
         let (open_threshold_per_mille, close_threshold_per_mille) =
             live_stream_vad_thresholds_per_mille(config.vad_threshold);
@@ -181,6 +335,7 @@ impl LiveStreamRuntimeExecution {
                 partial_window_ms: config.chunk_window_ms,
                 partial_stride_ms: config.chunk_stride_ms,
                 min_partial_span_ms: config.chunk_stride_ms.min(config.chunk_window_ms).max(1),
+                backpressure: live_stream_backpressure_config(config),
             },
         );
         let incremental_jsonl = LiveStreamIncrementalJsonlWriter::open(config).map_err(|err| {
@@ -206,6 +361,11 @@ impl LiveStreamRuntimeExecution {
             )
             .map_err(|err| CliError::new(format!("failed to activate live runtime: {err}")))?;
 
+        let temp_audio_policy = if config.keep_temp_audio {
+            TempAudioPolicy::RetainAlways
+        } else {
+            TempAudioPolicy::RetainOnFailure
+        };
         let helper_program = resolve_backend_program(config.asr_backend, resolved_model_path);
         let executor = Arc::new(PooledAsrExecutor {
             backend: config.asr_backend,
@@ -213,13 +373,9 @@ impl LiveStreamRuntimeExecution {
             model_path: resolved_model_path.to_path_buf(),
             language: config.asr_language.clone(),
             threads: config.asr_threads,
+            temp_audio_policy,
             prewarm_enabled: true,
         });
-        let temp_audio_policy = if config.keep_temp_audio {
-            TempAudioPolicy::RetainAlways
-        } else {
-            TempAudioPolicy::RetainOnFailure
-        };
         let asr_service = LiveAsrService::start(
             executor,
             LiveAsrPoolConfig {
@@ -230,21 +386,10 @@ impl LiveStreamRuntimeExecution {
             },
         );
 
-        let segment_dir = PathBuf::from("artifacts")
-            .join("transcribe-live-runtime-segments")
-            .join(stamp);
-        fs::create_dir_all(&segment_dir).map_err(|err| {
-            CliError::new(format!(
-                "failed to create live-stream segment directory {}: {err}",
-                segment_dir.display()
-            ))
-        })?;
-
         let submit_window = asr_service.queue_capacity().max(1);
         Ok(Self {
             channel_mode: config.channel_mode,
             speaker_labels: config.speaker_labels.clone(),
-            segment_dir,
             terminal_stream: LiveTerminalStream::new(terminal_render_mode()),
             coordinator,
             asr_service,
@@ -254,17 +399,19 @@ impl LiveStreamRuntimeExecution {
             next_job_id: 0,
             submitted_specs: HashMap::new(),
             audio_by_channel: HashMap::new(),
+            pump_cadence: PumpCadenceController::new(config.chunk_stride_ms.max(1)),
         })
     }
 
     fn finish(mut self) -> Result<LiveStreamRuntimeOutcome, CliError> {
-        self.pump_once()?;
+        self.force_pump(PumpDecisionReason::ForcedCaptureEnd)?;
         self.coordinator
             .transition_to(
                 LiveRuntimePhase::Draining,
                 "finalizing queue cleanup, reconciliation, and transcript assembly",
             )
             .map_err(|err| CliError::new(format!("failed to enter drain phase: {err}")))?;
+        self.force_pump(PumpDecisionReason::ForcedPhaseTransition)?;
         self.drain_until_idle()?;
         self.coordinator
             .transition_to(
@@ -272,8 +419,10 @@ impl LiveStreamRuntimeExecution {
                 "runtime work finished; writing session artifacts and summary output",
             )
             .map_err(|err| CliError::new(format!("failed to enter shutdown phase: {err}")))?;
+        self.force_pump(PumpDecisionReason::ForcedPhaseTransition)?;
         self.drain_until_idle()?;
         self.asr_service.close();
+        self.force_pump(PumpDecisionReason::ForcedFlush)?;
         self.drain_until_idle()?;
         self.asr_service.join();
         self.terminal_stream.finish();
@@ -296,11 +445,23 @@ impl LiveStreamRuntimeExecution {
         })
     }
 
-    fn pump_once(&mut self) -> Result<(), CliError> {
+    fn run_full_pump(&mut self) -> Result<(), CliError> {
         self.collect_pending_specs();
         self.submit_pending_specs()?;
         self.drain_ready_results()?;
         Ok(())
+    }
+
+    fn apply_pump_decision(&mut self, decision: PumpDecision) -> Result<(), CliError> {
+        match decision {
+            PumpDecision::Run(_) => self.run_full_pump(),
+            PumpDecision::Skip(_) => Ok(()),
+        }
+    }
+
+    fn force_pump(&mut self, reason: PumpDecisionReason) -> Result<(), CliError> {
+        let decision = self.pump_cadence.force(reason);
+        self.apply_pump_decision(decision)
     }
 
     fn drain_until_idle(&mut self) -> Result<(), CliError> {
@@ -329,6 +490,17 @@ impl LiveStreamRuntimeExecution {
         }
     }
 
+    fn pump_for_chunk(&mut self, chunk: &CaptureChunk) -> Result<(), CliError> {
+        let pts_ms = if chunk.pts_seconds.is_finite() && chunk.pts_seconds >= 0.0 {
+            Some((chunk.pts_seconds * 1_000.0).round() as u64)
+        } else {
+            None
+        };
+        let phase = self.coordinator.state().current_phase;
+        let decision = self.pump_cadence.on_chunk(pts_ms, phase);
+        self.apply_pump_decision(decision)
+    }
+
     fn submit_pending_specs(&mut self) -> Result<(), CliError> {
         while self.in_flight < self.submit_window {
             let Some(spec) = self.pending_specs.pop_front() else {
@@ -336,8 +508,8 @@ impl LiveStreamRuntimeExecution {
             };
             let job_id = self.next_job_id;
             self.next_job_id += 1;
-            let job = self.build_asr_job(job_id, &spec)?;
-            if self.asr_service.submit(job).is_ok() {
+            let request = self.build_asr_request(job_id, &spec)?;
+            if self.asr_service.submit_request(request).is_ok() {
                 self.submitted_specs.insert(job_id, spec);
                 self.in_flight += 1;
             }
@@ -375,32 +547,11 @@ impl LiveStreamRuntimeExecution {
         Ok(())
     }
 
-    fn build_asr_job(
+    fn build_asr_request(
         &mut self,
         job_id: usize,
         spec: &RuntimeAsrJobSpec,
-    ) -> Result<LiveAsrJob, CliError> {
-        let audio_path = self.materialize_job_audio(job_id, spec)?;
-        Ok(LiveAsrJob {
-            job_id,
-            class: runtime_job_class_to_pool_job_class(spec.job_class),
-            role: runtime_channel_role(spec.channel.as_str()),
-            label: runtime_channel_label(
-                self.channel_mode,
-                &self.speaker_labels,
-                spec.channel.as_str(),
-            ),
-            segment_id: spec.segment_id.clone(),
-            audio_path,
-            is_temp_audio: true,
-        })
-    }
-
-    fn materialize_job_audio(
-        &mut self,
-        job_id: usize,
-        spec: &RuntimeAsrJobSpec,
-    ) -> Result<PathBuf, CliError> {
+    ) -> Result<LiveAsrRequest, CliError> {
         let channel_audio = self
             .audio_by_channel
             .get(spec.channel.as_str())
@@ -410,18 +561,19 @@ impl LiveStreamRuntimeExecution {
                     spec.channel
                 ))
             })?;
-        let mut samples = channel_audio.render_window(spec.start_ms, spec.end_ms);
-        if samples.is_empty() {
-            samples.push(0.0);
-        }
-        let audio_path = self.segment_dir.join(format!("job-{job_id:06}.wav"));
-        write_runtime_job_wav(&audio_path, channel_audio.sample_rate_hz.max(1), &samples)?;
-        Ok(audio_path)
+        Ok(build_live_asr_request_for_spec(
+            self.channel_mode,
+            &self.speaker_labels,
+            channel_audio,
+            job_id,
+            spec,
+        ))
     }
 }
 
 impl CaptureSink for LiveStreamRuntimeExecution {
     fn on_chunk(&mut self, chunk: CaptureChunk) -> Result<(), String> {
+        let pump_chunk = chunk.clone();
         let channel_key = match chunk.stream {
             recordit::capture_api::CaptureStream::Microphone => "microphone",
             recordit::capture_api::CaptureStream::SystemAudio => "system-audio",
@@ -433,7 +585,7 @@ impl CaptureSink for LiveStreamRuntimeExecution {
         self.coordinator
             .on_capture_chunk(chunk)
             .map_err(|err| format!("live runtime rejected capture chunk: {err}"))?;
-        self.pump_once()
+        self.pump_for_chunk(&pump_chunk)
             .map_err(|err| format!("live runtime pump failed after capture chunk: {err}"))?;
         Ok(())
     }
@@ -442,7 +594,7 @@ impl CaptureSink for LiveStreamRuntimeExecution {
         self.coordinator
             .on_capture_event(event)
             .map_err(|err| format!("live runtime rejected capture event: {err}"))?;
-        self.pump_once()
+        self.force_pump(PumpDecisionReason::ForcedCaptureEvent)
             .map_err(|err| format!("live runtime pump failed after capture event: {err}"))?;
         Ok(())
     }
@@ -509,9 +661,10 @@ pub(super) fn run_live_stream_pipeline(
         deferred_final_submissions: 0,
         max_pending_final_backlog: 0,
     };
+    let runtime_summary = runtime_outcome.runtime_summary;
     let chunk_queue = live_stream_chunk_queue_telemetry(
         config,
-        &runtime_outcome.runtime_summary,
+        &runtime_summary,
         &runtime_outcome.asr_worker_pool,
     );
     if chunk_queue.dropped_oldest > 0 {
@@ -573,6 +726,14 @@ pub(super) fn run_live_stream_pipeline(
     }
     channel_transcripts = channel_transcript_summaries_from_events(config, &events);
     let active_channel_mode = active_channel_mode_from_transcripts(config, &channel_transcripts);
+    let hot_path_diagnostics = build_hot_path_diagnostics(
+        config,
+        &events,
+        &channel_transcripts,
+        &chunk_queue,
+        &runtime_summary,
+        &runtime_outcome.asr_worker_pool,
+    );
 
     let cleanup_queue = cleanup_run.telemetry;
     let trust_notices = build_trust_notices(
@@ -611,6 +772,7 @@ pub(super) fn run_live_stream_pipeline(
         final_buffering,
         chunk_queue,
         cleanup_queue,
+        hot_path_diagnostics,
         benchmark,
         benchmark_summary_csv,
         benchmark_runs_csv,
@@ -619,4 +781,284 @@ pub(super) fn run_live_stream_pipeline(
     write_runtime_jsonl(config, &report)?;
     write_runtime_manifest(config, &report)?;
     Ok(report)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use recordit::live_stream_runtime::{
+        BackpressureMode, CaptureScheduler, LiveAsrJobClass as RuntimeAsrJobClass,
+        SchedulerPressureSnapshot,
+    };
+
+    fn test_speaker_labels() -> SpeakerLabels {
+        SpeakerLabels::parse("mic,system").expect("valid default speaker labels")
+    }
+
+    #[test]
+    fn pump_cadence_gate_defers_active_chunks_until_due() {
+        let mut cadence = PumpCadenceController::new(200);
+        assert_eq!(
+            cadence.on_chunk(Some(0), LiveRuntimePhase::Active),
+            PumpDecision::Run(PumpDecisionReason::CadenceDue)
+        );
+        assert_eq!(
+            cadence.on_chunk(Some(50), LiveRuntimePhase::Active),
+            PumpDecision::Skip(PumpDecisionReason::CadenceDeferred)
+        );
+        assert_eq!(
+            cadence.on_chunk(Some(199), LiveRuntimePhase::Active),
+            PumpDecision::Skip(PumpDecisionReason::CadenceDeferred)
+        );
+        assert_eq!(
+            cadence.on_chunk(Some(200), LiveRuntimePhase::Active),
+            PumpDecision::Run(PumpDecisionReason::CadenceDue)
+        );
+
+        let telemetry = cadence.telemetry();
+        assert_eq!(telemetry.cadence_ms, 200);
+        assert_eq!(telemetry.decisions, 4);
+        assert_eq!(telemetry.full_pumps, 2);
+        assert_eq!(telemetry.deferred_pumps, 2);
+        assert_eq!(telemetry.forced_pumps, 0);
+    }
+
+    #[test]
+    fn pump_cadence_gate_forces_drain_for_events_and_non_active_phases() {
+        let mut cadence = PumpCadenceController::new(200);
+        assert_eq!(
+            cadence.on_chunk(Some(0), LiveRuntimePhase::Active),
+            PumpDecision::Run(PumpDecisionReason::CadenceDue)
+        );
+        assert_eq!(
+            cadence.on_chunk(Some(60), LiveRuntimePhase::Active),
+            PumpDecision::Skip(PumpDecisionReason::CadenceDeferred)
+        );
+        assert_eq!(
+            cadence.force(PumpDecisionReason::ForcedCaptureEvent),
+            PumpDecision::Run(PumpDecisionReason::ForcedCaptureEvent)
+        );
+        assert_eq!(
+            cadence.on_chunk(Some(120), LiveRuntimePhase::Draining),
+            PumpDecision::Run(PumpDecisionReason::ForcedPhaseTransition)
+        );
+        assert_eq!(
+            cadence.force(PumpDecisionReason::ForcedFlush),
+            PumpDecision::Run(PumpDecisionReason::ForcedFlush)
+        );
+
+        let telemetry = cadence.telemetry();
+        assert_eq!(telemetry.decisions, 5);
+        assert_eq!(telemetry.full_pumps, 4);
+        assert_eq!(telemetry.deferred_pumps, 1);
+        assert_eq!(telemetry.forced_pumps, 3);
+        assert_eq!(telemetry.last_reason, Some(PumpDecisionReason::ForcedFlush));
+    }
+
+    #[test]
+    fn build_live_asr_request_for_spec_preserves_pcm_window_metadata() {
+        let channel_audio = RuntimeChannelAudio {
+            sample_rate_hz: 1_000,
+            base_pts_ms: Some(0),
+            samples: vec![0.1, 0.2, 0.3, 0.4],
+        };
+        let spec = RuntimeAsrJobSpec {
+            emit_seq: 9,
+            job_class: RuntimeAsrJobClass::Final,
+            channel: "microphone".to_string(),
+            segment_id: "seg-9".to_string(),
+            segment_ord: 3,
+            window_ord: 5,
+            start_ms: 1,
+            end_ms: 3,
+        };
+
+        let request = build_live_asr_request_for_spec(
+            ChannelMode::Separate,
+            &test_speaker_labels(),
+            &channel_audio,
+            77,
+            &spec,
+        );
+
+        assert_eq!(request.job_id, 77);
+        assert_eq!(request.class, LiveAsrJobClass::Final);
+        assert_eq!(request.role, "mic");
+        assert_eq!(request.label, "mic");
+        assert_eq!(request.segment_id, "seg-9");
+        match request.audio_input {
+            LiveAsrAudioInput::PcmWindow {
+                sample_rate_hz,
+                start_ms,
+                end_ms,
+                mono_samples,
+            } => {
+                assert_eq!(sample_rate_hz, 1_000);
+                assert_eq!(start_ms, 1);
+                assert_eq!(end_ms, 3);
+                assert_eq!(mono_samples, vec![0.2, 0.3]);
+            }
+            _ => assert!(false, "expected pcm window request"),
+        }
+    }
+
+    #[test]
+    fn build_live_asr_request_for_spec_keeps_zero_sample_fallback_for_empty_windows() {
+        let channel_audio = RuntimeChannelAudio::default();
+        let spec = RuntimeAsrJobSpec {
+            emit_seq: 3,
+            job_class: RuntimeAsrJobClass::Partial,
+            channel: "system-audio".to_string(),
+            segment_id: "seg-empty".to_string(),
+            segment_ord: 1,
+            window_ord: 2,
+            start_ms: 10,
+            end_ms: 20,
+        };
+
+        let request = build_live_asr_request_for_spec(
+            ChannelMode::Separate,
+            &test_speaker_labels(),
+            &channel_audio,
+            11,
+            &spec,
+        );
+
+        match request.audio_input {
+            LiveAsrAudioInput::PcmWindow {
+                sample_rate_hz,
+                start_ms,
+                end_ms,
+                mono_samples,
+            } => {
+                assert_eq!(sample_rate_hz, 1);
+                assert_eq!(start_ms, 10);
+                assert_eq!(end_ms, 20);
+                assert_eq!(mono_samples, vec![0.0]);
+            }
+            _ => assert!(false, "expected pcm window request"),
+        }
+    }
+
+    #[test]
+    fn live_stream_backpressure_kill_switch_sets_unreachable_thresholds() {
+        let mut config = TranscribeConfig::default();
+        config.live_stream = true;
+        config.adaptive_backpressure_enabled = false;
+
+        let backpressure = live_stream_backpressure_config(&config);
+        assert_eq!(backpressure.pressure_pending_jobs_threshold, u64::MAX);
+        assert_eq!(backpressure.severe_pending_jobs_threshold, u64::MAX);
+        assert_eq!(backpressure.severe_pending_final_jobs_threshold, u64::MAX);
+        assert_eq!(backpressure.pressure_min_observations, usize::MAX);
+        assert_eq!(backpressure.severe_min_observations, usize::MAX);
+        assert_eq!(backpressure.pressure_stride_multiplier, 1);
+    }
+
+    #[test]
+    fn kill_switch_keeps_scheduler_in_normal_mode_under_extreme_pressure() {
+        let mut config = TranscribeConfig::default();
+        config.live_stream = true;
+        config.adaptive_backpressure_enabled = false;
+
+        let scheduler_config = StreamingSchedulerConfig {
+            partial_window_ms: config.chunk_window_ms,
+            partial_stride_ms: config.chunk_stride_ms,
+            min_partial_span_ms: config.chunk_stride_ms.min(config.chunk_window_ms).max(1),
+            backpressure: live_stream_backpressure_config(&config),
+        };
+        let mut scheduler =
+            StreamingVadScheduler::with_configs(StreamingVadConfig::default(), scheduler_config);
+
+        for idx in 0..4 {
+            let input = recordit::live_stream_runtime::SchedulingInput {
+                channel: "microphone".to_string(),
+                pts_ms: idx * 120,
+                frame_count: 1_920,
+                duration_ms: 120,
+                activity_level_per_mille: 80,
+            };
+            let _ = scheduler.on_capture(
+                input,
+                LiveRuntimePhase::Active,
+                SchedulerPressureSnapshot {
+                    pending_jobs: u64::MAX,
+                    pending_final_jobs: u64::MAX,
+                },
+            );
+        }
+
+        assert_eq!(scheduler.backpressure_mode(), BackpressureMode::Normal);
+        assert!(scheduler.drain_backpressure_transitions().is_empty());
+    }
+
+    #[test]
+    fn kill_switch_preserves_normal_job_emission_under_pressure() {
+        let mut kill_switch_config = TranscribeConfig::default();
+        kill_switch_config.live_stream = true;
+        kill_switch_config.adaptive_backpressure_enabled = false;
+
+        let kill_switch_scheduler_config = StreamingSchedulerConfig {
+            partial_window_ms: kill_switch_config.chunk_window_ms,
+            partial_stride_ms: kill_switch_config.chunk_stride_ms,
+            min_partial_span_ms: kill_switch_config
+                .chunk_stride_ms
+                .min(kill_switch_config.chunk_window_ms)
+                .max(1),
+            backpressure: live_stream_backpressure_config(&kill_switch_config),
+        };
+        let baseline_scheduler_config = StreamingSchedulerConfig {
+            partial_window_ms: kill_switch_config.chunk_window_ms,
+            partial_stride_ms: kill_switch_config.chunk_stride_ms,
+            min_partial_span_ms: kill_switch_config
+                .chunk_stride_ms
+                .min(kill_switch_config.chunk_window_ms)
+                .max(1),
+            backpressure: recordit::live_stream_runtime::AdaptiveBackpressureConfig::default(),
+        };
+
+        let mut kill_switch_scheduler = StreamingVadScheduler::with_configs(
+            StreamingVadConfig::default(),
+            kill_switch_scheduler_config,
+        );
+        let mut baseline_scheduler = StreamingVadScheduler::with_configs(
+            StreamingVadConfig::default(),
+            baseline_scheduler_config,
+        );
+        let mut kill_switch_jobs = Vec::new();
+        let mut baseline_jobs = Vec::new();
+
+        for idx in 0..8 {
+            let input = recordit::live_stream_runtime::SchedulingInput {
+                channel: "microphone".to_string(),
+                pts_ms: idx * 120,
+                frame_count: 1_920,
+                duration_ms: 120,
+                activity_level_per_mille: 80,
+            };
+            kill_switch_jobs.extend(kill_switch_scheduler.on_capture(
+                input.clone(),
+                LiveRuntimePhase::Active,
+                SchedulerPressureSnapshot {
+                    pending_jobs: u64::MAX,
+                    pending_final_jobs: u64::MAX,
+                },
+            ));
+            baseline_jobs.extend(baseline_scheduler.on_capture(
+                input,
+                LiveRuntimePhase::Active,
+                SchedulerPressureSnapshot::default(),
+            ));
+        }
+
+        assert_eq!(
+            kill_switch_scheduler.backpressure_mode(),
+            BackpressureMode::Normal
+        );
+        assert_eq!(kill_switch_jobs, baseline_jobs);
+        assert!(
+            !kill_switch_jobs.is_empty(),
+            "expected partial/final job emission to remain available with kill-switch active"
+        );
+    }
 }

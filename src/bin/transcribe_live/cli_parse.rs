@@ -135,6 +135,9 @@ pub(super) fn parse_args_from(
             "--keep-temp-audio" => {
                 config.keep_temp_audio = true;
             }
+            "--disable-adaptive-backpressure" => {
+                config.adaptive_backpressure_enabled = false;
+            }
             "--transcribe-channels" => {
                 config.channel_mode =
                     ChannelMode::parse(&read_value(&mut args, "--transcribe-channels")?)?;

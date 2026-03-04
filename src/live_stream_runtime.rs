@@ -43,6 +43,8 @@ pub struct LiveRuntimeState {
     pub asr_results_emitted: u64,
     pub shutdown_abandoned_jobs: u64,
     pub shutdown_abandoned_final_jobs: u64,
+    pub backpressure_mode: BackpressureMode,
+    pub backpressure_transitions: Vec<BackpressureTransition>,
     next_emit_seq: u64,
 }
 
@@ -62,9 +64,56 @@ impl LiveRuntimeState {
             asr_results_emitted: 0,
             shutdown_abandoned_jobs: 0,
             shutdown_abandoned_final_jobs: 0,
+            backpressure_mode: BackpressureMode::Normal,
+            backpressure_transitions: Vec::new(),
             next_emit_seq: 1,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackpressureMode {
+    Normal,
+    Pressure,
+    Severe,
+}
+
+impl BackpressureMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Normal => "normal",
+            Self::Pressure => "pressure",
+            Self::Severe => "severe",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackpressureTransitionReason {
+    PendingJobsSustained,
+    PendingFinalJobsSustained,
+    RecoveryWindowClear,
+    PhaseBoundaryReset,
+}
+
+impl BackpressureTransitionReason {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::PendingJobsSustained => "pending_jobs_sustained",
+            Self::PendingFinalJobsSustained => "pending_final_jobs_sustained",
+            Self::RecoveryWindowClear => "recovery_window_clear",
+            Self::PhaseBoundaryReset => "phase_boundary_reset",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackpressureTransition {
+    pub from_mode: BackpressureMode,
+    pub to_mode: BackpressureMode,
+    pub observed_at_ms: u64,
+    pub reason: BackpressureTransitionReason,
+    pub detail: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -436,6 +485,36 @@ pub struct StreamingSchedulerConfig {
     pub partial_window_ms: u64,
     pub partial_stride_ms: u64,
     pub min_partial_span_ms: u64,
+    pub backpressure: AdaptiveBackpressureConfig,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AdaptiveBackpressureConfig {
+    pub pressure_window_ms: u64,
+    pub severe_window_ms: u64,
+    pub recovery_window_ms: u64,
+    pub pressure_pending_jobs_threshold: u64,
+    pub severe_pending_jobs_threshold: u64,
+    pub severe_pending_final_jobs_threshold: u64,
+    pub pressure_min_observations: usize,
+    pub severe_min_observations: usize,
+    pub pressure_stride_multiplier: u64,
+}
+
+impl Default for AdaptiveBackpressureConfig {
+    fn default() -> Self {
+        Self {
+            pressure_window_ms: 1_000,
+            severe_window_ms: 1_500,
+            recovery_window_ms: 2_000,
+            pressure_pending_jobs_threshold: 2,
+            severe_pending_jobs_threshold: 4,
+            severe_pending_final_jobs_threshold: 1,
+            pressure_min_observations: 2,
+            severe_min_observations: 2,
+            pressure_stride_multiplier: 2,
+        }
+    }
 }
 
 impl Default for StreamingSchedulerConfig {
@@ -444,6 +523,7 @@ impl Default for StreamingSchedulerConfig {
             partial_window_ms: 2_000,
             partial_stride_ms: 500,
             min_partial_span_ms: 500,
+            backpressure: AdaptiveBackpressureConfig::default(),
         }
     }
 }
@@ -460,12 +540,59 @@ struct PartialCursor {
     next_window_ord: u64,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SchedulerPressureSnapshot {
+    pub pending_jobs: u64,
+    pub pending_final_jobs: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SchedulerChannelDiagnostics {
+    pub pressure_samples: u64,
+    pub severe_samples: u64,
+    pub last_pending_jobs: u64,
+    pub last_pending_final_jobs: u64,
+    pub queued_partials: u64,
+    pub queued_finals: u64,
+    pub queued_reconciles: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SchedulerDiagnosticsSnapshot {
+    pub backpressure_mode: BackpressureMode,
+    pub backpressure_transition_count: usize,
+    pub last_backpressure_transition_reason: Option<BackpressureTransitionReason>,
+    pub channels: BTreeMap<String, SchedulerChannelDiagnostics>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BackpressureObservation {
+    observed_at_ms: u64,
+    pending_jobs: u64,
+    pending_final_jobs: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct BackpressureWindowCounts {
+    pressure_samples: usize,
+    severe_job_samples: usize,
+    severe_final_samples: usize,
+    recovery_samples: usize,
+    recovery_busy_samples: usize,
+}
+
 #[derive(Debug, Clone)]
 pub struct StreamingVadScheduler {
     tracker: StreamingVadTracker,
     scheduler_config: StreamingSchedulerConfig,
     partial_cursors: BTreeMap<SegmentKey, PartialCursor>,
     pending_reconcile_jobs: VecDeque<LiveAsrJobDraft>,
+    backpressure_mode: BackpressureMode,
+    backpressure_observations: VecDeque<BackpressureObservation>,
+    pending_backpressure_transitions: VecDeque<BackpressureTransition>,
+    backpressure_transition_total: usize,
+    last_backpressure_transition_reason: Option<BackpressureTransitionReason>,
+    channel_diagnostics: BTreeMap<String, SchedulerChannelDiagnostics>,
 }
 
 impl Default for StreamingVadScheduler {
@@ -488,6 +615,12 @@ impl StreamingVadScheduler {
             scheduler_config,
             partial_cursors: BTreeMap::new(),
             pending_reconcile_jobs: VecDeque::new(),
+            backpressure_mode: BackpressureMode::Normal,
+            backpressure_observations: VecDeque::new(),
+            pending_backpressure_transitions: VecDeque::new(),
+            backpressure_transition_total: 0,
+            last_backpressure_transition_reason: None,
+            channel_diagnostics: BTreeMap::new(),
         }
     }
 
@@ -499,8 +632,240 @@ impl StreamingVadScheduler {
         self.tracker.channel_snapshot(channel)
     }
 
+    pub fn backpressure_mode(&self) -> BackpressureMode {
+        self.backpressure_mode
+    }
+
+    pub fn drain_backpressure_transitions(&mut self) -> Vec<BackpressureTransition> {
+        self.pending_backpressure_transitions.drain(..).collect()
+    }
+
+    pub fn diagnostics_snapshot(&self) -> SchedulerDiagnosticsSnapshot {
+        SchedulerDiagnosticsSnapshot {
+            backpressure_mode: self.backpressure_mode,
+            backpressure_transition_count: self.backpressure_transition_total,
+            last_backpressure_transition_reason: self.last_backpressure_transition_reason,
+            channels: self.channel_diagnostics.clone(),
+        }
+    }
+
     pub fn queue_reconcile_job(&mut self, job: LiveAsrJobDraft) {
         self.pending_reconcile_jobs.push_back(job);
+    }
+
+    fn observe_backpressure(&mut self, observed_at_ms: u64, pressure: SchedulerPressureSnapshot) {
+        self.backpressure_observations
+            .push_back(BackpressureObservation {
+                observed_at_ms,
+                pending_jobs: pressure.pending_jobs,
+                pending_final_jobs: pressure.pending_final_jobs,
+            });
+        self.trim_backpressure_observations(observed_at_ms);
+
+        let counts = self.backpressure_window_counts(observed_at_ms);
+        let severe_from_finals = counts.severe_final_samples
+            >= self.scheduler_config.backpressure.severe_min_observations;
+        let severe_from_jobs =
+            counts.severe_job_samples >= self.scheduler_config.backpressure.severe_min_observations;
+        let pressure_from_jobs =
+            counts.pressure_samples >= self.scheduler_config.backpressure.pressure_min_observations;
+        let recovery_window_clear =
+            counts.recovery_samples > 0 && counts.recovery_busy_samples == 0;
+
+        let transition = match self.backpressure_mode {
+            BackpressureMode::Normal if severe_from_finals => Some(BackpressureTransition {
+                from_mode: BackpressureMode::Normal,
+                to_mode: BackpressureMode::Severe,
+                observed_at_ms,
+                reason: BackpressureTransitionReason::PendingFinalJobsSustained,
+                detail: format!(
+                    "entered severe mode after {} sustained final-backlog observation(s) in {}ms window (pending_final_jobs>={})",
+                    counts.severe_final_samples,
+                    self.scheduler_config.backpressure.severe_window_ms,
+                    self.scheduler_config
+                        .backpressure
+                        .severe_pending_final_jobs_threshold
+                ),
+            }),
+            BackpressureMode::Normal if severe_from_jobs => Some(BackpressureTransition {
+                from_mode: BackpressureMode::Normal,
+                to_mode: BackpressureMode::Severe,
+                observed_at_ms,
+                reason: BackpressureTransitionReason::PendingJobsSustained,
+                detail: format!(
+                    "entered severe mode after {} sustained backlog observation(s) in {}ms window (pending_jobs>={})",
+                    counts.severe_job_samples,
+                    self.scheduler_config.backpressure.severe_window_ms,
+                    self.scheduler_config
+                        .backpressure
+                        .severe_pending_jobs_threshold
+                ),
+            }),
+            BackpressureMode::Normal if pressure_from_jobs => Some(BackpressureTransition {
+                from_mode: BackpressureMode::Normal,
+                to_mode: BackpressureMode::Pressure,
+                observed_at_ms,
+                reason: BackpressureTransitionReason::PendingJobsSustained,
+                detail: format!(
+                    "entered pressure mode after {} sustained backlog observation(s) in {}ms window (pending_jobs>={})",
+                    counts.pressure_samples,
+                    self.scheduler_config.backpressure.pressure_window_ms,
+                    self.scheduler_config
+                        .backpressure
+                        .pressure_pending_jobs_threshold
+                ),
+            }),
+            BackpressureMode::Pressure if severe_from_finals => Some(BackpressureTransition {
+                from_mode: BackpressureMode::Pressure,
+                to_mode: BackpressureMode::Severe,
+                observed_at_ms,
+                reason: BackpressureTransitionReason::PendingFinalJobsSustained,
+                detail: format!(
+                    "escalated to severe mode after {} sustained final-backlog observation(s) in {}ms window",
+                    counts.severe_final_samples,
+                    self.scheduler_config.backpressure.severe_window_ms
+                ),
+            }),
+            BackpressureMode::Pressure if severe_from_jobs => Some(BackpressureTransition {
+                from_mode: BackpressureMode::Pressure,
+                to_mode: BackpressureMode::Severe,
+                observed_at_ms,
+                reason: BackpressureTransitionReason::PendingJobsSustained,
+                detail: format!(
+                    "escalated to severe mode after {} sustained backlog observation(s) in {}ms window",
+                    counts.severe_job_samples, self.scheduler_config.backpressure.severe_window_ms
+                ),
+            }),
+            BackpressureMode::Pressure if recovery_window_clear => Some(BackpressureTransition {
+                from_mode: BackpressureMode::Pressure,
+                to_mode: BackpressureMode::Normal,
+                observed_at_ms,
+                reason: BackpressureTransitionReason::RecoveryWindowClear,
+                detail: format!(
+                    "recovered to normal mode after {}ms clear window with no pending backlog",
+                    self.scheduler_config.backpressure.recovery_window_ms
+                ),
+            }),
+            BackpressureMode::Severe if recovery_window_clear => Some(BackpressureTransition {
+                from_mode: BackpressureMode::Severe,
+                to_mode: BackpressureMode::Normal,
+                observed_at_ms,
+                reason: BackpressureTransitionReason::RecoveryWindowClear,
+                detail: format!(
+                    "recovered directly to normal mode after {}ms clear window with no pending backlog",
+                    self.scheduler_config.backpressure.recovery_window_ms
+                ),
+            }),
+            BackpressureMode::Severe if !severe_from_finals && !severe_from_jobs => {
+                Some(BackpressureTransition {
+                    from_mode: BackpressureMode::Severe,
+                    to_mode: BackpressureMode::Pressure,
+                    observed_at_ms,
+                    reason: BackpressureTransitionReason::RecoveryWindowClear,
+                    detail: format!(
+                        "eased from severe to pressure after severe-window pressure cleared; waiting for {}ms clean recovery window before normal mode",
+                        self.scheduler_config.backpressure.recovery_window_ms
+                    ),
+                })
+            }
+            _ => None,
+        };
+
+        if let Some(transition) = transition {
+            self.backpressure_mode = transition.to_mode;
+            self.backpressure_transition_total += 1;
+            self.last_backpressure_transition_reason = Some(transition.reason);
+            self.pending_backpressure_transitions.push_back(transition);
+        }
+    }
+
+    fn trim_backpressure_observations(&mut self, observed_at_ms: u64) {
+        let max_window_ms = self
+            .scheduler_config
+            .backpressure
+            .pressure_window_ms
+            .max(self.scheduler_config.backpressure.severe_window_ms)
+            .max(self.scheduler_config.backpressure.recovery_window_ms);
+        let min_observed_at = observed_at_ms.saturating_sub(max_window_ms);
+        while self
+            .backpressure_observations
+            .front()
+            .is_some_and(|sample| sample.observed_at_ms < min_observed_at)
+        {
+            self.backpressure_observations.pop_front();
+        }
+    }
+
+    fn backpressure_window_counts(&self, observed_at_ms: u64) -> BackpressureWindowCounts {
+        let mut counts = BackpressureWindowCounts::default();
+        let pressure_start =
+            observed_at_ms.saturating_sub(self.scheduler_config.backpressure.pressure_window_ms);
+        let severe_start =
+            observed_at_ms.saturating_sub(self.scheduler_config.backpressure.severe_window_ms);
+        let recovery_start =
+            observed_at_ms.saturating_sub(self.scheduler_config.backpressure.recovery_window_ms);
+
+        for sample in &self.backpressure_observations {
+            if sample.observed_at_ms >= pressure_start
+                && sample.pending_jobs
+                    >= self
+                        .scheduler_config
+                        .backpressure
+                        .pressure_pending_jobs_threshold
+            {
+                counts.pressure_samples += 1;
+            }
+            if sample.observed_at_ms >= severe_start
+                && sample.pending_jobs
+                    >= self
+                        .scheduler_config
+                        .backpressure
+                        .severe_pending_jobs_threshold
+            {
+                counts.severe_job_samples += 1;
+            }
+            if sample.observed_at_ms >= severe_start
+                && sample.pending_final_jobs
+                    >= self
+                        .scheduler_config
+                        .backpressure
+                        .severe_pending_final_jobs_threshold
+            {
+                counts.severe_final_samples += 1;
+            }
+            if sample.observed_at_ms >= recovery_start {
+                counts.recovery_samples += 1;
+                if sample.pending_jobs > 0 || sample.pending_final_jobs > 0 {
+                    counts.recovery_busy_samples += 1;
+                }
+            }
+        }
+
+        counts
+    }
+
+    fn reset_backpressure(&mut self, phase: LiveRuntimePhase) {
+        self.backpressure_observations.clear();
+        if self.backpressure_mode == BackpressureMode::Normal {
+            return;
+        }
+
+        let previous = self.backpressure_mode;
+        self.backpressure_mode = BackpressureMode::Normal;
+        self.pending_backpressure_transitions
+            .push_back(BackpressureTransition {
+                from_mode: previous,
+                to_mode: BackpressureMode::Normal,
+                observed_at_ms: 0,
+                reason: BackpressureTransitionReason::PhaseBoundaryReset,
+                detail: format!(
+                    "reset backpressure mode to normal on phase boundary `{}`",
+                    phase.as_str()
+                ),
+            });
+        self.backpressure_transition_total += 1;
+        self.last_backpressure_transition_reason =
+            Some(BackpressureTransitionReason::PhaseBoundaryReset);
     }
 
     fn handle_boundary(
@@ -575,10 +940,23 @@ impl StreamingVadScheduler {
             last_partial_emit_end_ms: segment_start_ms,
             next_window_ord: 1,
         });
+        let effective_stride_ms = match self.backpressure_mode {
+            BackpressureMode::Normal => self.scheduler_config.partial_stride_ms,
+            BackpressureMode::Pressure => self
+                .scheduler_config
+                .partial_stride_ms
+                .saturating_mul(
+                    self.scheduler_config
+                        .backpressure
+                        .pressure_stride_multiplier,
+                )
+                .max(self.scheduler_config.partial_stride_ms),
+            BackpressureMode::Severe => return,
+        };
         let stride_ready = segment_end_ms
             >= cursor
                 .last_partial_emit_end_ms
-                .saturating_add(self.scheduler_config.partial_stride_ms);
+                .saturating_add(effective_stride_ms);
         if !stride_ready {
             return;
         }
@@ -606,6 +984,34 @@ impl StreamingVadScheduler {
 
     fn drain_pending_reconcile_jobs(&mut self, out_jobs: &mut Vec<LiveAsrJobDraft>) {
         out_jobs.extend(self.pending_reconcile_jobs.drain(..));
+    }
+
+    fn record_channel_pressure_sample(&mut self, channel: &str, pressure: SchedulerPressureSnapshot) {
+        let diagnostics = self
+            .channel_diagnostics
+            .entry(channel.to_string())
+            .or_default();
+        diagnostics.last_pending_jobs = pressure.pending_jobs;
+        diagnostics.last_pending_final_jobs = pressure.pending_final_jobs;
+        match self.backpressure_mode {
+            BackpressureMode::Normal => {}
+            BackpressureMode::Pressure => diagnostics.pressure_samples += 1,
+            BackpressureMode::Severe => diagnostics.severe_samples += 1,
+        }
+    }
+
+    fn record_queued_jobs(&mut self, jobs: &[LiveAsrJobDraft]) {
+        for job in jobs {
+            let diagnostics = self
+                .channel_diagnostics
+                .entry(job.channel.clone())
+                .or_default();
+            match job.job_class {
+                LiveAsrJobClass::Partial => diagnostics.queued_partials += 1,
+                LiveAsrJobClass::Final => diagnostics.queued_finals += 1,
+                LiveAsrJobClass::Reconcile => diagnostics.queued_reconciles += 1,
+            }
+        }
     }
 }
 
@@ -636,12 +1042,15 @@ impl CaptureScheduler for StreamingVadScheduler {
         &mut self,
         input: SchedulingInput,
         phase: LiveRuntimePhase,
+        pressure: SchedulerPressureSnapshot,
     ) -> Vec<LiveAsrJobDraft> {
         if phase == LiveRuntimePhase::Shutdown {
             return Vec::new();
         }
 
         let channel = input.channel.clone();
+        self.observe_backpressure(input.end_ms(), pressure);
+        self.record_channel_pressure_sample(&channel, pressure);
         self.tracker.ingest(input);
         let mut jobs = Vec::new();
         let allow_job_emit = phase != LiveRuntimePhase::Warmup;
@@ -652,10 +1061,14 @@ impl CaptureScheduler for StreamingVadScheduler {
             self.maybe_emit_partial(&snapshot, phase == LiveRuntimePhase::Active, &mut jobs);
         }
         self.drain_pending_reconcile_jobs(&mut jobs);
+        self.record_queued_jobs(&jobs);
         jobs
     }
 
     fn on_phase_change(&mut self, phase: LiveRuntimePhase) -> Vec<LiveAsrJobDraft> {
+        if phase != LiveRuntimePhase::Active {
+            self.reset_backpressure(phase);
+        }
         if matches!(
             phase,
             LiveRuntimePhase::Draining | LiveRuntimePhase::Shutdown
@@ -667,7 +1080,12 @@ impl CaptureScheduler for StreamingVadScheduler {
             self.handle_boundary(boundary, true, &mut jobs);
         }
         self.drain_pending_reconcile_jobs(&mut jobs);
+        self.record_queued_jobs(&jobs);
         jobs
+    }
+
+    fn drain_backpressure_transitions(&mut self) -> Vec<BackpressureTransition> {
+        StreamingVadScheduler::drain_backpressure_transitions(self)
     }
 }
 
@@ -718,6 +1136,8 @@ pub struct LiveRuntimeSummary {
     pub pending_final_jobs: u64,
     pub shutdown_abandoned_jobs: u64,
     pub shutdown_abandoned_final_jobs: u64,
+    pub backpressure_mode: BackpressureMode,
+    pub backpressure_transitions: Vec<BackpressureTransition>,
 }
 
 pub trait CaptureScheduler {
@@ -725,9 +1145,14 @@ pub trait CaptureScheduler {
         &mut self,
         input: SchedulingInput,
         phase: LiveRuntimePhase,
+        pressure: SchedulerPressureSnapshot,
     ) -> Vec<LiveAsrJobDraft>;
 
     fn on_phase_change(&mut self, _phase: LiveRuntimePhase) -> Vec<LiveAsrJobDraft> {
+        Vec::new()
+    }
+
+    fn drain_backpressure_transitions(&mut self) -> Vec<BackpressureTransition> {
         Vec::new()
     }
 }
@@ -795,16 +1220,23 @@ where
         })?;
 
         let scheduled = self.scheduler.on_phase_change(phase);
+        self.record_backpressure_transitions();
         self.enqueue_jobs(scheduled)?;
         Ok(())
     }
 
     pub fn on_capture_chunk(&mut self, chunk: CaptureChunk) -> Result<(), String> {
         self.state.capture_chunks_seen += 1;
+        let (pending_jobs, pending_final_jobs) = self.pending_job_counts();
         let scheduled = self.scheduler.on_capture(
             SchedulingInput::from_capture_chunk(&chunk),
             self.state.current_phase,
+            SchedulerPressureSnapshot {
+                pending_jobs,
+                pending_final_jobs,
+            },
         );
+        self.record_backpressure_transitions();
         self.enqueue_jobs(scheduled)
     }
 
@@ -844,6 +1276,8 @@ where
             pending_final_jobs,
             shutdown_abandoned_jobs: self.state.shutdown_abandoned_jobs,
             shutdown_abandoned_final_jobs: self.state.shutdown_abandoned_final_jobs,
+            backpressure_mode: self.state.backpressure_mode,
+            backpressure_transitions: self.state.backpressure_transitions.clone(),
         }
     }
 
@@ -907,6 +1341,13 @@ where
         let seq = self.state.next_emit_seq;
         self.state.next_emit_seq += 1;
         seq
+    }
+
+    fn record_backpressure_transitions(&mut self) {
+        for transition in self.scheduler.drain_backpressure_transitions() {
+            self.state.backpressure_mode = transition.to_mode;
+            self.state.backpressure_transitions.push(transition);
+        }
     }
 
     fn pending_job_counts(&self) -> (u64, u64) {
@@ -991,6 +1432,7 @@ mod tests {
             &mut self,
             input: SchedulingInput,
             phase: LiveRuntimePhase,
+            _pressure: SchedulerPressureSnapshot,
         ) -> Vec<LiveAsrJobDraft> {
             if phase != LiveRuntimePhase::Active {
                 return Vec::new();
@@ -1016,6 +1458,7 @@ mod tests {
             &mut self,
             _input: SchedulingInput,
             _phase: LiveRuntimePhase,
+            _pressure: SchedulerPressureSnapshot,
         ) -> Vec<LiveAsrJobDraft> {
             Vec::new()
         }
@@ -1069,6 +1512,15 @@ mod tests {
         }
     }
 
+    fn speech_chunk(pts_ms: u64, frame_count: usize, amplitude: f32) -> CaptureChunk {
+        CaptureChunk {
+            stream: CaptureStream::Microphone,
+            pts_seconds: pts_ms as f64 / 1_000.0,
+            sample_rate_hz: 48_000,
+            mono_samples: vec![amplitude; frame_count],
+        }
+    }
+
     fn sample_event() -> CaptureEvent {
         CaptureEvent {
             generated_unix: 0,
@@ -1110,7 +1562,34 @@ mod tests {
             partial_window_ms: 40,
             partial_stride_ms: 25,
             min_partial_span_ms: 20,
+            backpressure: AdaptiveBackpressureConfig::default(),
         }
+    }
+
+    fn count_jobs_for_channel(
+        jobs: &[LiveAsrJobDraft],
+        channel: &str,
+        class: LiveAsrJobClass,
+    ) -> usize {
+        jobs.iter()
+            .filter(|job| job.channel == channel && job.job_class == class)
+            .count()
+    }
+
+    fn fairness_timeline(jobs: &[LiveAsrJobDraft]) -> String {
+        jobs.iter()
+            .map(|job| {
+                format!(
+                    "{}:{}#{}:{}-{}",
+                    job.channel,
+                    job.job_class.as_str(),
+                    job.window_ord,
+                    job.start_ms,
+                    job.end_ms
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" | ")
     }
 
     #[test]
@@ -1272,6 +1751,61 @@ mod tests {
     }
 
     #[test]
+    fn coordinator_summary_tracks_backpressure_transition_diagnostics() {
+        let mut scheduler_config = test_scheduler_config();
+        scheduler_config
+            .backpressure
+            .pressure_pending_jobs_threshold = 1;
+        scheduler_config.backpressure.pressure_min_observations = 1;
+        scheduler_config.backpressure.severe_pending_jobs_threshold = 100;
+        scheduler_config
+            .backpressure
+            .severe_pending_final_jobs_threshold = 100;
+        scheduler_config.backpressure.severe_min_observations = 10;
+
+        let scheduler = StreamingVadScheduler::with_configs(
+            StreamingVadConfig {
+                rolling_window_ms: 40,
+                min_speech_ms: 1,
+                min_silence_ms: 20,
+                open_threshold_per_mille: 10,
+                close_threshold_per_mille: 5,
+            },
+            StreamingSchedulerConfig {
+                partial_window_ms: 20,
+                partial_stride_ms: 5,
+                min_partial_span_ms: 1,
+                ..scheduler_config
+            },
+        );
+        let mut coordinator =
+            LiveStreamCoordinator::new(scheduler, TestOutput::default(), TestFinalizer::default());
+        coordinator
+            .transition_to(LiveRuntimePhase::Active, "active")
+            .expect("transition should succeed");
+
+        coordinator
+            .on_capture_chunk(speech_chunk(0, 960, 0.5))
+            .expect("first capture should queue a partial");
+        coordinator
+            .on_capture_chunk(speech_chunk(20, 960, 0.5))
+            .expect("second capture should observe queued backlog");
+
+        let summary = coordinator.summary_snapshot();
+        assert_eq!(summary.backpressure_mode, BackpressureMode::Pressure);
+        assert_eq!(summary.backpressure_transitions.len(), 1);
+        assert_eq!(
+            summary.backpressure_transitions[0].reason,
+            BackpressureTransitionReason::PendingJobsSustained
+        );
+        assert!(
+            summary.backpressure_transitions[0]
+                .detail
+                .contains("entered pressure mode")
+        );
+    }
+
+    #[test]
     fn scheduling_input_derives_duration_and_activity_level() {
         let chunk = CaptureChunk {
             stream: CaptureStream::Microphone,
@@ -1365,6 +1899,7 @@ mod tests {
         let open_jobs = scheduler.on_capture(
             manual_input("microphone", 0, 20, 960, 110),
             LiveRuntimePhase::Active,
+            SchedulerPressureSnapshot::default(),
         );
         assert!(open_jobs.is_empty());
         assert!(scheduler.drain_boundaries().is_empty());
@@ -1391,12 +1926,14 @@ mod tests {
         let jobs_1 = scheduler.on_capture(
             manual_input("microphone", 0, 20, 960, 110),
             LiveRuntimePhase::Active,
+            SchedulerPressureSnapshot::default(),
         );
         assert!(jobs_1.is_empty());
 
         let jobs_2 = scheduler.on_capture(
             manual_input("microphone", 20, 20, 960, 110),
             LiveRuntimePhase::Active,
+            SchedulerPressureSnapshot::default(),
         );
         assert_eq!(jobs_2.len(), 1);
         assert_eq!(jobs_2[0].job_class, LiveAsrJobClass::Partial);
@@ -1408,12 +1945,14 @@ mod tests {
         let jobs_3 = scheduler.on_capture(
             manual_input("microphone", 40, 20, 960, 110),
             LiveRuntimePhase::Active,
+            SchedulerPressureSnapshot::default(),
         );
         assert!(jobs_3.is_empty());
 
         let jobs_4 = scheduler.on_capture(
             manual_input("microphone", 60, 20, 960, 110),
             LiveRuntimePhase::Active,
+            SchedulerPressureSnapshot::default(),
         );
         assert_eq!(jobs_4.len(), 1);
         assert_eq!(jobs_4[0].job_class, LiveAsrJobClass::Partial);
@@ -1424,6 +1963,430 @@ mod tests {
     }
 
     #[test]
+    fn streaming_scheduler_enters_pressure_mode_with_sustained_pending_jobs() {
+        let mut scheduler_config = test_scheduler_config();
+        scheduler_config
+            .backpressure
+            .pressure_pending_jobs_threshold = 1;
+        scheduler_config.backpressure.pressure_min_observations = 2;
+        scheduler_config.backpressure.severe_pending_jobs_threshold = 100;
+        scheduler_config
+            .backpressure
+            .severe_pending_final_jobs_threshold = 100;
+        scheduler_config.backpressure.severe_min_observations = 10;
+
+        let mut scheduler =
+            StreamingVadScheduler::with_configs(test_vad_config(), scheduler_config);
+
+        scheduler.on_capture(
+            manual_input("microphone", 0, 20, 960, 110),
+            LiveRuntimePhase::Active,
+            SchedulerPressureSnapshot {
+                pending_jobs: 1,
+                pending_final_jobs: 0,
+            },
+        );
+        assert_eq!(scheduler.backpressure_mode(), BackpressureMode::Normal);
+
+        scheduler.on_capture(
+            manual_input("microphone", 20, 20, 960, 110),
+            LiveRuntimePhase::Active,
+            SchedulerPressureSnapshot {
+                pending_jobs: 1,
+                pending_final_jobs: 0,
+            },
+        );
+        assert_eq!(scheduler.backpressure_mode(), BackpressureMode::Pressure);
+
+        let transitions = scheduler.drain_backpressure_transitions();
+        assert_eq!(transitions.len(), 1);
+        assert_eq!(transitions[0].from_mode, BackpressureMode::Normal);
+        assert_eq!(transitions[0].to_mode, BackpressureMode::Pressure);
+        assert_eq!(
+            transitions[0].reason,
+            BackpressureTransitionReason::PendingJobsSustained
+        );
+        assert!(transitions[0].detail.contains("entered pressure mode"));
+    }
+
+    #[test]
+    fn scheduler_diagnostics_snapshot_tracks_per_channel_pressure_and_queue_state() {
+        let mut scheduler_config = test_scheduler_config();
+        scheduler_config
+            .backpressure
+            .pressure_pending_jobs_threshold = 1;
+        scheduler_config.backpressure.pressure_min_observations = 1;
+        scheduler_config.backpressure.severe_pending_jobs_threshold = 100;
+        scheduler_config
+            .backpressure
+            .severe_pending_final_jobs_threshold = 100;
+        scheduler_config.backpressure.severe_min_observations = 10;
+
+        let mut scheduler = StreamingVadScheduler::with_configs(
+            StreamingVadConfig {
+                min_speech_ms: 20,
+                ..test_vad_config()
+            },
+            scheduler_config,
+        );
+
+        for (channel, pts_ms, pending_jobs) in [
+            ("microphone", 0, 0),
+            ("system-audio", 0, 0),
+            ("microphone", 20, 1),
+            ("system-audio", 20, 1),
+        ] {
+            let _ = scheduler.on_capture(
+                manual_input(channel, pts_ms, 20, 960, 110),
+                LiveRuntimePhase::Active,
+                SchedulerPressureSnapshot {
+                    pending_jobs,
+                    pending_final_jobs: 0,
+                },
+            );
+        }
+
+        let diagnostics = scheduler.diagnostics_snapshot();
+        assert_eq!(diagnostics.backpressure_mode, BackpressureMode::Pressure);
+        assert_eq!(diagnostics.backpressure_transition_count, 1);
+        assert_eq!(
+            diagnostics.last_backpressure_transition_reason,
+            Some(BackpressureTransitionReason::PendingJobsSustained)
+        );
+
+        let mic = diagnostics
+            .channels
+            .get("microphone")
+            .expect("missing microphone diagnostics");
+        assert!(
+            mic.pressure_samples >= 1,
+            "expected pressure samples for microphone diagnostics: {:?}",
+            diagnostics
+        );
+        assert_eq!(mic.last_pending_jobs, 1);
+        assert_eq!(mic.last_pending_final_jobs, 0);
+
+        let sys = diagnostics
+            .channels
+            .get("system-audio")
+            .expect("missing system-audio diagnostics");
+        assert!(
+            sys.pressure_samples >= 1,
+            "expected pressure samples for system-audio diagnostics: {:?}",
+            diagnostics
+        );
+        assert_eq!(sys.last_pending_jobs, 1);
+        assert_eq!(sys.last_pending_final_jobs, 0);
+        let _ = scheduler.on_phase_change(LiveRuntimePhase::Draining);
+        let drained_diagnostics = scheduler.diagnostics_snapshot();
+        let mic_drained = drained_diagnostics
+            .channels
+            .get("microphone")
+            .expect("missing microphone diagnostics after drain");
+        let sys_drained = drained_diagnostics
+            .channels
+            .get("system-audio")
+            .expect("missing system-audio diagnostics after drain");
+        let total_queued_finals = mic_drained.queued_finals + sys_drained.queued_finals;
+        assert!(
+            total_queued_finals >= 1,
+            "expected at least one queued final in diagnostics snapshot after drain: {:?}",
+            drained_diagnostics
+        );
+    }
+
+    #[test]
+    fn pressure_mode_reduces_partial_cadence_without_blocking_finals() {
+        let mut scheduler_config = test_scheduler_config();
+        scheduler_config.partial_stride_ms = 20;
+        scheduler_config
+            .backpressure
+            .pressure_pending_jobs_threshold = 1;
+        scheduler_config.backpressure.pressure_min_observations = 1;
+        scheduler_config.backpressure.severe_pending_jobs_threshold = 100;
+        scheduler_config
+            .backpressure
+            .severe_pending_final_jobs_threshold = 100;
+        scheduler_config.backpressure.severe_min_observations = 10;
+        scheduler_config.backpressure.pressure_stride_multiplier = 2;
+
+        let mut scheduler =
+            StreamingVadScheduler::with_configs(test_vad_config(), scheduler_config);
+
+        let jobs_1 = scheduler.on_capture(
+            manual_input("microphone", 0, 20, 960, 110),
+            LiveRuntimePhase::Active,
+            SchedulerPressureSnapshot::default(),
+        );
+        assert!(jobs_1.is_empty());
+
+        let jobs_2 = scheduler.on_capture(
+            manual_input("microphone", 20, 20, 960, 110),
+            LiveRuntimePhase::Active,
+            SchedulerPressureSnapshot::default(),
+        );
+        assert_eq!(jobs_2.len(), 1);
+        assert_eq!(jobs_2[0].job_class, LiveAsrJobClass::Partial);
+        assert_eq!(jobs_2[0].window_ord, 1);
+
+        let jobs_3 = scheduler.on_capture(
+            manual_input("microphone", 40, 20, 960, 110),
+            LiveRuntimePhase::Active,
+            SchedulerPressureSnapshot {
+                pending_jobs: 1,
+                pending_final_jobs: 0,
+            },
+        );
+        assert_eq!(scheduler.backpressure_mode(), BackpressureMode::Pressure);
+        assert!(jobs_3.is_empty());
+
+        let jobs_4 = scheduler.on_capture(
+            manual_input("microphone", 60, 20, 960, 110),
+            LiveRuntimePhase::Active,
+            SchedulerPressureSnapshot {
+                pending_jobs: 1,
+                pending_final_jobs: 0,
+            },
+        );
+        assert_eq!(jobs_4.len(), 1);
+        assert_eq!(jobs_4[0].job_class, LiveAsrJobClass::Partial);
+        assert_eq!(jobs_4[0].window_ord, 2);
+    }
+
+    #[test]
+    fn pressure_mode_keeps_balanced_partial_fairness_across_channels() {
+        let mut scheduler_config = test_scheduler_config();
+        scheduler_config.partial_stride_ms = 20;
+        scheduler_config
+            .backpressure
+            .pressure_pending_jobs_threshold = 1;
+        scheduler_config.backpressure.pressure_min_observations = 1;
+        scheduler_config.backpressure.severe_pending_jobs_threshold = 100;
+        scheduler_config
+            .backpressure
+            .severe_pending_final_jobs_threshold = 100;
+        scheduler_config.backpressure.severe_min_observations = 10;
+        scheduler_config.backpressure.pressure_stride_multiplier = 2;
+
+        let mut scheduler = StreamingVadScheduler::with_configs(
+            StreamingVadConfig {
+                min_speech_ms: 20,
+                ..test_vad_config()
+            },
+            scheduler_config,
+        );
+
+        let mut emitted = Vec::new();
+        for (channel, pts_ms) in [
+            ("microphone", 0),
+            ("system-audio", 0),
+            ("microphone", 20),
+            ("system-audio", 20),
+            ("microphone", 40),
+            ("system-audio", 40),
+            ("microphone", 60),
+            ("system-audio", 60),
+        ] {
+            emitted.extend(scheduler.on_capture(
+                manual_input(channel, pts_ms, 20, 960, 110),
+                LiveRuntimePhase::Active,
+                SchedulerPressureSnapshot {
+                    pending_jobs: 1,
+                    pending_final_jobs: 0,
+                },
+            ));
+        }
+
+        assert_eq!(scheduler.backpressure_mode(), BackpressureMode::Pressure);
+        let transitions = scheduler.drain_backpressure_transitions();
+        assert!(
+            transitions
+                .iter()
+                .any(|transition| transition.to_mode == BackpressureMode::Pressure),
+            "expected pressure transition, got {:?}",
+            transitions
+        );
+
+        let mic_partials = count_jobs_for_channel(&emitted, "microphone", LiveAsrJobClass::Partial);
+        let sys_partials =
+            count_jobs_for_channel(&emitted, "system-audio", LiveAsrJobClass::Partial);
+        let skew = mic_partials.abs_diff(sys_partials);
+        let timeline = fairness_timeline(&emitted);
+        let diagnostics = scheduler.diagnostics_snapshot();
+        assert!(
+            skew == 0,
+            "pressure-mode partial fairness skew exceeded bound (max=0): mic_partials={}, sys_partials={}, skew={}, transitions={:?}, diagnostics={:?}, timeline={}",
+            mic_partials,
+            sys_partials,
+            skew,
+            transitions,
+            diagnostics,
+            timeline
+        );
+    }
+
+    #[test]
+    fn severe_mode_suppresses_partials_and_phase_reset_recovers_to_normal() {
+        let mut scheduler_config = test_scheduler_config();
+        scheduler_config
+            .backpressure
+            .pressure_pending_jobs_threshold = 100;
+        scheduler_config.backpressure.pressure_min_observations = 10;
+        scheduler_config.backpressure.severe_pending_jobs_threshold = 100;
+        scheduler_config
+            .backpressure
+            .severe_pending_final_jobs_threshold = 1;
+        scheduler_config.backpressure.severe_min_observations = 1;
+
+        let mut scheduler = StreamingVadScheduler::with_configs(
+            StreamingVadConfig {
+                min_speech_ms: 20,
+                ..test_vad_config()
+            },
+            scheduler_config,
+        );
+
+        let open = scheduler.on_capture(
+            manual_input("microphone", 0, 20, 960, 110),
+            LiveRuntimePhase::Active,
+            SchedulerPressureSnapshot::default(),
+        );
+        assert!(open.is_empty());
+
+        let severe_capture = scheduler.on_capture(
+            manual_input("microphone", 20, 20, 960, 110),
+            LiveRuntimePhase::Active,
+            SchedulerPressureSnapshot {
+                pending_jobs: 0,
+                pending_final_jobs: 1,
+            },
+        );
+        assert_eq!(scheduler.backpressure_mode(), BackpressureMode::Severe);
+        assert!(
+            severe_capture.is_empty(),
+            "severe mode must suppress partials"
+        );
+
+        let transitions = scheduler.drain_backpressure_transitions();
+        assert_eq!(transitions.len(), 1);
+        assert_eq!(transitions[0].to_mode, BackpressureMode::Severe);
+        assert_eq!(
+            transitions[0].reason,
+            BackpressureTransitionReason::PendingFinalJobsSustained
+        );
+
+        scheduler.queue_reconcile_job(LiveAsrJobDraft {
+            job_class: LiveAsrJobClass::Reconcile,
+            channel: "microphone".to_string(),
+            segment_id: "microphone-seg-0001".to_string(),
+            segment_ord: 1,
+            window_ord: 2,
+            start_ms: 0,
+            end_ms: 20,
+        });
+
+        let jobs = scheduler.on_phase_change(LiveRuntimePhase::Draining);
+        assert_eq!(jobs.len(), 2);
+        assert_eq!(jobs[0].job_class, LiveAsrJobClass::Final);
+        assert_eq!(jobs[1].job_class, LiveAsrJobClass::Reconcile);
+
+        let reset = scheduler.drain_backpressure_transitions();
+        assert_eq!(reset.len(), 1);
+        assert_eq!(reset[0].from_mode, BackpressureMode::Severe);
+        assert_eq!(reset[0].to_mode, BackpressureMode::Normal);
+        assert_eq!(
+            reset[0].reason,
+            BackpressureTransitionReason::PhaseBoundaryReset
+        );
+    }
+
+    #[test]
+    fn severe_mode_keeps_final_delivery_fair_across_channels() {
+        let mut scheduler_config = test_scheduler_config();
+        scheduler_config.partial_stride_ms = 20;
+        scheduler_config
+            .backpressure
+            .pressure_pending_jobs_threshold = 100;
+        scheduler_config.backpressure.pressure_min_observations = 10;
+        scheduler_config.backpressure.severe_pending_jobs_threshold = 100;
+        scheduler_config
+            .backpressure
+            .severe_pending_final_jobs_threshold = 1;
+        scheduler_config.backpressure.severe_min_observations = 1;
+
+        let mut scheduler = StreamingVadScheduler::with_configs(
+            StreamingVadConfig {
+                min_speech_ms: 20,
+                ..test_vad_config()
+            },
+            scheduler_config,
+        );
+
+        let mut emitted = Vec::new();
+        for (channel, pts_ms, activity, pending_final_jobs) in [
+            ("microphone", 0, 110, 0),
+            ("system-audio", 0, 110, 0),
+            ("microphone", 20, 110, 0),
+            ("system-audio", 20, 110, 0),
+            ("microphone", 40, 110, 1),
+            ("system-audio", 40, 110, 1),
+            ("microphone", 60, 0, 1),
+            ("system-audio", 60, 0, 1),
+            ("microphone", 80, 0, 1),
+            ("system-audio", 80, 0, 1),
+        ] {
+            emitted.extend(scheduler.on_capture(
+                manual_input(channel, pts_ms, 20, 960, activity),
+                LiveRuntimePhase::Active,
+                SchedulerPressureSnapshot {
+                    pending_jobs: 0,
+                    pending_final_jobs,
+                },
+            ));
+        }
+
+        assert_eq!(scheduler.backpressure_mode(), BackpressureMode::Severe);
+        let transitions = scheduler.drain_backpressure_transitions();
+        assert!(
+            transitions
+                .iter()
+                .any(|transition| transition.to_mode == BackpressureMode::Severe),
+            "expected severe transition, got {:?}",
+            transitions
+        );
+
+        let mic_finals = count_jobs_for_channel(&emitted, "microphone", LiveAsrJobClass::Final);
+        let sys_finals = count_jobs_for_channel(&emitted, "system-audio", LiveAsrJobClass::Final);
+        let final_skew = mic_finals.abs_diff(sys_finals);
+        let severe_only: Vec<LiveAsrJobDraft> = emitted
+            .iter()
+            .filter(|job| job.start_ms >= 40)
+            .cloned()
+            .collect();
+        let severe_partials = severe_only
+            .iter()
+            .filter(|job| job.job_class == LiveAsrJobClass::Partial)
+            .count();
+        let timeline = fairness_timeline(&emitted);
+        let diagnostics = scheduler.diagnostics_snapshot();
+        assert!(
+            final_skew == 0,
+            "severe-mode final fairness skew exceeded bound (max=0): mic_finals={}, sys_finals={}, skew={}, transitions={:?}, diagnostics={:?}, timeline={}",
+            mic_finals,
+            sys_finals,
+            final_skew,
+            transitions,
+            diagnostics,
+            timeline
+        );
+        assert_eq!(
+            severe_partials, 0,
+            "severe mode emitted partial(s) after severe activation: severe_partials={}, timeline={}",
+            severe_partials, timeline
+        );
+    }
+
+    #[test]
     fn streaming_scheduler_emits_final_on_close_boundary() {
         let mut scheduler = StreamingVadScheduler::with_configs(
             test_vad_config(),
@@ -1431,29 +2394,35 @@ mod tests {
                 partial_window_ms: 40,
                 partial_stride_ms: 1000,
                 min_partial_span_ms: 20,
+                backpressure: AdaptiveBackpressureConfig::default(),
             },
         );
         scheduler.on_capture(
             manual_input("microphone", 0, 20, 960, 110),
             LiveRuntimePhase::Active,
+            SchedulerPressureSnapshot::default(),
         );
         scheduler.on_capture(
             manual_input("microphone", 20, 20, 960, 110),
             LiveRuntimePhase::Active,
+            SchedulerPressureSnapshot::default(),
         );
         scheduler.on_capture(
             manual_input("microphone", 40, 20, 960, 110),
             LiveRuntimePhase::Active,
+            SchedulerPressureSnapshot::default(),
         );
         let silence_1 = scheduler.on_capture(
             manual_input("microphone", 60, 20, 960, 0),
             LiveRuntimePhase::Active,
+            SchedulerPressureSnapshot::default(),
         );
         assert!(silence_1.is_empty());
 
         let silence_2 = scheduler.on_capture(
             manual_input("microphone", 80, 20, 960, 0),
             LiveRuntimePhase::Active,
+            SchedulerPressureSnapshot::default(),
         );
         assert_eq!(silence_2.len(), 1);
         assert_eq!(silence_2[0].job_class, LiveAsrJobClass::Final);
@@ -1507,6 +2476,7 @@ mod tests {
         scheduler.on_capture(
             manual_input("microphone", 0, 20, 960, 110),
             LiveRuntimePhase::Active,
+            SchedulerPressureSnapshot::default(),
         );
         scheduler.queue_reconcile_job(LiveAsrJobDraft {
             job_class: LiveAsrJobClass::Reconcile,
