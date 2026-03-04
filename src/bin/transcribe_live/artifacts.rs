@@ -1,3 +1,5 @@
+use super::contracts_models::{runtime_jsonl, runtime_manifest};
+use super::runtime_manifest_models as manifest_models;
 use super::*;
 
 pub(super) fn emit_latest_lifecycle_transition_jsonl(
@@ -25,15 +27,18 @@ pub(super) fn ensure_runtime_jsonl_parent(path: &Path) -> Result<(), CliError> {
 }
 
 pub(super) fn jsonl_vad_boundary_line(boundary: &VadBoundary, config: &TranscribeConfig) -> String {
-    format!(
-        "{{\"event_type\":\"vad_boundary\",\"channel\":\"merged\",\"boundary_id\":{},\"start_ms\":{},\"end_ms\":{},\"source\":\"{}\",\"vad_backend\":\"{}\",\"vad_threshold\":{:.3}}}",
-        boundary.id,
-        boundary.start_ms,
-        boundary.end_ms,
-        json_escape(boundary.source),
-        json_escape(&config.vad_backend.to_string()),
-        config.vad_threshold,
-    )
+    serde_json::to_string(&runtime_jsonl::RuntimeJsonlEvent::VadBoundary(
+        runtime_jsonl::VadBoundaryEventModel {
+            channel: "merged".to_string(),
+            boundary_id: boundary.id,
+            start_ms: boundary.start_ms,
+            end_ms: boundary.end_ms,
+            source: boundary.source.to_string(),
+            vad_backend: config.vad_backend.to_string(),
+            vad_threshold: config.vad_threshold as f64,
+        },
+    ))
+    .expect("runtime jsonl vad_boundary serialization")
 }
 
 pub(super) fn jsonl_transcript_event_line(
@@ -41,31 +46,47 @@ pub(super) fn jsonl_transcript_event_line(
     backend_id: &str,
     vad_boundary_count: usize,
 ) -> String {
-    if let Some(source_segment_id) = &event.source_final_segment_id {
-        format!(
-            "{{\"event_type\":\"{}\",\"channel\":\"{}\",\"segment_id\":\"{}\",\"source_final_segment_id\":\"{}\",\"start_ms\":{},\"end_ms\":{},\"text\":\"{}\",\"asr_backend\":\"{}\",\"vad_boundary_count\":{}}}",
-            event.event_type,
-            event.channel,
-            json_escape(&event.segment_id),
-            json_escape(source_segment_id),
-            event.start_ms,
-            event.end_ms,
-            json_escape(&event.text),
-            json_escape(backend_id),
-            vad_boundary_count
-        )
-    } else {
-        format!(
-            "{{\"event_type\":\"{}\",\"channel\":\"{}\",\"segment_id\":\"{}\",\"start_ms\":{},\"end_ms\":{},\"text\":\"{}\",\"asr_backend\":\"{}\",\"vad_boundary_count\":{}}}",
-            event.event_type,
-            event.channel,
-            json_escape(&event.segment_id),
-            event.start_ms,
-            event.end_ms,
-            json_escape(&event.text),
-            json_escape(backend_id),
-            vad_boundary_count
-        )
+    let payload = runtime_jsonl::TranscriptArtifactEventModel {
+        channel: event.channel.clone(),
+        segment_id: event.segment_id.clone(),
+        source_final_segment_id: event.source_final_segment_id.clone(),
+        start_ms: event.start_ms,
+        end_ms: event.end_ms,
+        text: event.text.clone(),
+        asr_backend: backend_id.to_string(),
+        vad_boundary_count,
+    };
+    match event.event_type {
+        runtime_jsonl::EVENT_TYPE_PARTIAL => {
+            serde_json::to_string(&runtime_jsonl::RuntimeJsonlEvent::Partial(payload))
+                .expect("runtime jsonl transcript serialization")
+        }
+        runtime_jsonl::EVENT_TYPE_FINAL => {
+            serde_json::to_string(&runtime_jsonl::RuntimeJsonlEvent::Final(payload))
+                .expect("runtime jsonl transcript serialization")
+        }
+        runtime_jsonl::EVENT_TYPE_LLM_FINAL => {
+            serde_json::to_string(&runtime_jsonl::RuntimeJsonlEvent::LlmFinal(payload))
+                .expect("runtime jsonl transcript serialization")
+        }
+        runtime_jsonl::EVENT_TYPE_RECONCILED_FINAL => {
+            serde_json::to_string(&runtime_jsonl::RuntimeJsonlEvent::ReconciledFinal(payload))
+                .expect("runtime jsonl transcript serialization")
+        }
+        // Preserve forward compatibility for unknown transcript-like rows without
+        // introducing a panic surface in artifact emission.
+        other => serde_json::to_string(&serde_json::json!({
+            "event_type": other,
+            "channel": event.channel,
+            "segment_id": event.segment_id,
+            "source_final_segment_id": event.source_final_segment_id,
+            "start_ms": event.start_ms,
+            "end_ms": event.end_ms,
+            "text": event.text,
+            "asr_backend": backend_id,
+            "vad_boundary_count": vad_boundary_count
+        }))
+        .expect("runtime jsonl transcript fallback serialization"),
     }
 }
 
@@ -74,104 +95,129 @@ pub(super) fn jsonl_mode_degradation_line(
     active_mode: ChannelMode,
     degradation: &ModeDegradationEvent,
 ) -> String {
-    format!(
-        "{{\"event_type\":\"mode_degradation\",\"channel\":\"control\",\"requested_mode\":\"{}\",\"active_mode\":\"{}\",\"code\":\"{}\",\"detail\":\"{}\"}}",
-        json_escape(&requested_mode.to_string()),
-        json_escape(&active_mode.to_string()),
-        json_escape(degradation.code),
-        json_escape(&degradation.detail)
-    )
+    serde_json::to_string(&runtime_jsonl::RuntimeJsonlEvent::ModeDegradation(
+        runtime_jsonl::ModeDegradationEventModel {
+            channel: "control".to_string(),
+            requested_mode: requested_mode.to_string(),
+            active_mode: active_mode.to_string(),
+            code: degradation.code.to_string(),
+            detail: degradation.detail.clone(),
+        },
+    ))
+    .expect("runtime jsonl mode_degradation serialization")
 }
 
 pub(super) fn jsonl_trust_notice_line(notice: &TrustNotice) -> String {
-    format!(
-        "{{\"event_type\":\"trust_notice\",\"channel\":\"control\",\"code\":\"{}\",\"severity\":\"{}\",\"cause\":\"{}\",\"impact\":\"{}\",\"guidance\":\"{}\"}}",
-        json_escape(&notice.code),
-        json_escape(&notice.severity),
-        json_escape(&notice.cause),
-        json_escape(&notice.impact),
-        json_escape(&notice.guidance)
-    )
+    serde_json::to_string(&runtime_jsonl::RuntimeJsonlEvent::TrustNotice(
+        runtime_jsonl::TrustNoticeEventModel {
+            channel: "control".to_string(),
+            code: notice.code.clone(),
+            severity: notice.severity.clone(),
+            cause: notice.cause.clone(),
+            impact: notice.impact.clone(),
+            guidance: notice.guidance.clone(),
+        },
+    ))
+    .expect("runtime jsonl trust_notice serialization")
 }
 
 pub(super) fn jsonl_lifecycle_phase_line(
     index: usize,
     transition: &LiveLifecycleTransition,
 ) -> String {
-    format!(
-        "{{\"event_type\":\"lifecycle_phase\",\"channel\":\"control\",\"phase\":\"{}\",\"transition_index\":{},\"entered_at_utc\":\"{}\",\"ready_for_transcripts\":{},\"detail\":\"{}\"}}",
-        transition.phase,
-        index,
-        json_escape(&transition.entered_at_utc),
-        transition.phase.ready_for_transcripts(),
-        json_escape(&transition.detail)
-    )
+    serde_json::to_string(&runtime_jsonl::RuntimeJsonlEvent::LifecyclePhase(
+        runtime_jsonl::LifecyclePhaseEventModel {
+            channel: "control".to_string(),
+            phase: transition.phase.to_string(),
+            transition_index: index,
+            entered_at_utc: transition.entered_at_utc.clone(),
+            ready_for_transcripts: transition.phase.ready_for_transcripts(),
+            detail: transition.detail.clone(),
+        },
+    ))
+    .expect("runtime jsonl lifecycle_phase serialization")
 }
 
 pub(super) fn jsonl_reconciliation_matrix_line(reconciliation: &ReconciliationMatrix) -> String {
-    format!(
-        "{{\"event_type\":\"reconciliation_matrix\",\"channel\":\"control\",\"required\":{},\"applied\":{},\"trigger_count\":{},\"trigger_codes\":[{}]}}",
-        reconciliation.required,
-        reconciliation.applied,
-        reconciliation.triggers.len(),
-        reconciliation_trigger_codes_json(reconciliation.triggers.as_slice())
-    )
+    serde_json::to_string(&runtime_jsonl::RuntimeJsonlEvent::ReconciliationMatrix(
+        runtime_jsonl::ReconciliationMatrixEventModel {
+            channel: "control".to_string(),
+            required: reconciliation.required,
+            applied: reconciliation.applied,
+            trigger_count: reconciliation.triggers.len(),
+            trigger_codes: reconciliation
+                .triggers
+                .iter()
+                .map(|trigger| trigger.code.to_string())
+                .collect(),
+        },
+    ))
+    .expect("runtime jsonl reconciliation_matrix serialization")
 }
 
 pub(super) fn jsonl_asr_worker_pool_line(asr_worker_pool: &LiveAsrPoolTelemetry) -> String {
-    format!(
-        "{{\"event_type\":\"asr_worker_pool\",\"channel\":\"control\",\"prewarm_ok\":{},\"submitted\":{},\"enqueued\":{},\"dropped_queue_full\":{},\"processed\":{},\"succeeded\":{},\"failed\":{},\"retry_attempts\":{},\"temp_audio_deleted\":{},\"temp_audio_retained\":{}}}",
-        asr_worker_pool.prewarm_ok,
-        asr_worker_pool.submitted,
-        asr_worker_pool.enqueued,
-        asr_worker_pool.dropped_queue_full,
-        asr_worker_pool.processed,
-        asr_worker_pool.succeeded,
-        asr_worker_pool.failed,
-        asr_worker_pool.retry_attempts,
-        asr_worker_pool.temp_audio_deleted,
-        asr_worker_pool.temp_audio_retained
-    )
+    serde_json::to_string(&runtime_jsonl::RuntimeJsonlEvent::AsrWorkerPool(
+        runtime_jsonl::AsrWorkerPoolEventModel {
+            channel: "control".to_string(),
+            prewarm_ok: asr_worker_pool.prewarm_ok,
+            submitted: asr_worker_pool.submitted,
+            enqueued: asr_worker_pool.enqueued,
+            dropped_queue_full: asr_worker_pool.dropped_queue_full,
+            processed: asr_worker_pool.processed,
+            succeeded: asr_worker_pool.succeeded,
+            failed: asr_worker_pool.failed,
+            retry_attempts: asr_worker_pool.retry_attempts,
+            temp_audio_deleted: asr_worker_pool.temp_audio_deleted,
+            temp_audio_retained: asr_worker_pool.temp_audio_retained,
+        },
+    ))
+    .expect("runtime jsonl asr_worker_pool serialization")
 }
 
 pub(super) fn jsonl_chunk_queue_line(chunk_queue: &LiveChunkQueueTelemetry) -> String {
-    format!(
-        "{{\"event_type\":\"chunk_queue\",\"channel\":\"control\",\"enabled\":{},\"max_queue\":{},\"submitted\":{},\"enqueued\":{},\"dropped_oldest\":{},\"processed\":{},\"pending\":{},\"high_water\":{},\"drain_completed\":{},\"lag_sample_count\":{},\"lag_p50_ms\":{},\"lag_p95_ms\":{},\"lag_max_ms\":{}}}",
-        chunk_queue.enabled,
-        chunk_queue.max_queue,
-        chunk_queue.submitted,
-        chunk_queue.enqueued,
-        chunk_queue.dropped_oldest,
-        chunk_queue.processed,
-        chunk_queue.pending,
-        chunk_queue.high_water,
-        chunk_queue.drain_completed,
-        chunk_queue.lag_sample_count,
-        chunk_queue.lag_p50_ms,
-        chunk_queue.lag_p95_ms,
-        chunk_queue.lag_max_ms
-    )
+    serde_json::to_string(&runtime_jsonl::RuntimeJsonlEvent::ChunkQueue(
+        runtime_jsonl::ChunkQueueEventModel {
+            channel: "control".to_string(),
+            enabled: chunk_queue.enabled,
+            max_queue: chunk_queue.max_queue,
+            submitted: chunk_queue.submitted,
+            enqueued: chunk_queue.enqueued,
+            dropped_oldest: chunk_queue.dropped_oldest,
+            processed: chunk_queue.processed,
+            pending: chunk_queue.pending,
+            high_water: chunk_queue.high_water,
+            drain_completed: chunk_queue.drain_completed,
+            lag_sample_count: chunk_queue.lag_sample_count,
+            lag_p50_ms: chunk_queue.lag_p50_ms as usize,
+            lag_p95_ms: chunk_queue.lag_p95_ms as usize,
+            lag_max_ms: chunk_queue.lag_max_ms as usize,
+        },
+    ))
+    .expect("runtime jsonl chunk_queue serialization")
 }
 
 pub(super) fn jsonl_cleanup_queue_line(cleanup_queue: &CleanupQueueTelemetry) -> String {
-    format!(
-        "{{\"event_type\":\"cleanup_queue\",\"channel\":\"control\",\"enabled\":{},\"max_queue\":{},\"timeout_ms\":{},\"retries\":{},\"submitted\":{},\"enqueued\":{},\"dropped_queue_full\":{},\"processed\":{},\"succeeded\":{},\"timed_out\":{},\"failed\":{},\"retry_attempts\":{},\"pending\":{},\"drain_budget_ms\":{},\"drain_completed\":{}}}",
-        cleanup_queue.enabled,
-        cleanup_queue.max_queue,
-        cleanup_queue.timeout_ms,
-        cleanup_queue.retries,
-        cleanup_queue.submitted,
-        cleanup_queue.enqueued,
-        cleanup_queue.dropped_queue_full,
-        cleanup_queue.processed,
-        cleanup_queue.succeeded,
-        cleanup_queue.timed_out,
-        cleanup_queue.failed,
-        cleanup_queue.retry_attempts,
-        cleanup_queue.pending,
-        cleanup_queue.drain_budget_ms,
-        cleanup_queue.drain_completed
-    )
+    serde_json::to_string(&runtime_jsonl::RuntimeJsonlEvent::CleanupQueue(
+        runtime_jsonl::CleanupQueueEventModel {
+            channel: "control".to_string(),
+            enabled: cleanup_queue.enabled,
+            max_queue: cleanup_queue.max_queue,
+            timeout_ms: cleanup_queue.timeout_ms,
+            retries: cleanup_queue.retries,
+            submitted: cleanup_queue.submitted,
+            enqueued: cleanup_queue.enqueued,
+            dropped_queue_full: cleanup_queue.dropped_queue_full,
+            processed: cleanup_queue.processed,
+            succeeded: cleanup_queue.succeeded,
+            timed_out: cleanup_queue.timed_out,
+            failed: cleanup_queue.failed,
+            retry_attempts: cleanup_queue.retry_attempts,
+            pending: cleanup_queue.pending,
+            drain_budget_ms: cleanup_queue.drain_budget_ms,
+            drain_completed: cleanup_queue.drain_completed,
+        },
+    ))
+    .expect("runtime jsonl cleanup_queue serialization")
 }
 
 pub(super) fn write_runtime_jsonl(
@@ -263,25 +309,10 @@ pub(super) fn write_runtime_jsonl(
     Ok(())
 }
 
-pub(super) fn write_runtime_manifest(
+fn build_runtime_manifest_model(
     config: &TranscribeConfig,
     report: &LiveRunReport,
-) -> Result<(), CliError> {
-    if let Some(parent) = config.out_manifest.parent() {
-        fs::create_dir_all(parent).map_err(|err| {
-            CliError::new(format!(
-                "failed to create runtime manifest directory {}: {err}",
-                parent.display()
-            ))
-        })?;
-    }
-    let mut file = File::create(&config.out_manifest).map_err(|err| {
-        CliError::new(format!(
-            "failed to create runtime manifest {}: {err}",
-            display_path(&config.out_manifest)
-        ))
-    })?;
-
+) -> manifest_models::RuntimeManifest {
     let first_start_ms = report
         .vad_boundaries
         .first()
@@ -310,408 +341,12 @@ pub(super) fn write_runtime_manifest(
         .map(|metadata| metadata.is_file())
         .unwrap_or(false);
     let out_wav_bytes = out_wav_metadata.map(|metadata| metadata.len()).unwrap_or(0);
-
-    writeln!(file, "{{").map_err(io_to_cli)?;
-    writeln!(file, "  \"schema_version\": \"1\",").map_err(io_to_cli)?;
-    writeln!(file, "  \"kind\": \"transcribe-live-runtime\",").map_err(io_to_cli)?;
-    writeln!(
-        file,
-        "  \"generated_at_utc\": \"{}\",",
-        json_escape(&report.generated_at_utc)
-    )
-    .map_err(io_to_cli)?;
-    writeln!(
-        file,
-        "  \"asr_backend\": \"{}\",",
-        json_escape(report.backend_id)
-    )
-    .map_err(io_to_cli)?;
-    writeln!(
-        file,
-        "  \"asr_model\": \"{}\",",
-        json_escape(&display_path(&report.resolved_model_path))
-    )
-    .map_err(io_to_cli)?;
-    writeln!(
-        file,
-        "  \"asr_model_source\": \"{}\",",
-        json_escape(&report.resolved_model_source)
-    )
-    .map_err(io_to_cli)?;
-    writeln!(
-        file,
-        "  \"asr_model_checksum_sha256\": \"{}\",",
-        json_escape(&model_checksum.sha256)
-    )
-    .map_err(io_to_cli)?;
-    writeln!(
-        file,
-        "  \"asr_model_checksum_status\": \"{}\",",
-        json_escape(&model_checksum.status)
-    )
-    .map_err(io_to_cli)?;
-    writeln!(
-        file,
-        "  \"input_wav\": \"{}\",",
-        json_escape(&display_path(&config.input_wav))
-    )
-    .map_err(io_to_cli)?;
-    writeln!(
-        file,
-        "  \"input_wav_semantics\": \"{}\",",
-        json_escape(input_wav_semantics(config))
-    )
-    .map_err(io_to_cli)?;
-    writeln!(
-        file,
-        "  \"out_wav\": \"{}\",",
-        json_escape(&display_path(&config.out_wav))
-    )
-    .map_err(io_to_cli)?;
-    writeln!(
-        file,
-        "  \"out_wav_semantics\": \"{}\",",
-        json_escape(OUT_WAV_SEMANTICS)
-    )
-    .map_err(io_to_cli)?;
-    writeln!(
-        file,
-        "  \"out_wav_materialized\": {},",
-        out_wav_materialized
-    )
-    .map_err(io_to_cli)?;
-    writeln!(file, "  \"out_wav_bytes\": {},", out_wav_bytes).map_err(io_to_cli)?;
-    writeln!(
-        file,
-        "  \"channel_mode\": \"{}\",",
-        json_escape(&report.active_channel_mode.to_string())
-    )
-    .map_err(io_to_cli)?;
-    writeln!(
-        file,
-        "  \"channel_mode_requested\": \"{}\",",
-        json_escape(&report.channel_mode.to_string())
-    )
-    .map_err(io_to_cli)?;
-    writeln!(
-        file,
-        "  \"runtime_mode\": \"{}\",",
-        json_escape(config.runtime_mode_label())
-    )
-    .map_err(io_to_cli)?;
-    writeln!(
-        file,
-        "  \"runtime_mode_taxonomy\": \"{}\",",
-        json_escape(config.runtime_mode_taxonomy_label())
-    )
-    .map_err(io_to_cli)?;
-    writeln!(
-        file,
-        "  \"runtime_mode_selector\": \"{}\",",
-        json_escape(config.runtime_mode_selector_label())
-    )
-    .map_err(io_to_cli)?;
-    writeln!(
-        file,
-        "  \"runtime_mode_status\": \"{}\",",
-        json_escape(config.runtime_mode_status_label())
-    )
-    .map_err(io_to_cli)?;
-    writeln!(
-        file,
-        "  \"live_config\": {{\"live_chunked\":{},\"chunk_window_ms\":{},\"chunk_stride_ms\":{},\"chunk_queue_cap\":{}}},",
-        config.live_chunked,
-        config.chunk_window_ms,
-        config.chunk_stride_ms,
-        config.chunk_queue_cap
-    )
-    .map_err(io_to_cli)?;
-    writeln!(
-        file,
-        "  \"lifecycle\": {{\"current_phase\":\"{}\",\"ready_for_transcripts\":{},\"transitions\": [",
-        json_escape(report.lifecycle.current_phase.as_str()),
-        report.lifecycle.ready_for_transcripts
-    )
-    .map_err(io_to_cli)?;
-    for (idx, transition) in report.lifecycle.transitions.iter().enumerate() {
-        writeln!(
-            file,
-            "    {{\"phase\":\"{}\",\"transition_index\":{},\"entered_at_utc\":\"{}\",\"ready_for_transcripts\":{},\"detail\":\"{}\"}}{}",
-            json_escape(transition.phase.as_str()),
-            idx,
-            json_escape(&transition.entered_at_utc),
-            transition.phase.ready_for_transcripts(),
-            json_escape(&transition.detail),
-            if idx + 1 == report.lifecycle.transitions.len() {
-                ""
-            } else {
-                ","
-            }
-        )
-        .map_err(io_to_cli)?;
-    }
-    writeln!(file, "  ]}},").map_err(io_to_cli)?;
-    writeln!(
-        file,
-        "  \"speaker_labels\": [\"{}\",\"{}\"],",
-        json_escape(&config.speaker_labels.mic),
-        json_escape(&config.speaker_labels.system)
-    )
-    .map_err(io_to_cli)?;
-    writeln!(
-        file,
-        "  \"event_channels\": [{}],",
-        event_channels
-            .iter()
-            .map(|channel| format!("\"{}\"", json_escape(channel)))
-            .collect::<Vec<_>>()
-            .join(",")
-    )
-    .map_err(io_to_cli)?;
-    writeln!(
-        file,
-        "  \"vad\": {{\"backend\":\"{}\",\"threshold\":{:.3},\"min_speech_ms\":{},\"min_silence_ms\":{},\"boundary_count\":{}}},",
-        json_escape(&config.vad_backend.to_string()),
-        config.vad_threshold,
-        config.vad_min_speech_ms,
-        config.vad_min_silence_ms,
-        report.vad_boundaries.len()
-    )
-    .map_err(io_to_cli)?;
-    writeln!(
-        file,
-        "  \"transcript\": {{\"segment_id\":\"representative-0\",\"start_ms\":{},\"end_ms\":{},\"text\":\"{}\"}},",
-        first_start_ms,
-        last_end_ms,
-        json_escape(&report.transcript_text)
-    )
-    .map_err(io_to_cli)?;
-    writeln!(
-        file,
-        "  \"readability_defaults\": {{\"merged_line_format\":\"[MM:SS.mmm-MM:SS.mmm] <channel>: <text>\",\"near_overlap_window_ms\":{},\"near_overlap_annotation\":\"(overlap<={}ms with <channel>)\",\"ordering\":\"start_ms,end_ms,event_type,channel,segment_id,source_final_segment_id,text\"}},",
-        OVERLAP_WINDOW_MS,
-        OVERLAP_WINDOW_MS
-    )
-    .map_err(io_to_cli)?;
-    writeln!(file, "  \"transcript_per_channel\": [").map_err(io_to_cli)?;
-    for (idx, channel) in per_channel_defaults.iter().enumerate() {
-        writeln!(
-            file,
-            "    {{\"channel\":\"{}\",\"text\":\"{}\"}}{}",
-            json_escape(&channel.channel),
-            json_escape(&channel.text),
-            if idx + 1 == per_channel_defaults.len() {
-                ""
-            } else {
-                ","
-            }
-        )
-        .map_err(io_to_cli)?;
-    }
-    writeln!(file, "  ],").map_err(io_to_cli)?;
-    writeln!(
-        file,
-        "  \"terminal_summary\": {{\"live_mode\":{},\"render_mode\":\"{}\",\"stable_line_policy\":\"final-only\",\"stable_line_count\":{},\"stable_lines_replayed\":{},\"stable_lines\": [",
-        live_mode,
-        json_escape(terminal_mode.as_str()),
-        stable_terminal_lines.len(),
-        !live_mode
-    )
-    .map_err(io_to_cli)?;
-    for (idx, line) in stable_terminal_lines.iter().enumerate() {
-        writeln!(
-            file,
-            "    \"{}\"{}",
-            json_escape(line),
-            if idx + 1 == stable_terminal_lines.len() {
-                ""
-            } else {
-                ","
-            }
-        )
-        .map_err(io_to_cli)?;
-    }
-    writeln!(file, "  ]}},").map_err(io_to_cli)?;
-    writeln!(
-        file,
-        "  \"first_emit_timing_ms\": {{\"first_any\":{},\"first_partial\":{},\"first_final\":{},\"first_stable\":{}}},",
-        json_optional_u64(first_emit.first_any_end_ms),
-        json_optional_u64(first_emit.first_partial_end_ms),
-        json_optional_u64(first_emit.first_final_end_ms),
-        json_optional_u64(first_emit.first_stable_end_ms)
-    )
-    .map_err(io_to_cli)?;
-    writeln!(
-        file,
-        "  \"queue_defer\": {{\"submit_window\":{},\"deferred_final_submissions\":{},\"max_pending_final_backlog\":{}}},",
-        report.final_buffering.submit_window,
-        report.final_buffering.deferred_final_submissions,
-        report.final_buffering.max_pending_final_backlog
-    )
-    .map_err(io_to_cli)?;
-    writeln!(
-        file,
-        "  \"ordering_metadata\": {{\"event_sort_key\":\"start_ms,end_ms,event_type,channel,segment_id,source_final_segment_id,text\",\"stable_line_sort_key\":\"start_ms,end_ms,channel,segment_id,source_final_segment_id,text\",\"stable_line_event_types\":[\"final\",\"llm_final\",\"reconciled_final\"],\"event_count\":{}}},",
-        report.events.len()
-    )
-    .map_err(io_to_cli)?;
-    writeln!(file, "  \"events\": [").map_err(io_to_cli)?;
-    for (idx, event) in report.events.iter().enumerate() {
-        if let Some(source_segment_id) = &event.source_final_segment_id {
-            writeln!(
-                file,
-                "    {{\"event_type\":\"{}\",\"channel\":\"{}\",\"segment_id\":\"{}\",\"source_final_segment_id\":\"{}\",\"start_ms\":{},\"end_ms\":{},\"text\":\"{}\"}}{}",
-                json_escape(event.event_type),
-                json_escape(&event.channel),
-                json_escape(&event.segment_id),
-                json_escape(source_segment_id),
-                event.start_ms,
-                event.end_ms,
-                json_escape(&event.text),
-                if idx + 1 == report.events.len() { "" } else { "," }
-            )
-            .map_err(io_to_cli)?;
-        } else {
-            writeln!(
-                file,
-                "    {{\"event_type\":\"{}\",\"channel\":\"{}\",\"segment_id\":\"{}\",\"start_ms\":{},\"end_ms\":{},\"text\":\"{}\"}}{}",
-                json_escape(event.event_type),
-                json_escape(&event.channel),
-                json_escape(&event.segment_id),
-                event.start_ms,
-                event.end_ms,
-                json_escape(&event.text),
-                if idx + 1 == report.events.len() { "" } else { "," }
-            )
-            .map_err(io_to_cli)?;
-        }
-    }
-    writeln!(file, "  ],").map_err(io_to_cli)?;
-    writeln!(
-        file,
-        "  \"benchmark\": {{\"run_count\":{},\"wall_ms_p50\":{:.6},\"wall_ms_p95\":{:.6},\"partial_slo_met\":{},\"final_slo_met\":{},\"summary_csv\":\"{}\",\"runs_csv\":\"{}\"}},",
-        report.benchmark.run_count,
-        report.benchmark.wall_ms_p50,
-        report.benchmark.wall_ms_p95,
-        report.benchmark.partial_slo_met,
-        report.benchmark.final_slo_met,
-        json_escape(&report.benchmark_summary_csv.display().to_string()),
-        json_escape(&report.benchmark_runs_csv.display().to_string())
-    )
-    .map_err(io_to_cli)?;
-    writeln!(
-        file,
-        "  \"reconciliation\": {{\"required\":{},\"applied\":{},\"trigger_count\":{},\"trigger_codes\":[{}]}},",
-        report.reconciliation.required,
-        report.reconciliation.applied,
-        report.reconciliation.triggers.len(),
-        reconciliation_trigger_codes_json(&report.reconciliation.triggers)
-    )
-    .map_err(io_to_cli)?;
-    writeln!(
-        file,
-        "  \"asr_worker_pool\": {{\"prewarm_ok\":{},\"submitted\":{},\"enqueued\":{},\"dropped_queue_full\":{},\"processed\":{},\"succeeded\":{},\"failed\":{},\"retry_attempts\":{},\"temp_audio_deleted\":{},\"temp_audio_retained\":{}}},",
-        report.asr_worker_pool.prewarm_ok,
-        report.asr_worker_pool.submitted,
-        report.asr_worker_pool.enqueued,
-        report.asr_worker_pool.dropped_queue_full,
-        report.asr_worker_pool.processed,
-        report.asr_worker_pool.succeeded,
-        report.asr_worker_pool.failed,
-        report.asr_worker_pool.retry_attempts,
-        report.asr_worker_pool.temp_audio_deleted,
-        report.asr_worker_pool.temp_audio_retained
-    )
-    .map_err(io_to_cli)?;
-    writeln!(
-        file,
-        "  \"chunk_queue\": {{\"enabled\":{},\"max_queue\":{},\"submitted\":{},\"enqueued\":{},\"dropped_oldest\":{},\"processed\":{},\"pending\":{},\"high_water\":{},\"drain_completed\":{},\"lag_sample_count\":{},\"lag_p50_ms\":{},\"lag_p95_ms\":{},\"lag_max_ms\":{}}},",
-        report.chunk_queue.enabled,
-        report.chunk_queue.max_queue,
-        report.chunk_queue.submitted,
-        report.chunk_queue.enqueued,
-        report.chunk_queue.dropped_oldest,
-        report.chunk_queue.processed,
-        report.chunk_queue.pending,
-        report.chunk_queue.high_water,
-        report.chunk_queue.drain_completed,
-        report.chunk_queue.lag_sample_count,
-        report.chunk_queue.lag_p50_ms,
-        report.chunk_queue.lag_p95_ms,
-        report.chunk_queue.lag_max_ms
-    )
-    .map_err(io_to_cli)?;
-    writeln!(
-        file,
-        "  \"cleanup_queue\": {{\"enabled\":{},\"max_queue\":{},\"timeout_ms\":{},\"retries\":{},\"submitted\":{},\"enqueued\":{},\"dropped_queue_full\":{},\"processed\":{},\"succeeded\":{},\"timed_out\":{},\"failed\":{},\"retry_attempts\":{},\"pending\":{},\"drain_budget_ms\":{},\"drain_completed\":{}}},",
-        report.cleanup_queue.enabled,
-        report.cleanup_queue.max_queue,
-        report.cleanup_queue.timeout_ms,
-        report.cleanup_queue.retries,
-        report.cleanup_queue.submitted,
-        report.cleanup_queue.enqueued,
-        report.cleanup_queue.dropped_queue_full,
-        report.cleanup_queue.processed,
-        report.cleanup_queue.succeeded,
-        report.cleanup_queue.timed_out,
-        report.cleanup_queue.failed,
-        report.cleanup_queue.retry_attempts,
-        report.cleanup_queue.pending,
-        report.cleanup_queue.drain_budget_ms,
-        report.cleanup_queue.drain_completed
-    )
-    .map_err(io_to_cli)?;
-    writeln!(file, "  \"degradation_events\": [").map_err(io_to_cli)?;
-    for (idx, degradation) in report.degradation_events.iter().enumerate() {
-        writeln!(file, "    {{").map_err(io_to_cli)?;
-        writeln!(
-            file,
-            "      \"code\": \"{}\",",
-            json_escape(degradation.code)
-        )
-        .map_err(io_to_cli)?;
-        writeln!(
-            file,
-            "      \"detail\": \"{}\"",
-            json_escape(&degradation.detail)
-        )
-        .map_err(io_to_cli)?;
-        if idx + 1 == report.degradation_events.len() {
-            writeln!(file, "    }}").map_err(io_to_cli)?;
-        } else {
-            writeln!(file, "    }},").map_err(io_to_cli)?;
-        }
-    }
-    writeln!(file, "  ],").map_err(io_to_cli)?;
-    writeln!(
-        file,
-        "  \"trust\": {{\"degraded_mode_active\":{},\"notice_count\":{},\"notices\": [",
-        !report.trust_notices.is_empty(),
-        report.trust_notices.len()
-    )
-    .map_err(io_to_cli)?;
-    for (idx, notice) in report.trust_notices.iter().enumerate() {
-        writeln!(
-            file,
-            "    {{\"code\":\"{}\",\"severity\":\"{}\",\"cause\":\"{}\",\"impact\":\"{}\",\"guidance\":\"{}\"}}{}",
-            json_escape(&notice.code),
-            json_escape(&notice.severity),
-            json_escape(&notice.cause),
-            json_escape(&notice.impact),
-            json_escape(&notice.guidance),
-            if idx + 1 == report.trust_notices.len() {
-                ""
-            } else {
-                ","
-            }
-        )
-        .map_err(io_to_cli)?;
-    }
-    writeln!(file, "  ]}},").map_err(io_to_cli)?;
-    let partial_count = transcript_event_count(&report.events, "partial");
-    let final_count = transcript_event_count(&report.events, "final");
-    let llm_final_count = transcript_event_count(&report.events, "llm_final");
-    let reconciled_final_count = transcript_event_count(&report.events, "reconciled_final");
+    let partial_count = transcript_event_count(&report.events, runtime_jsonl::EVENT_TYPE_PARTIAL);
+    let final_count = transcript_event_count(&report.events, runtime_jsonl::EVENT_TYPE_FINAL);
+    let llm_final_count =
+        transcript_event_count(&report.events, runtime_jsonl::EVENT_TYPE_LLM_FINAL);
+    let reconciled_final_count =
+        transcript_event_count(&report.events, runtime_jsonl::EVENT_TYPE_RECONCILED_FINAL);
     let trust_top_codes = top_codes(
         report
             .trust_notices
@@ -726,73 +361,286 @@ pub(super) fn write_runtime_manifest(
             .map(|event| event.code.to_string()),
         3,
     );
-    writeln!(
-        file,
-        "  \"event_counts\": {{\"vad_boundary\":{},\"transcript\":{},\"partial\":{},\"final\":{},\"llm_final\":{},\"reconciled_final\":{}}},",
-        report.vad_boundaries.len(),
-        report.events.len(),
-        partial_count,
-        final_count,
-        llm_final_count,
-        reconciled_final_count
-    )
-    .map_err(io_to_cli)?;
-    writeln!(
-        file,
-        "  \"session_summary\": {{\"session_status\":\"{}\",\"duration_sec\":{},\"channel_mode_requested\":\"{}\",\"channel_mode_active\":\"{}\",\"transcript_events\":{{\"partial\":{},\"final\":{},\"llm_final\":{},\"reconciled_final\":{}}},\"chunk_queue\":{{\"submitted\":{},\"enqueued\":{},\"dropped_oldest\":{},\"processed\":{},\"pending\":{},\"high_water\":{},\"drain_completed\":{}}},\"chunk_lag\":{{\"lag_sample_count\":{},\"lag_p50_ms\":{},\"lag_p95_ms\":{},\"lag_max_ms\":{}}},\"trust_notices\":{{\"count\":{},\"top_codes\":[{}]}},\"degradation_events\":{{\"count\":{},\"top_codes\":[{}]}},\"cleanup_queue\":{{\"enabled\":{},\"submitted\":{},\"enqueued\":{},\"dropped_queue_full\":{},\"processed\":{},\"succeeded\":{},\"timed_out\":{},\"failed\":{},\"retry_attempts\":{},\"pending\":{},\"drain_completed\":{}}},\"artifacts\":{{\"out_wav\":\"{}\",\"out_jsonl\":\"{}\",\"out_manifest\":\"{}\"}}}},",
-        json_escape(session_status(report)),
-        config.duration_sec,
-        json_escape(&report.channel_mode.to_string()),
-        json_escape(&report.active_channel_mode.to_string()),
-        partial_count,
-        final_count,
-        llm_final_count,
-        reconciled_final_count,
-        report.chunk_queue.submitted,
-        report.chunk_queue.enqueued,
-        report.chunk_queue.dropped_oldest,
-        report.chunk_queue.processed,
-        report.chunk_queue.pending,
-        report.chunk_queue.high_water,
-        report.chunk_queue.drain_completed,
-        report.chunk_queue.lag_sample_count,
-        report.chunk_queue.lag_p50_ms,
-        report.chunk_queue.lag_p95_ms,
-        report.chunk_queue.lag_max_ms,
-        report.trust_notices.len(),
-        top_codes_json(&trust_top_codes),
-        report.degradation_events.len(),
-        top_codes_json(&degradation_top_codes),
-        report.cleanup_queue.enabled,
-        report.cleanup_queue.submitted,
-        report.cleanup_queue.enqueued,
-        report.cleanup_queue.dropped_queue_full,
-        report.cleanup_queue.processed,
-        report.cleanup_queue.succeeded,
-        report.cleanup_queue.timed_out,
-        report.cleanup_queue.failed,
-        report.cleanup_queue.retry_attempts,
-        report.cleanup_queue.pending,
-        report.cleanup_queue.drain_completed,
-        json_escape(&display_path(&config.out_wav)),
-        json_escape(&display_path(&config.out_jsonl)),
-        json_escape(&display_path(&config.out_manifest))
-    )
-    .map_err(io_to_cli)?;
-    writeln!(
-        file,
-        "  \"jsonl_path\": \"{}\"",
-        json_escape(&display_path(&config.out_jsonl))
-    )
-    .map_err(io_to_cli)?;
-    writeln!(file, "}}").map_err(io_to_cli)?;
-    Ok(())
+
+    manifest_models::RuntimeManifest {
+        schema_version: "1".to_string(),
+        kind: runtime_manifest::KIND_RUNTIME_MANIFEST.to_string(),
+        generated_at_utc: report.generated_at_utc.clone(),
+        asr_backend: report.backend_id.to_string(),
+        asr_model: display_path(&report.resolved_model_path),
+        asr_model_source: report.resolved_model_source.clone(),
+        asr_model_checksum_sha256: model_checksum.sha256,
+        asr_model_checksum_status: model_checksum.status,
+        input_wav: display_path(&config.input_wav),
+        input_wav_semantics: input_wav_semantics(config).to_string(),
+        out_wav: display_path(&config.out_wav),
+        out_wav_semantics: OUT_WAV_SEMANTICS.to_string(),
+        out_wav_materialized,
+        out_wav_bytes,
+        channel_mode: report.active_channel_mode.to_string(),
+        channel_mode_requested: report.channel_mode.to_string(),
+        runtime_mode: config.runtime_mode_label().to_string(),
+        runtime_mode_taxonomy: config.runtime_mode_taxonomy_label().to_string(),
+        runtime_mode_selector: config.runtime_mode_selector_label().to_string(),
+        runtime_mode_status: config.runtime_mode_status_label().to_string(),
+        live_config: manifest_models::RuntimeLiveConfig {
+            live_chunked: config.live_chunked,
+            chunk_window_ms: config.chunk_window_ms,
+            chunk_stride_ms: config.chunk_stride_ms,
+            chunk_queue_cap: config.chunk_queue_cap,
+        },
+        lifecycle: manifest_models::RuntimeLifecycle {
+            current_phase: report.lifecycle.current_phase.as_str().to_string(),
+            ready_for_transcripts: report.lifecycle.ready_for_transcripts,
+            transitions: report
+                .lifecycle
+                .transitions
+                .iter()
+                .enumerate()
+                .map(
+                    |(idx, transition)| manifest_models::RuntimeLifecycleTransition {
+                        phase: transition.phase.as_str().to_string(),
+                        transition_index: idx,
+                        entered_at_utc: transition.entered_at_utc.clone(),
+                        ready_for_transcripts: transition.phase.ready_for_transcripts(),
+                        detail: transition.detail.clone(),
+                    },
+                )
+                .collect(),
+        },
+        speaker_labels: vec![
+            config.speaker_labels.mic.clone(),
+            config.speaker_labels.system.clone(),
+        ],
+        event_channels,
+        vad: manifest_models::RuntimeVad {
+            backend: config.vad_backend.to_string(),
+            threshold: config.vad_threshold,
+            min_speech_ms: u64::from(config.vad_min_speech_ms),
+            min_silence_ms: u64::from(config.vad_min_silence_ms),
+            boundary_count: report.vad_boundaries.len(),
+        },
+        transcript: manifest_models::RuntimeTranscript {
+            segment_id: "representative-0".to_string(),
+            start_ms: first_start_ms,
+            end_ms: last_end_ms,
+            text: report.transcript_text.clone(),
+        },
+        readability_defaults: manifest_models::RuntimeReadabilityDefaults {
+            merged_line_format: "[MM:SS.mmm-MM:SS.mmm] <channel>: <text>".to_string(),
+            near_overlap_window_ms: OVERLAP_WINDOW_MS,
+            near_overlap_annotation: format!("(overlap<={}ms with <channel>)", OVERLAP_WINDOW_MS),
+            ordering: "start_ms,end_ms,event_type,channel,segment_id,source_final_segment_id,text"
+                .to_string(),
+        },
+        transcript_per_channel: per_channel_defaults
+            .iter()
+            .map(|channel| manifest_models::RuntimeTranscriptPerChannel {
+                channel: channel.channel.clone(),
+                text: channel.text.clone(),
+            })
+            .collect(),
+        terminal_summary: manifest_models::RuntimeTerminalSummary {
+            live_mode,
+            render_mode: terminal_mode.as_str().to_string(),
+            stable_line_policy: "final-only".to_string(),
+            stable_line_count: stable_terminal_lines.len(),
+            stable_lines_replayed: !live_mode,
+            stable_lines: stable_terminal_lines,
+        },
+        first_emit_timing_ms: manifest_models::RuntimeFirstEmitTiming {
+            first_any: first_emit.first_any_end_ms,
+            first_partial: first_emit.first_partial_end_ms,
+            first_final: first_emit.first_final_end_ms,
+            first_stable: first_emit.first_stable_end_ms,
+        },
+        queue_defer: manifest_models::RuntimeQueueDefer {
+            submit_window: report.final_buffering.submit_window,
+            deferred_final_submissions: report.final_buffering.deferred_final_submissions,
+            max_pending_final_backlog: report.final_buffering.max_pending_final_backlog,
+        },
+        ordering_metadata: manifest_models::RuntimeOrderingMetadata {
+            event_sort_key:
+                "start_ms,end_ms,event_type,channel,segment_id,source_final_segment_id,text"
+                    .to_string(),
+            stable_line_sort_key: "start_ms,end_ms,channel,segment_id,source_final_segment_id,text"
+                .to_string(),
+            stable_line_event_types: vec![
+                runtime_jsonl::EVENT_TYPE_FINAL.to_string(),
+                runtime_jsonl::EVENT_TYPE_LLM_FINAL.to_string(),
+                runtime_jsonl::EVENT_TYPE_RECONCILED_FINAL.to_string(),
+            ],
+            event_count: report.events.len(),
+        },
+        events: report
+            .events
+            .iter()
+            .map(|event| manifest_models::RuntimeTranscriptEvent {
+                event_type: event.event_type.to_string(),
+                channel: event.channel.clone(),
+                segment_id: event.segment_id.clone(),
+                source_final_segment_id: event.source_final_segment_id.clone(),
+                start_ms: event.start_ms,
+                end_ms: event.end_ms,
+                text: event.text.clone(),
+            })
+            .collect(),
+        benchmark: manifest_models::RuntimeBenchmark {
+            run_count: report.benchmark.run_count,
+            wall_ms_p50: report.benchmark.wall_ms_p50,
+            wall_ms_p95: report.benchmark.wall_ms_p95,
+            partial_slo_met: report.benchmark.partial_slo_met,
+            final_slo_met: report.benchmark.final_slo_met,
+            summary_csv: report.benchmark_summary_csv.display().to_string(),
+            runs_csv: report.benchmark_runs_csv.display().to_string(),
+        },
+        reconciliation: manifest_models::RuntimeReconciliation {
+            required: report.reconciliation.required,
+            applied: report.reconciliation.applied,
+            trigger_count: report.reconciliation.triggers.len(),
+            trigger_codes: report
+                .reconciliation
+                .triggers
+                .iter()
+                .map(|trigger| trigger.code.to_string())
+                .collect(),
+        },
+        asr_worker_pool: manifest_models::RuntimeAsrWorkerPool {
+            prewarm_ok: report.asr_worker_pool.prewarm_ok,
+            submitted: report.asr_worker_pool.submitted,
+            enqueued: report.asr_worker_pool.enqueued,
+            dropped_queue_full: report.asr_worker_pool.dropped_queue_full,
+            processed: report.asr_worker_pool.processed,
+            succeeded: report.asr_worker_pool.succeeded,
+            failed: report.asr_worker_pool.failed,
+            retry_attempts: report.asr_worker_pool.retry_attempts,
+            temp_audio_deleted: report.asr_worker_pool.temp_audio_deleted,
+            temp_audio_retained: report.asr_worker_pool.temp_audio_retained,
+        },
+        chunk_queue: manifest_models::RuntimeChunkQueue {
+            enabled: report.chunk_queue.enabled,
+            max_queue: report.chunk_queue.max_queue,
+            submitted: report.chunk_queue.submitted,
+            enqueued: report.chunk_queue.enqueued,
+            dropped_oldest: report.chunk_queue.dropped_oldest,
+            processed: report.chunk_queue.processed,
+            pending: report.chunk_queue.pending,
+            high_water: report.chunk_queue.high_water,
+            drain_completed: report.chunk_queue.drain_completed,
+            lag_sample_count: report.chunk_queue.lag_sample_count,
+            lag_p50_ms: report.chunk_queue.lag_p50_ms,
+            lag_p95_ms: report.chunk_queue.lag_p95_ms,
+            lag_max_ms: report.chunk_queue.lag_max_ms,
+        },
+        cleanup_queue: manifest_models::RuntimeCleanupQueue {
+            enabled: report.cleanup_queue.enabled,
+            max_queue: report.cleanup_queue.max_queue,
+            timeout_ms: report.cleanup_queue.timeout_ms,
+            retries: report.cleanup_queue.retries,
+            submitted: report.cleanup_queue.submitted,
+            enqueued: report.cleanup_queue.enqueued,
+            dropped_queue_full: report.cleanup_queue.dropped_queue_full,
+            processed: report.cleanup_queue.processed,
+            succeeded: report.cleanup_queue.succeeded,
+            timed_out: report.cleanup_queue.timed_out,
+            failed: report.cleanup_queue.failed,
+            retry_attempts: report.cleanup_queue.retry_attempts,
+            pending: report.cleanup_queue.pending,
+            drain_budget_ms: report.cleanup_queue.drain_budget_ms,
+            drain_completed: report.cleanup_queue.drain_completed,
+        },
+        degradation_events: report
+            .degradation_events
+            .iter()
+            .map(|event| manifest_models::RuntimeDegradationEvent {
+                code: event.code.to_string(),
+                detail: event.detail.clone(),
+            })
+            .collect(),
+        trust: manifest_models::RuntimeTrust {
+            degraded_mode_active: !report.trust_notices.is_empty(),
+            notice_count: report.trust_notices.len(),
+            notices: report
+                .trust_notices
+                .iter()
+                .map(|notice| manifest_models::RuntimeTrustNotice {
+                    code: notice.code.clone(),
+                    severity: notice.severity.clone(),
+                    cause: notice.cause.clone(),
+                    impact: notice.impact.clone(),
+                    guidance: notice.guidance.clone(),
+                })
+                .collect(),
+        },
+        event_counts: manifest_models::RuntimeEventCounts {
+            vad_boundary: report.vad_boundaries.len(),
+            transcript: report.events.len(),
+            partial: partial_count,
+            final_count,
+            llm_final: llm_final_count,
+            reconciled_final: reconciled_final_count,
+        },
+        session_summary: manifest_models::RuntimeSessionSummary {
+            session_status: session_status(report).to_string(),
+            duration_sec: config.duration_sec,
+            channel_mode_requested: report.channel_mode.to_string(),
+            channel_mode_active: report.active_channel_mode.to_string(),
+            transcript_events: manifest_models::RuntimeSessionTranscriptEvents {
+                partial: partial_count,
+                final_count,
+                llm_final: llm_final_count,
+                reconciled_final: reconciled_final_count,
+            },
+            chunk_queue: manifest_models::RuntimeSessionChunkQueue {
+                submitted: report.chunk_queue.submitted,
+                enqueued: report.chunk_queue.enqueued,
+                dropped_oldest: report.chunk_queue.dropped_oldest,
+                processed: report.chunk_queue.processed,
+                pending: report.chunk_queue.pending,
+                high_water: report.chunk_queue.high_water,
+                drain_completed: report.chunk_queue.drain_completed,
+            },
+            chunk_lag: manifest_models::RuntimeSessionChunkLag {
+                lag_sample_count: report.chunk_queue.lag_sample_count,
+                lag_p50_ms: report.chunk_queue.lag_p50_ms,
+                lag_p95_ms: report.chunk_queue.lag_p95_ms,
+                lag_max_ms: report.chunk_queue.lag_max_ms,
+            },
+            trust_notices: manifest_models::RuntimeSessionCodeSummary {
+                count: report.trust_notices.len(),
+                top_codes: trust_top_codes,
+            },
+            degradation_events: manifest_models::RuntimeSessionCodeSummary {
+                count: report.degradation_events.len(),
+                top_codes: degradation_top_codes,
+            },
+            cleanup_queue: manifest_models::RuntimeSessionCleanupQueue {
+                enabled: report.cleanup_queue.enabled,
+                submitted: report.cleanup_queue.submitted,
+                enqueued: report.cleanup_queue.enqueued,
+                dropped_queue_full: report.cleanup_queue.dropped_queue_full,
+                processed: report.cleanup_queue.processed,
+                succeeded: report.cleanup_queue.succeeded,
+                timed_out: report.cleanup_queue.timed_out,
+                failed: report.cleanup_queue.failed,
+                retry_attempts: report.cleanup_queue.retry_attempts,
+                pending: report.cleanup_queue.pending,
+                drain_completed: report.cleanup_queue.drain_completed,
+            },
+            artifacts: manifest_models::RuntimeSessionArtifacts {
+                out_wav: display_path(&config.out_wav),
+                out_jsonl: display_path(&config.out_jsonl),
+                out_manifest: display_path(&config.out_manifest),
+            },
+        },
+        jsonl_path: display_path(&config.out_jsonl),
+    }
 }
 
-pub(super) fn write_preflight_manifest(
+fn build_preflight_manifest_model(
     config: &TranscribeConfig,
     report: &PreflightReport,
-) -> Result<(), CliError> {
+) -> manifest_models::PreflightManifest {
     let resolved_model = validate_model_path_for_backend(config).ok();
     let model_checksum = model_checksum_info(resolved_model.as_ref());
     let requested_model = if config.asr_model.as_os_str().is_empty() {
@@ -809,6 +657,84 @@ pub(super) fn write_preflight_manifest(
         .map(|model| model.source.as_str())
         .unwrap_or("unresolved");
 
+    manifest_models::PreflightManifest {
+        schema_version: "1".to_string(),
+        kind: runtime_manifest::KIND_PREFLIGHT_MANIFEST.to_string(),
+        generated_at_utc: report.generated_at_utc.clone(),
+        overall_status: report.overall_status().to_string(),
+        runtime_mode: Some(config.runtime_mode_label().to_string()),
+        runtime_mode_taxonomy: Some(config.runtime_mode_taxonomy_label().to_string()),
+        runtime_mode_selector: Some(config.runtime_mode_selector_label().to_string()),
+        runtime_mode_status: Some(config.runtime_mode_status_label().to_string()),
+        config: manifest_models::PreflightConfig {
+            input_wav: Some(display_path(&config.input_wav)),
+            input_wav_semantics: Some(input_wav_semantics(config).to_string()),
+            out_wav: display_path(&config.out_wav),
+            out_wav_semantics: Some(OUT_WAV_SEMANTICS.to_string()),
+            out_jsonl: display_path(&config.out_jsonl),
+            out_manifest: display_path(&config.out_manifest),
+            asr_backend: config.asr_backend.to_string(),
+            asr_model_requested: requested_model,
+            asr_model_resolved: resolved_model_path,
+            asr_model_source: resolved_model_source.to_string(),
+            asr_model_checksum_sha256: Some(model_checksum.sha256),
+            asr_model_checksum_status: Some(model_checksum.status),
+            runtime_mode: Some(config.runtime_mode_label().to_string()),
+            runtime_mode_taxonomy: Some(config.runtime_mode_taxonomy_label().to_string()),
+            runtime_mode_selector: Some(config.runtime_mode_selector_label().to_string()),
+            runtime_mode_status: Some(config.runtime_mode_status_label().to_string()),
+            live_chunked: Some(config.live_chunked),
+            chunk_window_ms: Some(config.chunk_window_ms),
+            chunk_stride_ms: Some(config.chunk_stride_ms),
+            chunk_queue_cap: Some(config.chunk_queue_cap),
+            sample_rate_hz: config.sample_rate_hz,
+        },
+        checks: report
+            .checks
+            .iter()
+            .map(|check| manifest_models::PreflightCheck {
+                id: check.id.to_string(),
+                status: check.status.to_string(),
+                detail: check.detail.clone(),
+                remediation: check.remediation.as_deref().unwrap_or("").to_string(),
+            })
+            .collect(),
+    }
+}
+
+pub(super) fn write_runtime_manifest(
+    config: &TranscribeConfig,
+    report: &LiveRunReport,
+) -> Result<(), CliError> {
+    if let Some(parent) = config.out_manifest.parent() {
+        fs::create_dir_all(parent).map_err(|err| {
+            CliError::new(format!(
+                "failed to create runtime manifest directory {}: {err}",
+                parent.display()
+            ))
+        })?;
+    }
+    let mut file = File::create(&config.out_manifest).map_err(|err| {
+        CliError::new(format!(
+            "failed to create runtime manifest {}: {err}",
+            display_path(&config.out_manifest)
+        ))
+    })?;
+    let manifest_model = build_runtime_manifest_model(config, report);
+    serde_json::to_writer_pretty(&mut file, &manifest_model).map_err(|err| {
+        CliError::new(format!(
+            "failed to serialize runtime manifest {}: {err}",
+            display_path(&config.out_manifest)
+        ))
+    })?;
+    writeln!(file).map_err(io_to_cli)?;
+    Ok(())
+}
+
+pub(super) fn write_preflight_manifest(
+    config: &TranscribeConfig,
+    report: &PreflightReport,
+) -> Result<(), CliError> {
     if let Some(parent) = config.out_manifest.parent() {
         fs::create_dir_all(parent).map_err(|err| {
             CliError::new(format!(
@@ -824,180 +750,102 @@ pub(super) fn write_preflight_manifest(
             display_path(&config.out_manifest)
         ))
     })?;
+    let manifest_model = build_preflight_manifest_model(config, report);
+    serde_json::to_writer_pretty(&mut file, &manifest_model).map_err(|err| {
+        CliError::new(format!(
+            "failed to serialize preflight manifest {}: {err}",
+            display_path(&config.out_manifest)
+        ))
+    })?;
+    writeln!(file).map_err(io_to_cli)?;
+    Ok(())
+}
 
-    writeln!(file, "{{").map_err(io_to_cli)?;
-    writeln!(file, "  \"schema_version\": \"1\",").map_err(io_to_cli)?;
-    writeln!(file, "  \"kind\": \"transcribe-live-preflight\",").map_err(io_to_cli)?;
-    writeln!(
-        file,
-        "  \"generated_at_utc\": \"{}\",",
-        json_escape(&report.generated_at_utc)
-    )
-    .map_err(io_to_cli)?;
-    writeln!(
-        file,
-        "  \"overall_status\": \"{}\",",
-        report.overall_status()
-    )
-    .map_err(io_to_cli)?;
-    writeln!(
-        file,
-        "  \"runtime_mode\": \"{}\",",
-        json_escape(config.runtime_mode_label())
-    )
-    .map_err(io_to_cli)?;
-    writeln!(
-        file,
-        "  \"runtime_mode_taxonomy\": \"{}\",",
-        json_escape(config.runtime_mode_taxonomy_label())
-    )
-    .map_err(io_to_cli)?;
-    writeln!(
-        file,
-        "  \"runtime_mode_selector\": \"{}\",",
-        json_escape(config.runtime_mode_selector_label())
-    )
-    .map_err(io_to_cli)?;
-    writeln!(
-        file,
-        "  \"runtime_mode_status\": \"{}\",",
-        json_escape(config.runtime_mode_status_label())
-    )
-    .map_err(io_to_cli)?;
-    writeln!(file, "  \"config\": {{").map_err(io_to_cli)?;
-    writeln!(
-        file,
-        "    \"input_wav\": \"{}\",",
-        json_escape(&display_path(&config.input_wav))
-    )
-    .map_err(io_to_cli)?;
-    writeln!(
-        file,
-        "    \"input_wav_semantics\": \"{}\",",
-        json_escape(input_wav_semantics(config))
-    )
-    .map_err(io_to_cli)?;
-    writeln!(
-        file,
-        "    \"out_wav\": \"{}\",",
-        json_escape(&display_path(&config.out_wav))
-    )
-    .map_err(io_to_cli)?;
-    writeln!(
-        file,
-        "    \"out_wav_semantics\": \"{}\",",
-        json_escape(OUT_WAV_SEMANTICS)
-    )
-    .map_err(io_to_cli)?;
-    writeln!(
-        file,
-        "    \"out_jsonl\": \"{}\",",
-        json_escape(&display_path(&config.out_jsonl))
-    )
-    .map_err(io_to_cli)?;
-    writeln!(
-        file,
-        "    \"out_manifest\": \"{}\",",
-        json_escape(&display_path(&config.out_manifest))
-    )
-    .map_err(io_to_cli)?;
-    writeln!(
-        file,
-        "    \"asr_backend\": \"{}\",",
-        json_escape(&config.asr_backend.to_string())
-    )
-    .map_err(io_to_cli)?;
-    writeln!(
-        file,
-        "    \"asr_model_requested\": \"{}\",",
-        json_escape(&requested_model)
-    )
-    .map_err(io_to_cli)?;
-    writeln!(
-        file,
-        "    \"asr_model_resolved\": \"{}\",",
-        json_escape(&resolved_model_path)
-    )
-    .map_err(io_to_cli)?;
-    writeln!(
-        file,
-        "    \"asr_model_source\": \"{}\",",
-        json_escape(resolved_model_source)
-    )
-    .map_err(io_to_cli)?;
-    writeln!(
-        file,
-        "    \"asr_model_checksum_sha256\": \"{}\",",
-        json_escape(&model_checksum.sha256)
-    )
-    .map_err(io_to_cli)?;
-    writeln!(
-        file,
-        "    \"asr_model_checksum_status\": \"{}\",",
-        json_escape(&model_checksum.status)
-    )
-    .map_err(io_to_cli)?;
-    writeln!(
-        file,
-        "    \"runtime_mode\": \"{}\",",
-        json_escape(config.runtime_mode_label())
-    )
-    .map_err(io_to_cli)?;
-    writeln!(
-        file,
-        "    \"runtime_mode_taxonomy\": \"{}\",",
-        json_escape(config.runtime_mode_taxonomy_label())
-    )
-    .map_err(io_to_cli)?;
-    writeln!(
-        file,
-        "    \"runtime_mode_selector\": \"{}\",",
-        json_escape(config.runtime_mode_selector_label())
-    )
-    .map_err(io_to_cli)?;
-    writeln!(
-        file,
-        "    \"runtime_mode_status\": \"{}\",",
-        json_escape(config.runtime_mode_status_label())
-    )
-    .map_err(io_to_cli)?;
-    writeln!(file, "    \"live_chunked\": {},", config.live_chunked).map_err(io_to_cli)?;
-    writeln!(file, "    \"chunk_window_ms\": {},", config.chunk_window_ms).map_err(io_to_cli)?;
-    writeln!(file, "    \"chunk_stride_ms\": {},", config.chunk_stride_ms).map_err(io_to_cli)?;
-    writeln!(file, "    \"chunk_queue_cap\": {},", config.chunk_queue_cap).map_err(io_to_cli)?;
-    writeln!(file, "    \"sample_rate_hz\": {}", config.sample_rate_hz).map_err(io_to_cli)?;
-    writeln!(file, "  }},").map_err(io_to_cli)?;
-    writeln!(file, "  \"checks\": [").map_err(io_to_cli)?;
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::Value;
+    use std::collections::BTreeSet;
 
-    for (idx, check) in report.checks.iter().enumerate() {
-        writeln!(file, "    {{").map_err(io_to_cli)?;
-        writeln!(file, "      \"id\": \"{}\",", json_escape(check.id)).map_err(io_to_cli)?;
-        writeln!(
-            file,
-            "      \"status\": \"{}\",",
-            json_escape(&check.status.to_string())
-        )
-        .map_err(io_to_cli)?;
-        writeln!(
-            file,
-            "      \"detail\": \"{}\",",
-            json_escape(&check.detail)
-        )
-        .map_err(io_to_cli)?;
-        writeln!(
-            file,
-            "      \"remediation\": \"{}\"",
-            json_escape(check.remediation.as_deref().unwrap_or(""))
-        )
-        .map_err(io_to_cli)?;
-        if idx + 1 == report.checks.len() {
-            writeln!(file, "    }}").map_err(io_to_cli)?;
-        } else {
-            writeln!(file, "    }},").map_err(io_to_cli)?;
-        }
+    fn keys_set(value: &Value) -> BTreeSet<String> {
+        value
+            .as_object()
+            .expect("json object")
+            .keys()
+            .cloned()
+            .collect()
     }
 
-    writeln!(file, "  ]").map_err(io_to_cli)?;
-    writeln!(file, "}}").map_err(io_to_cli)?;
-    Ok(())
+    fn expected_set(keys: &[&str]) -> BTreeSet<String> {
+        keys.iter().map(|key| (*key).to_string()).collect()
+    }
+
+    #[test]
+    fn contracts_models_vad_boundary_keys_match_emitted_jsonl() {
+        let config = TranscribeConfig::default();
+        let boundary = VadBoundary {
+            id: 3,
+            start_ms: 120,
+            end_ms: 980,
+            source: "live_runtime",
+        };
+
+        let line = jsonl_vad_boundary_line(&boundary, &config);
+        let parsed: Value = serde_json::from_str(&line).expect("valid json line");
+        assert_eq!(
+            parsed.get("event_type").and_then(Value::as_str),
+            Some(runtime_jsonl::EVENT_TYPE_VAD_BOUNDARY)
+        );
+        assert_eq!(
+            keys_set(&parsed),
+            expected_set(runtime_jsonl::VAD_BOUNDARY_KEYS)
+        );
+    }
+
+    #[test]
+    fn contracts_models_cleanup_queue_keys_match_emitted_jsonl() {
+        let config = TranscribeConfig::default();
+        let telemetry = CleanupQueueTelemetry::disabled(&config);
+        let line = jsonl_cleanup_queue_line(&telemetry);
+        let parsed: Value = serde_json::from_str(&line).expect("valid json line");
+        assert_eq!(
+            parsed.get("event_type").and_then(Value::as_str),
+            Some(runtime_jsonl::EVENT_TYPE_CLEANUP_QUEUE)
+        );
+        assert_eq!(
+            keys_set(&parsed),
+            expected_set(runtime_jsonl::CLEANUP_QUEUE_KEYS)
+        );
+    }
+
+    #[test]
+    fn contracts_models_manifest_constants_preserve_kind_and_core_keys() {
+        assert_eq!(
+            runtime_manifest::KIND_RUNTIME_MANIFEST,
+            "transcribe-live-runtime"
+        );
+        assert_eq!(
+            runtime_manifest::KIND_PREFLIGHT_MANIFEST,
+            "transcribe-live-preflight"
+        );
+        for required in [
+            "runtime_mode",
+            "runtime_mode_taxonomy",
+            "runtime_mode_selector",
+            "runtime_mode_status",
+            "events",
+            "session_summary",
+        ] {
+            assert!(
+                runtime_manifest::RUNTIME_TOP_LEVEL_KEYS.contains(&required),
+                "missing top-level runtime manifest key {required}"
+            );
+        }
+        for required in ["session_status", "transcript_events", "artifacts"] {
+            assert!(
+                runtime_manifest::SESSION_SUMMARY_KEYS.contains(&required),
+                "missing session_summary key {required}"
+            );
+        }
+    }
 }

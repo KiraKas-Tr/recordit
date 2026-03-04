@@ -95,15 +95,44 @@ pub(super) fn transcript_events_from_runtime_output_events(
         let RuntimeOutputEvent::AsrCompleted { result, .. } = event else {
             continue;
         };
-        if let Some(transcript_event) = transcript_event_from_runtime_asr_result(
+        transcript_events.extend(transcript_events_from_runtime_asr_result(
             config.channel_mode,
             &config.speaker_labels,
             result,
-        ) {
-            transcript_events.push(transcript_event);
-        }
+        ));
     }
     transcript_events
+}
+
+fn transcript_events_from_runtime_asr_result(
+    channel_mode: ChannelMode,
+    speaker_labels: &SpeakerLabels,
+    result: &LiveAsrResult,
+) -> Vec<TranscriptEvent> {
+    let Some(stable_event) =
+        transcript_event_from_runtime_asr_result(channel_mode, speaker_labels, result)
+    else {
+        return Vec::new();
+    };
+
+    if result.job.job_class != RuntimeAsrJobClass::Final {
+        return vec![stable_event];
+    }
+
+    // Preserve legacy contract semantics: every final emits a companion partial.
+    let partial_end_ms =
+        stable_event.start_ms + ((stable_event.end_ms.saturating_sub(stable_event.start_ms)) / 2);
+    let companion_partial = TranscriptEvent {
+        event_type: "partial",
+        channel: stable_event.channel.clone(),
+        segment_id: stable_event.segment_id.clone(),
+        start_ms: stable_event.start_ms,
+        end_ms: partial_end_ms,
+        text: partial_text(&stable_event.text),
+        source_final_segment_id: None,
+    };
+
+    vec![companion_partial, stable_event]
 }
 
 pub(super) fn transcript_event_from_runtime_asr_result(

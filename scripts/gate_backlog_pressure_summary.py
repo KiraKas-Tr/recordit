@@ -9,6 +9,8 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 
+from manifest_signal_extract import extract_manifest_signal_codes
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -49,19 +51,30 @@ def as_bool(value: object) -> bool:
     return False
 
 
+def as_dict(value: object) -> dict[str, object]:
+    if isinstance(value, dict):
+        return value
+    return {}
+
+
 def parse_jsonl(path: Path) -> list[dict[str, object]]:
     events: list[dict[str, object]] = []
     with path.open(encoding="utf-8") as handle:
-        for line in handle:
+        for line_number, line in enumerate(handle, start=1):
             line = line.strip()
             if not line:
                 continue
             try:
                 payload = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(payload, dict):
-                events.append(payload)
+            except json.JSONDecodeError as err:
+                raise ValueError(
+                    f"invalid JSONL line at {path}:{line_number}: {err.msg}"
+                ) from err
+            if not isinstance(payload, dict):
+                raise ValueError(
+                    f"invalid JSONL line at {path}:{line_number}: expected object"
+                )
+            events.append(payload)
     return events
 
 
@@ -71,15 +84,25 @@ def bool_text(value: bool) -> str:
 
 def main() -> None:
     args = parse_args()
-    with args.manifest.open(encoding="utf-8") as handle:
-        manifest = json.load(handle)
+    try:
+        with args.manifest.open(encoding="utf-8") as handle:
+            manifest = json.load(handle)
+    except json.JSONDecodeError as err:
+        raise SystemExit(
+            f"manifest is not valid JSON: {args.manifest}: {err.msg}"
+        ) from err
+    if not isinstance(manifest, dict):
+        raise SystemExit(f"manifest must be a JSON object: {args.manifest}")
 
-    events = parse_jsonl(args.jsonl)
-    chunk_queue = manifest.get("chunk_queue") or {}
-    degradation_events = manifest.get("degradation_events") or []
-    trust = manifest.get("trust") or {}
-    trust_notices = trust.get("notices") or []
-    first_emit_timing = manifest.get("first_emit_timing_ms") or {}
+    try:
+        events = parse_jsonl(args.jsonl)
+    except ValueError as err:
+        raise SystemExit(str(err)) from err
+    chunk_queue = as_dict(manifest.get("chunk_queue"))
+    first_emit_timing = as_dict(manifest.get("first_emit_timing_ms"))
+    event_counts = as_dict(manifest.get("event_counts"))
+    terminal_summary = as_dict(manifest.get("terminal_summary"))
+    signal_codes = extract_manifest_signal_codes(manifest)
 
     runtime_mode = str(manifest.get("runtime_mode", ""))
     runtime_mode_taxonomy = str(manifest.get("runtime_mode_taxonomy", ""))
@@ -102,14 +125,8 @@ def main() -> None:
     if submitted > 0:
         drop_ratio = dropped_oldest / submitted
 
-    degradation_codes = {
-        str(item.get("code", ""))
-        for item in degradation_events
-        if isinstance(item, dict)
-    }
-    trust_codes = {
-        str(item.get("code", "")) for item in trust_notices if isinstance(item, dict)
-    }
+    degradation_codes = set(signal_codes["degradation_codes"])
+    trust_codes = set(signal_codes["trust_codes"])
     jsonl_chunk_queue_events = [
         event for event in events if event.get("event_type") == "chunk_queue"
     ]
@@ -142,15 +159,15 @@ def main() -> None:
     threshold_runtime_mode_status_ok = runtime_mode_status == "implemented"
     threshold_first_stable_emit_ok = as_int(first_emit_timing.get("first_stable")) > 0
     threshold_transcript_surface_ok = (
-        as_int((manifest.get("event_counts") or {}).get("transcript")) > 0
-        or as_int((manifest.get("event_counts") or {}).get("partial")) > 0
-        or as_int((manifest.get("event_counts") or {}).get("final")) > 0
+        as_int(event_counts.get("transcript")) > 0
+        or as_int(event_counts.get("partial")) > 0
+        or as_int(event_counts.get("final")) > 0
         or any(
             str(event.get("event_type", "")) in {"partial", "final", "llm_final", "reconciled_final"}
             for event in events
         )
     )
-    threshold_terminal_live_mode_ok = as_bool((manifest.get("terminal_summary") or {}).get("live_mode"))
+    threshold_terminal_live_mode_ok = as_bool(terminal_summary.get("live_mode"))
 
     gate_pass = all(
         [

@@ -262,6 +262,7 @@ pub(super) fn run_standard_pipeline(config: &TranscribeConfig) -> Result<LiveRun
         final_buffering,
         chunk_queue,
         cleanup_queue,
+        hot_path_diagnostics: HotPathDiagnostics::default(),
         benchmark,
         benchmark_summary_csv,
         benchmark_runs_csv,
@@ -512,6 +513,11 @@ pub(super) fn transcribe_channels_once(
             is_temp_audio: input.is_temp_audio,
         })
         .collect::<Vec<_>>();
+    let temp_audio_policy = if config.keep_temp_audio {
+        TempAudioPolicy::RetainAlways
+    } else {
+        TempAudioPolicy::RetainOnFailure
+    };
     let helper_program = resolve_backend_program(config.asr_backend, resolved_model_path);
     let executor = Arc::new(PooledAsrExecutor {
         backend: config.asr_backend,
@@ -519,13 +525,9 @@ pub(super) fn transcribe_channels_once(
         model_path: resolved_model_path.to_path_buf(),
         language: config.asr_language.clone(),
         threads: config.asr_threads,
+        temp_audio_policy,
         prewarm_enabled,
     });
-    let temp_audio_policy = if config.keep_temp_audio {
-        TempAudioPolicy::RetainAlways
-    } else {
-        TempAudioPolicy::RetainOnFailure
-    };
     let (results, telemetry, final_buffering) = run_live_asr_pool_with_final_buffering(
         executor,
         jobs,
@@ -606,7 +608,7 @@ pub(super) fn run_live_asr_pool_with_final_buffering(
             let Some(job) = pending_jobs.pop_front() else {
                 break;
             };
-            if service.submit(job).is_ok() {
+            if service.submit_request(job.into_request()).is_ok() {
                 in_flight += 1;
             }
         }
