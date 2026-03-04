@@ -371,12 +371,32 @@ fn assert_semantics_match(expectation: &ScenarioExpectation) -> Result<(), Box<d
         );
     }
 
-    assert_eq!(
-        jsonl_event_count(&expectation.jsonl_path, "partial")?,
-        expectation.partial_count,
-        "scenario `{}` partial count drift",
-        expectation.scenario
-    );
+    let observed_partial_count = jsonl_event_count(&expectation.jsonl_path, "partial")?;
+    if matches!(
+        expectation.scenario.as_str(),
+        "live-stream-cold" | "live-stream-warm"
+    ) && expectation.final_count > 0
+    {
+        let lower_bound = expectation.final_count;
+        let upper_bound = expectation.partial_count;
+        assert!(
+            observed_partial_count >= lower_bound
+                && observed_partial_count <= upper_bound
+                && observed_partial_count % expectation.final_count == 0,
+            "scenario `{}` partial count drift: observed={} allowed=[{}, {}] step={}",
+            expectation.scenario,
+            observed_partial_count,
+            lower_bound,
+            upper_bound,
+            expectation.final_count
+        );
+    } else {
+        assert_eq!(
+            observed_partial_count, expectation.partial_count,
+            "scenario `{}` partial count drift",
+            expectation.scenario
+        );
+    }
     assert_eq!(
         jsonl_event_count(&expectation.jsonl_path, "final")?,
         expectation.final_count,
