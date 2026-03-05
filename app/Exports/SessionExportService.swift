@@ -550,6 +550,10 @@ public struct FileSystemSessionExportService: SessionExportService {
 
     private func parseManifestSupportSummary(_ data: Data) -> [String: Any] {
         guard let payload = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            let fallbackFailureContext: [String: Any] = [
+                "code": NSNull(),
+                "message": NSNull(),
+            ]
             return [
                 "manifest_valid": false,
                 "runtime_mode": "unknown",
@@ -557,10 +561,7 @@ public struct FileSystemSessionExportService: SessionExportService {
                 "duration_sec": 0,
                 "trust_notice_count": 0,
                 "degradation_codes": [],
-                "failure_context": [
-                    "code": NSNull(),
-                    "message": NSNull(),
-                ],
+                "failure_context": fallbackFailureContext,
             ]
         }
 
@@ -578,6 +579,10 @@ public struct FileSystemSessionExportService: SessionExportService {
             ?? (summary?["failure_code"] as? String)
         let failureMessage = (failure?["message"] as? String)
             ?? (summary?["failure_detail"] as? String)
+        let failureContext: [String: Any] = [
+            "code": failureCode ?? NSNull(),
+            "message": failureMessage ?? NSNull(),
+        ]
 
         return [
             "manifest_valid": true,
@@ -586,10 +591,7 @@ public struct FileSystemSessionExportService: SessionExportService {
             "duration_sec": durationSec,
             "trust_notice_count": trustNoticeCount,
             "degradation_codes": degradationCodes,
-            "failure_context": [
-                "code": failureCode ?? NSNull(),
-                "message": failureMessage ?? NSNull(),
-            ],
+            "failure_context": failureContext,
         ]
     }
 
