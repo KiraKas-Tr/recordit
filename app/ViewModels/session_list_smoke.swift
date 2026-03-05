@@ -90,6 +90,34 @@ private struct QueryTriggeredFailureSessionLibraryService: SessionLibraryService
     }
 }
 
+private struct SequencedSessionLibraryService: SessionLibraryService {
+    let defaultSnapshot: [SessionSummaryDTO]
+    let snapshotsBySearchText: [String: [SessionSummaryDTO]]
+
+    func listSessions(query: SessionQuery) throws -> [SessionSummaryDTO] {
+        guard
+            let rawSearchText = query.searchText?.trimmingCharacters(in: .whitespacesAndNewlines),
+            !rawSearchText.isEmpty
+        else {
+            return defaultSnapshot
+        }
+
+        return snapshotsBySearchText[rawSearchText] ?? defaultSnapshot
+    }
+
+    func deleteSession(
+        sessionID: String,
+        rootPath: URL,
+        confirmTrash: Bool
+    ) throws -> SessionDeletionResultDTO {
+        throw AppServiceError(
+            code: .invalidInput,
+            userMessage: "Not used in smoke.",
+            remediation: "N/A"
+        )
+    }
+}
+
 @main
 struct SessionListSmoke {
     static func main() async throws {
@@ -175,6 +203,100 @@ struct SessionListSmoke {
         }
         try require(error.code == .invalidInput, "non-ready action should reject with invalid input")
         try require(!recoverableItems.isEmpty, "recoverable items should be preserved on action failure")
+
+        let transitioningReady = makeSession(
+            id: "deferred-ready",
+            startedAt: now.addingTimeInterval(120),
+            mode: .recordOnly,
+            status: .pending,
+            pendingState: .pendingModel,
+            readyToTranscribe: false
+        )
+        let transitioningFailed = makeSession(
+            id: "deferred-failed",
+            startedAt: now.addingTimeInterval(121),
+            mode: .recordOnly,
+            status: .pending,
+            pendingState: .readyToTranscribe,
+            readyToTranscribe: true
+        )
+        let snapshotOne = [transitioningReady, transitioningFailed]
+        let snapshotTwo = [
+            makeSession(
+                id: "deferred-ready",
+                startedAt: transitioningReady.startedAt,
+                mode: .recordOnly,
+                status: .pending,
+                pendingState: .readyToTranscribe,
+                readyToTranscribe: true
+            ),
+            makeSession(
+                id: "deferred-failed",
+                startedAt: transitioningFailed.startedAt,
+                mode: .recordOnly,
+                status: .failed,
+                pendingState: .failed,
+                readyToTranscribe: false
+            )
+        ]
+        let snapshotThree = [
+            makeSession(
+                id: "deferred-ready",
+                startedAt: transitioningReady.startedAt,
+                mode: .recordOnly,
+                status: .ok,
+                pendingState: nil,
+                readyToTranscribe: false
+            ),
+            makeSession(
+                id: "deferred-failed",
+                startedAt: transitioningFailed.startedAt,
+                mode: .recordOnly,
+                status: .failed,
+                pendingState: .failed,
+                readyToTranscribe: false
+            )
+        ]
+
+        let sequenceVM = SessionListViewModel(
+            sessionLibrary: SequencedSessionLibraryService(
+                defaultSnapshot: snapshotOne,
+                snapshotsBySearchText: [
+                    "phase-two": snapshotTwo,
+                    "phase-three": snapshotThree
+                ]
+            )
+        )
+        sequenceVM.refresh()
+        try require(
+            sequenceVM.consumePendingNotifications().isEmpty,
+            "initial snapshot should not emit transition notifications"
+        )
+
+        sequenceVM.setSearchText("phase-two")
+        let transitionNotices = sequenceVM.consumePendingNotifications()
+        try require(transitionNotices.count == 2, "expected ready + failed transition notifications")
+        let kinds = transitionNotices.map(\.kind)
+        try require(kinds.contains(.readyToTranscribe), "expected ready transition notification")
+        try require(kinds.contains(.failed), "expected failed transition notification")
+        let failedNotice = transitionNotices.first { $0.kind == .failed }
+        try require(
+            failedNotice?.primaryAction == .retryDeferredTranscription(sessionID: "deferred-failed"),
+            "failed transition should expose retry action"
+        )
+        try require(
+            failedNotice?.secondaryAction == .openSessionDetail(sessionID: "deferred-failed"),
+            "failed transition should expose deep-link detail fallback"
+        )
+
+        sequenceVM.setSearchText("phase-three")
+        let completionNotices = sequenceVM.consumePendingNotifications()
+        try require(completionNotices.count == 1, "expected one completion notification")
+        try require(completionNotices.first?.kind == .completed, "expected completed transition kind")
+        try require(
+            completionNotices.first?.deepLinkSessionID == "deferred-ready",
+            "completion notice should deep-link to session detail"
+        )
 
         print("bd-2i3h smoke ok")
     }

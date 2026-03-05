@@ -128,14 +128,18 @@ public final class SessionListViewModel {
 
     private let sessionLibrary: SessionLibraryService
     private let pendingTranscriptionService: (any PendingSessionTranscribing)?
+    private let pendingNotificationService: any PendingSessionNotificationDetecting
     private var lastLoadedItems: [SessionSummaryDTO] = []
+    public private(set) var pendingNotifications: [PendingSessionNotificationIntent] = []
 
     public init(
         sessionLibrary: SessionLibraryService,
-        pendingTranscriptionService: (any PendingSessionTranscribing)? = nil
+        pendingTranscriptionService: (any PendingSessionTranscribing)? = nil,
+        pendingNotificationService: any PendingSessionNotificationDetecting = PendingSessionNotificationService()
     ) {
         self.sessionLibrary = sessionLibrary
         self.pendingTranscriptionService = pendingTranscriptionService
+        self.pendingNotificationService = pendingNotificationService
     }
 
     public func refresh() {
@@ -149,6 +153,13 @@ public final class SessionListViewModel {
             )
             let listed = try sessionLibrary.listSessions(query: query)
             let ordered = listed.sorted(by: Self.deterministicNewestFirst)
+            let transitionNotifications = pendingNotificationService.detectTransitionNotifications(
+                previous: lastLoadedItems,
+                current: ordered
+            )
+            if !transitionNotifications.isEmpty {
+                pendingNotifications.append(contentsOf: transitionNotifications)
+            }
             lastLoadedItems = ordered
 
             if ordered.isEmpty {
@@ -266,6 +277,12 @@ public final class SessionListViewModel {
         case .idle, .empty:
             return []
         }
+    }
+
+    public func consumePendingNotifications() -> [PendingSessionNotificationIntent] {
+        let queued = pendingNotifications
+        pendingNotifications.removeAll(keepingCapacity: false)
+        return queued
     }
 
     private func normalizedSearchText(_ text: String) -> String? {
