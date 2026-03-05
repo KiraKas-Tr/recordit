@@ -316,10 +316,12 @@ public struct FileSystemSessionExportService: SessionExportService {
         try writeDataAtomically(redactedManifestData, to: stageManifest)
 
         var included = ["session.manifest.json"]
+        var sourceJsonlData: Data?
 
         let jsonlSource = sessionRoot.appendingPathComponent("session.jsonl")
         if fileManager.fileExists(atPath: jsonlSource.path) {
             let jsonlData = try readData(at: jsonlSource)
+            sourceJsonlData = jsonlData
             let diagnosticsJsonlData = includeTranscript
                 ? jsonlData
                 : redactJsonlTranscriptText(jsonlData)
@@ -337,6 +339,11 @@ public struct FileSystemSessionExportService: SessionExportService {
             }
         }
 
+        let supportSnapshot = buildDiagnosticsSupportSnapshot(
+            manifestData: manifestData,
+            jsonlData: sourceJsonlData
+        )
+
         let diagnosticsMetadata: [String: Any] = [
             "schema_version": "1",
             "kind": "recordit-diagnostics",
@@ -344,6 +351,8 @@ public struct FileSystemSessionExportService: SessionExportService {
             "session_id": sessionID,
             "include_transcript_text": includeTranscript,
             "include_audio": includeAudio,
+            "redaction_contract": diagnosticsRedactionContract(includeTranscript: includeTranscript),
+            "support_snapshot": supportSnapshot,
             "artifacts": included.sorted()
         ]
         let diagnosticsData = try JSONSerialization.data(
@@ -523,6 +532,111 @@ public struct FileSystemSessionExportService: SessionExportService {
         }
 
         return redactedLines.joined(separator: "\n").data(using: .utf8) ?? Data()
+    }
+
+    private func buildDiagnosticsSupportSnapshot(
+        manifestData: Data,
+        jsonlData: Data?
+    ) -> [String: Any] {
+        let manifestSummary = parseManifestSupportSummary(manifestData)
+        let jsonlCounters = parseJsonlCounters(jsonlData)
+
+        return [
+            "schema_version": "1",
+            "manifest_summary": manifestSummary,
+            "counters": jsonlCounters,
+        ]
+    }
+
+    private func parseManifestSupportSummary(_ data: Data) -> [String: Any] {
+        guard let payload = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return [
+                "manifest_valid": false,
+                "runtime_mode": "unknown",
+                "session_status": "unknown",
+                "duration_sec": 0,
+                "trust_notice_count": 0,
+                "degradation_codes": [],
+                "failure_context": [
+                    "code": NSNull(),
+                    "message": NSNull(),
+                ],
+            ]
+        }
+
+        let summary = payload["session_summary"] as? [String: Any]
+        let trust = payload["trust"] as? [String: Any]
+        let failure = payload["failure_context"] as? [String: Any]
+
+        let runtimeMode = (payload["runtime_mode"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let sessionStatus = (summary?["session_status"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let durationSec = (summary?["duration_sec"] as? NSNumber)?.doubleValue ?? 0
+        let trustNoticeCount = (trust?["notice_count"] as? NSNumber)?.intValue ?? 0
+        let degradationCodes = (trust?["degradation_codes"] as? [String]) ?? []
+
+        let failureCode = (failure?["code"] as? String)
+            ?? (summary?["failure_code"] as? String)
+        let failureMessage = (failure?["message"] as? String)
+            ?? (summary?["failure_detail"] as? String)
+
+        return [
+            "manifest_valid": true,
+            "runtime_mode": runtimeMode ?? "unknown",
+            "session_status": sessionStatus ?? "unknown",
+            "duration_sec": durationSec,
+            "trust_notice_count": trustNoticeCount,
+            "degradation_codes": degradationCodes,
+            "failure_context": [
+                "code": failureCode ?? NSNull(),
+                "message": failureMessage ?? NSNull(),
+            ],
+        ]
+    }
+
+    private func parseJsonlCounters(_ data: Data?) -> [String: Any] {
+        guard let data,
+              let text = String(data: data, encoding: .utf8) else {
+            return [
+                "jsonl_present": false,
+                "line_count": 0,
+                "unparseable_line_count": 0,
+                "event_type_counts": [String: Int](),
+            ]
+        }
+
+        var lineCount = 0
+        var unparseable = 0
+        var eventCounts: [String: Int] = [:]
+
+        for rawLine in text.split(separator: "\n", omittingEmptySubsequences: false) {
+            lineCount += 1
+            let line = String(rawLine).trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !line.isEmpty else { continue }
+
+            guard let lineData = line.data(using: .utf8),
+                  let object = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any],
+                  let eventType = object["event_type"] as? String,
+                  !eventType.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                unparseable += 1
+                continue
+            }
+            eventCounts[eventType, default: 0] += 1
+        }
+
+        return [
+            "jsonl_present": true,
+            "line_count": lineCount,
+            "unparseable_line_count": unparseable,
+            "event_type_counts": eventCounts,
+        ]
+    }
+
+    private func diagnosticsRedactionContract(includeTranscript: Bool) -> [String: Any] {
+        [
+            "mode": includeTranscript ? "include_opt_in" : "redact_default",
+            "transcript_text_included": includeTranscript,
+            "redacted_text_keys": Array(Self.redactedTextKeys).sorted(),
+        ]
     }
 
     private func redactJSONValue(_ value: Any, key: String?) -> Any {
