@@ -115,13 +115,14 @@ private func runSmoke() async {
     check(startCount == 1, "only one launch should be executed")
 
     await viewModel.stopCurrentRun()
-    check(viewModel.state == .finalizing, "successful stop should transition to finalizing")
+    check(viewModel.state == .completed, "successful stop should complete bounded finalization")
     let stopCount = await runtimeService.stopInvocationCount()
     check(stopCount == 1, "exactly one stop control should run")
+    check(viewModel.suggestedRecoveryActions.isEmpty, "successful stop/finalization should clear recovery suggestions")
 
     await viewModel.stopCurrentRun()
-    check(viewModel.lastRejectedActionError?.code == .invalidInput, "stop during finalizing should be rejected")
-    check(viewModel.state == .finalizing, "rejected stop should preserve finalizing state")
+    check(viewModel.lastRejectedActionError?.code == .invalidInput, "stop after completion should be rejected")
+    check(viewModel.state == .completed, "rejected stop should preserve completed state")
 
     viewModel.loadFinalStatus(manifestPath: URL(fileURLWithPath: "/tmp/smoke.manifest.json"))
     check(viewModel.state == .completed, "final status load should transition finalizing to completed")
