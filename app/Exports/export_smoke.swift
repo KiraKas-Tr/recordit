@@ -33,6 +33,18 @@ private func readTextFile(_ url: URL) throws -> String {
     return String(decoding: data, as: UTF8.self)
 }
 
+private func readJSONFile(_ url: URL) throws -> [String: Any] {
+    let handle = try FileHandle(forReadingFrom: url)
+    defer { try? handle.close() }
+    let data = try handle.readToEnd() ?? Data()
+    guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+        throw NSError(domain: "export_smoke", code: 1, userInfo: [
+            NSLocalizedDescriptionKey: "Expected JSON object at \(url.path)"
+        ])
+    }
+    return object
+}
+
 private func fixtureManifestData() -> Data {
     let payload: [String: Any] = [
         "schema_version": "1",
@@ -177,13 +189,25 @@ private func runSmoke() {
         check(redactedJsonl.contains("\"text\":\"[REDACTED]\""), "redacted diagnostics jsonl should scrub text fields")
         check(!redactedJsonl.contains("\"text\":\"gamma\""), "redacted diagnostics jsonl should remove original transcript text")
 
-        let redactedDiagnosticsMetadata = try readTextFile(
+        let redactedDiagnosticsMetadata = try readJSONFile(
             redactedSnapshot.appendingPathComponent("diagnostics.json")
         )
         check(
-            redactedDiagnosticsMetadata.contains("\"include_transcript_text\" : false"),
+            (redactedDiagnosticsMetadata["include_transcript_text"] as? Bool) == false,
             "default diagnostics metadata should keep transcript opt-in disabled"
         )
+        let redactionContract = redactedDiagnosticsMetadata["redaction_contract"] as? [String: Any]
+        check(redactionContract?["mode"] as? String == "redact_default", "default diagnostics should record redact_default mode")
+        check(redactionContract?["transcript_text_included"] as? Bool == false, "default diagnostics should mark transcript_text_included=false")
+        let supportSnapshot = redactedDiagnosticsMetadata["support_snapshot"] as? [String: Any]
+        check(supportSnapshot?["schema_version"] as? String == "1", "support snapshot should include schema version marker")
+        let counters = supportSnapshot?["counters"] as? [String: Any]
+        check(counters?["jsonl_present"] as? Bool == true, "support snapshot should report jsonl presence")
+        let eventCounts = counters?["event_type_counts"] as? [String: Any]
+        check((eventCounts?["reconciled_final"] as? NSNumber)?.intValue == 1, "support snapshot should include event type counts")
+        let manifestSummary = supportSnapshot?["manifest_summary"] as? [String: Any]
+        check(manifestSummary?["manifest_valid"] as? Bool == true, "support snapshot should capture manifest validity")
+        check(manifestSummary?["trust_notice_count"] as? Int == 0, "support snapshot should include trust notice count")
 
         let diagnosticsOptInResult = try service.exportSession(
             SessionExportRequest(
@@ -196,6 +220,7 @@ private func runSmoke() {
             )
         )
         check(!diagnosticsOptInResult.redacted, "diagnostics opt-in should include transcript text")
+        check(diagnosticsOptInResult.includedArtifacts.contains("diagnostics.json"), "diagnostics export should include diagnostics metadata")
         guard let optInSnapshot = archiveCapture.lastSnapshotDirectory else {
             check(false, "archive builder snapshot missing for diagnostics opt-in export")
             return
@@ -207,12 +232,21 @@ private func runSmoke() {
         )
         let optInJsonl = try readTextFile(optInSnapshot.appendingPathComponent("session.jsonl"))
         check(optInJsonl.contains("\"text\":\"gamma\""), "diagnostics opt-in should preserve jsonl transcript text")
-        let optInDiagnosticsMetadata = try readTextFile(
+        let optInDiagnosticsMetadata = try readJSONFile(
             optInSnapshot.appendingPathComponent("diagnostics.json")
         )
         check(
-            optInDiagnosticsMetadata.contains("\"include_transcript_text\" : true"),
+            (optInDiagnosticsMetadata["include_transcript_text"] as? Bool) == true,
             "opt-in diagnostics metadata should record transcript inclusion"
+        )
+        let optInRedactionContract = optInDiagnosticsMetadata["redaction_contract"] as? [String: Any]
+        check(
+            optInRedactionContract?["mode"] as? String == "include_opt_in",
+            "opt-in diagnostics should record include_opt_in mode"
+        )
+        check(
+            optInRedactionContract?["transcript_text_included"] as? Bool == true,
+            "opt-in diagnostics should mark transcript_text_included=true"
         )
 
         let outsideDestination = tempRoot.appendingPathComponent("outside", isDirectory: true)
