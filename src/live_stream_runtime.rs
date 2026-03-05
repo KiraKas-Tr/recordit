@@ -986,7 +986,11 @@ impl StreamingVadScheduler {
         out_jobs.extend(self.pending_reconcile_jobs.drain(..));
     }
 
-    fn record_channel_pressure_sample(&mut self, channel: &str, pressure: SchedulerPressureSnapshot) {
+    fn record_channel_pressure_sample(
+        &mut self,
+        channel: &str,
+        pressure: SchedulerPressureSnapshot,
+    ) {
         let diagnostics = self
             .channel_diagnostics
             .entry(channel.to_string())

@@ -568,9 +568,9 @@ fn default_model_candidates(backend: AsrBackend) -> Vec<(PathBuf, String)> {
 }
 
 fn sandbox_model_root() -> Option<PathBuf> {
-    env::var("HOME").ok().map(|home| {
-        PathBuf::from(home).join("Library/Containers/com.recordit.sequoiatranscribe/Data/models")
-    })
+    recordit::storage_roots::resolve_canonical_storage_roots()
+        .ok()
+        .map(|roots| roots.models_root)
 }
 
 pub(super) fn absolutize_candidate(path: PathBuf) -> PathBuf {
@@ -838,9 +838,10 @@ mod tests {
             TempAudioPolicy::RetainOnFailure,
         )
         .expect_err("symlink scratch path should be rejected");
-        assert!(err
-            .to_string()
-            .contains("refusing to overwrite unsafe PCM scratch symlink"));
+        assert!(
+            err.to_string()
+                .contains("refusing to overwrite unsafe PCM scratch symlink")
+        );
 
         let _ = fs::remove_file(&path);
         let _ = fs::remove_file(&target);

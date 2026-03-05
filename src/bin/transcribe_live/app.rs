@@ -1,15 +1,15 @@
 use hound::{SampleFormat, WavReader};
 use recordit::capture_api::{
-    capture_telemetry_path_for_output, CaptureChunk, CaptureEvent, CaptureSink,
+    CaptureChunk, CaptureEvent, CaptureSink, capture_telemetry_path_for_output,
 };
 use recordit::live_asr_pool::{
     LiveAsrExecutor, LiveAsrJob, LiveAsrJobClass, LiveAsrJobResult, LiveAsrPoolConfig,
     LiveAsrPoolTelemetry, LiveAsrRequest, LiveAsrService, TempAudioPolicy,
 };
 use recordit::live_capture::{
-    run_capture_session, run_streaming_capture_session,
     CallbackContractMode as LiveCaptureCallbackMode, LiveCaptureConfig,
-    SampleRateMismatchPolicy as LiveCaptureSampleRateMismatchPolicy,
+    SampleRateMismatchPolicy as LiveCaptureSampleRateMismatchPolicy, run_capture_session,
+    run_streaming_capture_session,
 };
 use recordit::live_stream_runtime::{
     BackpressureMode, BackpressureTransitionReason, LiveAsrJobClass as RuntimeAsrJobClass,
@@ -17,6 +17,7 @@ use recordit::live_stream_runtime::{
     LiveStreamCoordinator, RuntimeFinalizer, RuntimeOutputEvent, RuntimeOutputSink,
     StreamingSchedulerConfig, StreamingVadConfig, StreamingVadScheduler,
 };
+use recordit::storage_roots::{self, ManagedStorageDomain};
 use screencapturekit::prelude::*;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
@@ -26,7 +27,7 @@ use std::fs::{self, File};
 use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
-use std::sync::mpsc::{self, sync_channel, Receiver, RecvTimeoutError, TrySendError};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, UNIX_EPOCH};
@@ -3461,7 +3462,9 @@ fn parse_replay_transcript_event(
             replay_line_error(line_no, replay_parse_reason_category(&err_text), err_text)
         })?;
     let (event_name, payload) = match parsed {
-        contracts_models::runtime_jsonl::RuntimeJsonlEvent::Partial(payload) => ("partial", payload),
+        contracts_models::runtime_jsonl::RuntimeJsonlEvent::Partial(payload) => {
+            ("partial", payload)
+        }
         contracts_models::runtime_jsonl::RuntimeJsonlEvent::Final(payload) => ("final", payload),
         contracts_models::runtime_jsonl::RuntimeJsonlEvent::LlmFinal(payload) => {
             ("llm_final", payload)
@@ -3472,7 +3475,7 @@ fn parse_replay_transcript_event(
         _ => {
             return Err(CliError::new(format!(
                 "invalid replay line {line_no}: event_type `{event_type}` decoded as non-transcript variant"
-            )))
+            )));
         }
     };
     if payload.text.len() > REPLAY_TRANSCRIPT_TEXT_MAX_BYTES {
@@ -3672,6 +3675,22 @@ fn validate_output_path(flag: &str, path: &Path) -> Result<(), CliError> {
         }
     }
 
+    if storage_roots::app_managed_storage_policy_enabled() {
+        let roots = storage_roots::resolve_canonical_storage_roots().map_err(|err| {
+            CliError::new(format!(
+                "failed to resolve canonical app-managed storage roots: {err}"
+            ))
+        })?;
+        if matches!(flag, "--out-wav" | "--out-jsonl" | "--out-manifest") {
+            storage_roots::validate_app_managed_write_path(
+                path,
+                ManagedStorageDomain::Sessions,
+                &roots,
+            )
+            .map_err(|err| CliError::new(format!("`{flag}` violates storage policy: {err}")))?;
+        }
+    }
+
     Ok(())
 }
 
@@ -3739,7 +3758,22 @@ mod tests {
         top_remediation_hints,
     };
     use super::{
-        build_hot_path_diagnostics, build_live_chunked_events_with_queue,
+        AsrBackend, AsrWorkClass, AsrWorkItem, BenchmarkSummary, CaptureChunk, CaptureEvent,
+        CaptureSink, ChannelMode, ChannelVadBoundary, CheckStatus, CleanupAttemptOutcome,
+        CleanupQueueTelemetry, CleanupTaskStatus, CollectingRuntimeOutputSink,
+        FinalBufferingTelemetry, HELP_TEXT, HotPathDiagnostics, IncrementalVadTracker,
+        LIVE_CAPTURE_CALLBACK_CONTRACT_DEGRADED_CODE, LIVE_CAPTURE_CONTINUITY_UNVERIFIED_CODE,
+        LIVE_CAPTURE_INTERRUPTION_RECOVERED_CODE, LIVE_CAPTURE_TRANSPORT_DEGRADED_CODE,
+        LIVE_CHUNK_QUEUE_BACKPRESSURE_SEVERE_CODE, LIVE_CHUNK_QUEUE_DROP_OLDEST_CODE,
+        LiveAsrExecutor, LiveAsrJob, LiveAsrJobClass, LiveAsrPoolConfig, LiveAsrPoolTelemetry,
+        LiveAsrRequest, LiveCaptureCallbackMode, LiveCaptureConfig,
+        LiveCaptureSampleRateMismatchPolicy, LiveChunkQueueTelemetry, LiveLifecyclePhase,
+        LiveLifecycleTelemetry, LiveRunReport, ModeDegradationEvent, ParseOutcome, PreflightCheck,
+        PreflightReport, RECONCILIATION_APPLIED_CODE, REPLAY_JSONL_MAX_LINE_BYTES,
+        REPLAY_TRANSCRIPT_TEXT_MAX_BYTES, ReconciliationMatrix, ResolvedModelPath,
+        RuntimeExecutionBranch, RuntimeJsonlStream, RuntimeOutputSink, TempAudioPolicy,
+        TerminalRenderActionKind, TerminalRenderMode, TranscribeConfig, TranscriptEvent,
+        VadBoundary, build_hot_path_diagnostics, build_live_chunked_events_with_queue,
         build_reconciliation_events, build_reconciliation_matrix, build_rolling_chunk_windows,
         build_startup_banner_lines, build_targeted_reconciliation_events,
         build_terminal_render_actions, build_transcript_events, build_trust_notices,
@@ -3755,22 +3789,8 @@ mod tests {
         resolve_backend_program, resolve_model_path, run_cleanup_queue_with, run_live_chunk_queue,
         run_streaming_capture_session, runtime_mode_compatibility_matrix,
         select_runtime_execution_branch, transcript_events_from_runtime_output_events,
-        write_preflight_manifest, write_runtime_jsonl, write_runtime_manifest, AsrBackend,
-        AsrWorkClass, AsrWorkItem, BenchmarkSummary, CaptureChunk, CaptureEvent, CaptureSink,
-        ChannelMode, ChannelVadBoundary, CheckStatus, CleanupAttemptOutcome, CleanupQueueTelemetry,
-        CleanupTaskStatus, CollectingRuntimeOutputSink, FinalBufferingTelemetry,
-        HotPathDiagnostics, IncrementalVadTracker, LiveAsrExecutor, LiveAsrJob, LiveAsrJobClass,
-        LiveAsrPoolConfig, LiveAsrPoolTelemetry, LiveAsrRequest, LiveCaptureCallbackMode,
-        LiveCaptureConfig, LiveCaptureSampleRateMismatchPolicy, LiveChunkQueueTelemetry,
-        LiveLifecyclePhase, LiveLifecycleTelemetry, LiveRunReport, ModeDegradationEvent,
-        ParseOutcome, PreflightCheck, PreflightReport, ReconciliationMatrix, ResolvedModelPath,
-        RuntimeExecutionBranch, RuntimeJsonlStream, RuntimeOutputSink, TempAudioPolicy,
-        TerminalRenderActionKind, TerminalRenderMode, TranscribeConfig, TranscriptEvent,
-        VadBoundary, HELP_TEXT, LIVE_CAPTURE_CALLBACK_CONTRACT_DEGRADED_CODE,
-        LIVE_CAPTURE_CONTINUITY_UNVERIFIED_CODE, LIVE_CAPTURE_INTERRUPTION_RECOVERED_CODE,
-        LIVE_CAPTURE_TRANSPORT_DEGRADED_CODE, LIVE_CHUNK_QUEUE_BACKPRESSURE_SEVERE_CODE,
-        LIVE_CHUNK_QUEUE_DROP_OLDEST_CODE, RECONCILIATION_APPLIED_CODE,
-        REPLAY_JSONL_MAX_LINE_BYTES, REPLAY_TRANSCRIPT_TEXT_MAX_BYTES,
+        validate_output_path, write_preflight_manifest, write_runtime_jsonl,
+        write_runtime_manifest,
     };
     use hound::{SampleFormat, WavSpec, WavWriter};
     use recordit::live_stream_runtime::{
@@ -3779,6 +3799,7 @@ mod tests {
         LiveAsrResult as RuntimeAsrResult, LiveRuntimePhase, LiveRuntimeSummary,
         RuntimeOutputEvent,
     };
+    use recordit::storage_roots;
     use serde_json::Value;
     use std::env;
     use std::fs::{self, File};
@@ -3883,9 +3904,11 @@ mod tests {
     fn runtime_mode_compatibility_matrix_includes_live_stream_implemented_row() {
         let matrix = runtime_mode_compatibility_matrix();
         assert_eq!(matrix.len(), 3);
-        assert!(matrix
-            .iter()
-            .any(|row| row.taxonomy_mode == "live-stream" && row.status == "implemented"));
+        assert!(
+            matrix
+                .iter()
+                .any(|row| row.taxonomy_mode == "live-stream" && row.status == "implemented")
+        );
     }
 
     #[test]
@@ -3936,9 +3959,10 @@ mod tests {
         ];
         match parse_args_from(args.into_iter()) {
             Ok(_) => panic!("expected parse failure"),
-            Err(err) => assert!(err
-                .to_string()
-                .contains("require `--live-chunked` or `--live-stream`")),
+            Err(err) => assert!(
+                err.to_string()
+                    .contains("require `--live-chunked` or `--live-stream`")
+            ),
         }
     }
 
@@ -3951,9 +3975,10 @@ mod tests {
         ];
         match parse_args_from(args.into_iter()) {
             Ok(_) => panic!("expected parse failure"),
-            Err(err) => assert!(err
-                .to_string()
-                .contains("cannot be combined with `--replay-jsonl`")),
+            Err(err) => assert!(
+                err.to_string()
+                    .contains("cannot be combined with `--replay-jsonl`")
+            ),
         }
     }
 
@@ -3966,9 +3991,10 @@ mod tests {
         ];
         match parse_args_from(args.into_iter()) {
             Ok(_) => panic!("expected parse failure"),
-            Err(err) => assert!(err
-                .to_string()
-                .contains("cannot be combined with `--replay-jsonl`")),
+            Err(err) => assert!(
+                err.to_string()
+                    .contains("cannot be combined with `--replay-jsonl`")
+            ),
         }
     }
 
@@ -3991,9 +4017,10 @@ mod tests {
         let args = vec!["--live-stream".to_string(), "--live-chunked".to_string()];
         match parse_args_from(args.into_iter()) {
             Ok(_) => panic!("expected parse failure"),
-            Err(err) => assert!(err
-                .to_string()
-                .contains("cannot be combined with `--live-chunked`")),
+            Err(err) => assert!(
+                err.to_string()
+                    .contains("cannot be combined with `--live-chunked`")
+            ),
         }
     }
 
@@ -4086,9 +4113,10 @@ mod tests {
         let args = vec!["--disable-adaptive-backpressure".to_string()];
         match parse_args_from(args.into_iter()) {
             Ok(_) => panic!("expected parse failure"),
-            Err(err) => assert!(err
-                .to_string()
-                .contains("requires `--live-chunked` or `--live-stream`")),
+            Err(err) => assert!(
+                err.to_string()
+                    .contains("requires `--live-chunked` or `--live-stream`")
+            ),
         }
     }
 
@@ -4211,9 +4239,10 @@ mod tests {
         ];
         match parse_args_from(args.into_iter()) {
             Ok(_) => panic!("expected parse failure"),
-            Err(err) => assert!(err
-                .to_string()
-                .contains("`--model-doctor` cannot be combined with `--replay-jsonl`")),
+            Err(err) => assert!(
+                err.to_string()
+                    .contains("`--model-doctor` cannot be combined with `--replay-jsonl`")
+            ),
         }
     }
 
@@ -4222,9 +4251,10 @@ mod tests {
         let args = vec!["--model-doctor".to_string(), "--preflight".to_string()];
         match parse_args_from(args.into_iter()) {
             Ok(_) => panic!("expected parse failure"),
-            Err(err) => assert!(err
-                .to_string()
-                .contains("`--model-doctor` cannot be combined with `--preflight`")),
+            Err(err) => assert!(
+                err.to_string()
+                    .contains("`--model-doctor` cannot be combined with `--preflight`")
+            ),
         }
     }
 
@@ -4330,18 +4360,26 @@ mod tests {
             &chunk_queue,
         );
 
-        assert!(notices
-            .iter()
-            .any(|notice| notice.code == "mode_degradation"));
-        assert!(notices
-            .iter()
-            .any(|notice| notice.code == "cleanup_queue_drop"));
-        assert!(notices
-            .iter()
-            .any(|notice| notice.code == "cleanup_processing_failure"));
-        assert!(notices
-            .iter()
-            .any(|notice| notice.code == "cleanup_drain_incomplete"));
+        assert!(
+            notices
+                .iter()
+                .any(|notice| notice.code == "mode_degradation")
+        );
+        assert!(
+            notices
+                .iter()
+                .any(|notice| notice.code == "cleanup_queue_drop")
+        );
+        assert!(
+            notices
+                .iter()
+                .any(|notice| notice.code == "cleanup_processing_failure")
+        );
+        assert!(
+            notices
+                .iter()
+                .any(|notice| notice.code == "cleanup_drain_incomplete")
+        );
     }
 
     #[test]
@@ -4361,9 +4399,11 @@ mod tests {
             &chunk_queue,
         );
 
-        assert!(notices
-            .iter()
-            .any(|notice| notice.code == "continuity_recovered_with_gaps"));
+        assert!(
+            notices
+                .iter()
+                .any(|notice| notice.code == "continuity_recovered_with_gaps")
+        );
     }
 
     #[test]
@@ -4387,9 +4427,11 @@ mod tests {
             .find(|notice| notice.code == "continuity_unverified")
             .expect("expected continuity_unverified trust notice");
         assert_eq!(notice.severity, "warn");
-        assert!(notice
-            .guidance
-            .contains("Ensure capture telemetry is writable/readable"));
+        assert!(
+            notice
+                .guidance
+                .contains("Ensure capture telemetry is writable/readable")
+        );
     }
 
     #[test]
@@ -4963,12 +5005,16 @@ mod tests {
 
         assert_eq!(finals.len(), 1);
         assert_eq!(finals[0].segment_id, "mic-segment-0000-0-2600");
-        assert!(partial_ids
-            .iter()
-            .any(|id| id == "mic-segment-0000-partial-0000-0-2000"));
-        assert!(partial_ids
-            .iter()
-            .any(|id| id == "mic-segment-0000-partial-0001-500-2500"));
+        assert!(
+            partial_ids
+                .iter()
+                .any(|id| id == "mic-segment-0000-partial-0000-0-2000")
+        );
+        assert!(
+            partial_ids
+                .iter()
+                .any(|id| id == "mic-segment-0000-partial-0001-500-2500")
+        );
         assert!(partial_ids.iter().any(|id| id == "mic-segment-0000-0-2600"));
     }
 
@@ -5028,9 +5074,11 @@ mod tests {
         let events = collect_live_capture_continuity_events(&config);
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].code, "live_capture_interruption_recovered");
-        assert!(events[0]
-            .detail
-            .contains("2 stream interruption restart(s)"));
+        assert!(
+            events[0]
+                .detail
+                .contains("2 stream interruption restart(s)")
+        );
 
         let _ = fs::remove_file(input_wav);
         let _ = fs::remove_file(telemetry_path);
@@ -5238,12 +5286,16 @@ mod tests {
 
         let candidates = live_capture_telemetry_path_candidates(&config);
         assert_eq!(candidates.len(), 2);
-        assert!(candidates[0]
-            .to_string_lossy()
-            .ends_with("artifacts/live-output.telemetry.json"));
-        assert!(candidates[1]
-            .to_string_lossy()
-            .ends_with("artifacts/live-input.telemetry.json"));
+        assert!(
+            candidates[0]
+                .to_string_lossy()
+                .ends_with("artifacts/live-output.telemetry.json")
+        );
+        assert!(
+            candidates[1]
+                .to_string_lossy()
+                .ends_with("artifacts/live-input.telemetry.json")
+        );
     }
 
     #[test]
@@ -6148,12 +6200,16 @@ mod tests {
         );
 
         assert!(!reconciliation.is_empty());
-        assert!(reconciliation
-            .iter()
-            .all(|event| event.event_type == "reconciled_final"));
-        assert!(reconciliation
-            .iter()
-            .all(|event| event.segment_id.ends_with("-reconciled")));
+        assert!(
+            reconciliation
+                .iter()
+                .all(|event| event.event_type == "reconciled_final")
+        );
+        assert!(
+            reconciliation
+                .iter()
+                .all(|event| event.segment_id.ends_with("-reconciled"))
+        );
     }
 
     #[test]
@@ -6288,9 +6344,11 @@ mod tests {
         );
 
         assert_eq!(events.len(), 2);
-        assert!(events
-            .iter()
-            .all(|event| event.event_type == "reconciled_final"));
+        assert!(
+            events
+                .iter()
+                .all(|event| event.event_type == "reconciled_final")
+        );
         assert!(events.iter().all(|event| event.start_ms == 1_700));
         let lineage = events
             .iter()
@@ -6376,14 +6434,18 @@ mod tests {
         let merged = merge_transcript_events(merged);
         let reconciled_text = reconstruct_transcript(&merged);
 
-        assert!(merged
-            .iter()
-            .any(|event| event.event_type == "reconciled_final"));
+        assert!(
+            merged
+                .iter()
+                .any(|event| event.event_type == "reconciled_final")
+        );
         assert!(merged.iter().any(|event| event.event_type == "final"));
-        assert!(merged
-            .iter()
-            .filter(|event| event.event_type == "reconciled_final")
-            .all(|event| event.source_final_segment_id.is_some()));
+        assert!(
+            merged
+                .iter()
+                .filter(|event| event.event_type == "reconciled_final")
+                .all(|event| event.source_final_segment_id.is_some())
+        );
         assert!(reconciled_text.len() >= baseline_text.len());
         assert!(reconciled_text.contains("mic complete transcript"));
         assert!(reconciled_text.contains("system complete transcript"));
@@ -7215,10 +7277,12 @@ mod tests {
             chunk_lag.get("lag_max_ms").and_then(Value::as_u64),
             Some(2000)
         );
-        assert!(session_summary
-            .get("artifacts")
-            .and_then(Value::as_object)
-            .is_some());
+        assert!(
+            session_summary
+                .get("artifacts")
+                .and_then(Value::as_object)
+                .is_some()
+        );
 
         let _ = fs::remove_dir_all(temp_dir);
     }
@@ -7465,10 +7529,12 @@ mod tests {
                         == Some(runtime_jsonl::EVENT_TYPE_FINAL)
                 });
             assert!(has_final);
-            assert!(parsed
-                .get("session_summary")
-                .and_then(Value::as_object)
-                .is_some());
+            assert!(
+                parsed
+                    .get("session_summary")
+                    .and_then(Value::as_object)
+                    .is_some()
+            );
         }
 
         let _ = fs::remove_dir_all(temp_dir);
@@ -8005,9 +8071,11 @@ mod tests {
                 && line.contains("\"segment_id\":\"mic-reconciled-0000\"")
                 && line.contains("\"source_final_segment_id\":\"mic-chunk-0000-0-4000\"")
         }));
-        assert!(jsonl
-            .lines()
-            .any(|line| line.contains("\"event_type\":\"chunk_queue\"")));
+        assert!(
+            jsonl
+                .lines()
+                .any(|line| line.contains("\"event_type\":\"chunk_queue\""))
+        );
 
         let manifest = fs::read_to_string(&out_manifest).unwrap();
         let parsed: Value = serde_json::from_str(&manifest).unwrap();
@@ -8027,10 +8095,12 @@ mod tests {
                 .and_then(Value::as_str),
             Some("mic-chunk-0000-0-4000")
         );
-        assert!(parsed
-            .get("chunk_queue")
-            .and_then(Value::as_object)
-            .is_some());
+        assert!(
+            parsed
+                .get("chunk_queue")
+                .and_then(Value::as_object)
+                .is_some()
+        );
         assert!(parsed.get("jsonl_path").and_then(Value::as_str).is_some());
 
         replay_timeline(&out_jsonl).unwrap();
@@ -8218,6 +8288,61 @@ mod tests {
             writer.write_sample(-sample).unwrap(); // system audio
         }
         writer.finalize().unwrap();
+    }
+
+    #[test]
+    fn validate_output_path_allows_session_paths_inside_canonical_root() {
+        let _guard = env_lock().lock().unwrap();
+        let original_policy = env::var(storage_roots::APP_MANAGED_STORAGE_POLICY_ENV).ok();
+        let original_root = env::var(storage_roots::STORAGE_DATA_ROOT_ENV).ok();
+        let data_root = write_temp_dir("output-policy-allow");
+
+        unsafe {
+            env::set_var(storage_roots::APP_MANAGED_STORAGE_POLICY_ENV, "1");
+            env::set_var(storage_roots::STORAGE_DATA_ROOT_ENV, &data_root);
+        }
+
+        let allowed = data_root
+            .join("artifacts")
+            .join("packaged-beta")
+            .join("sessions")
+            .join("20260305")
+            .join("session.manifest.json");
+        let result = validate_output_path("--out-manifest", &allowed);
+
+        restore_optional_env(
+            storage_roots::APP_MANAGED_STORAGE_POLICY_ENV,
+            original_policy,
+        );
+        restore_optional_env(storage_roots::STORAGE_DATA_ROOT_ENV, original_root);
+        assert!(result.is_ok(), "expected in-root path to pass: {result:?}");
+    }
+
+    #[test]
+    fn validate_output_path_rejects_paths_outside_canonical_sessions_root() {
+        let _guard = env_lock().lock().unwrap();
+        let original_policy = env::var(storage_roots::APP_MANAGED_STORAGE_POLICY_ENV).ok();
+        let original_root = env::var(storage_roots::STORAGE_DATA_ROOT_ENV).ok();
+        let data_root = write_temp_dir("output-policy-reject");
+
+        unsafe {
+            env::set_var(storage_roots::APP_MANAGED_STORAGE_POLICY_ENV, "1");
+            env::set_var(storage_roots::STORAGE_DATA_ROOT_ENV, &data_root);
+        }
+
+        let outside = data_root.join("unmanaged").join("session.jsonl");
+        let err = validate_output_path("--out-jsonl", &outside)
+            .expect_err("out-of-policy path should be rejected");
+
+        restore_optional_env(
+            storage_roots::APP_MANAGED_STORAGE_POLICY_ENV,
+            original_policy,
+        );
+        restore_optional_env(storage_roots::STORAGE_DATA_ROOT_ENV, original_root);
+        assert!(
+            err.to_string().contains("outside canonical sessions root"),
+            "unexpected error: {err}"
+        );
     }
 
     fn write_temp_dir(prefix: &str) -> PathBuf {

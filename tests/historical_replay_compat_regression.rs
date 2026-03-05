@@ -37,14 +37,15 @@ fn read_jsonl(path: &Path) -> Vec<Value> {
     let raw = fs::read_to_string(path).expect("failed to read fixture JSONL");
     raw.lines()
         .enumerate()
-        .map(|(_idx, line)| {
-            serde_json::from_str::<Value>(line).expect("invalid fixture JSON row")
-        })
+        .map(|(_idx, line)| serde_json::from_str::<Value>(line).expect("invalid fixture JSON row"))
         .collect()
 }
 
 fn transcript_event_type(event_type: &str) -> bool {
-    matches!(event_type, "partial" | "final" | "llm_final" | "reconciled_final")
+    matches!(
+        event_type,
+        "partial" | "final" | "llm_final" | "reconciled_final"
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -68,7 +69,11 @@ fn fixture_transcript_rows(path: &Path) -> Vec<ReplayRow> {
             let channel = row.get("channel")?.as_str()?.to_string();
             let start_ms = row.get("start_ms")?.as_u64()?;
             let end_ms = row.get("end_ms")?.as_u64()?;
-            let text = row.get("text").and_then(Value::as_str).unwrap_or("").to_string();
+            let text = row
+                .get("text")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
             let segment_id = row
                 .get("segment_id")
                 .and_then(Value::as_str)
@@ -101,10 +106,7 @@ fn parse_replay_rows(stdout: &str) -> Vec<ReplayRow> {
 
             let mut parts = trimmed.splitn(3, ' ');
             let event_type = parts.next()?.to_string();
-            let channel = parts
-                .next()?
-                .strip_prefix("channel=")?
-                .to_string();
+            let channel = parts.next()?.strip_prefix("channel=")?.to_string();
             let timing_and_text = parts.next()?;
             let close_bracket = timing_and_text.find("] ")?;
             let timing = timing_and_text

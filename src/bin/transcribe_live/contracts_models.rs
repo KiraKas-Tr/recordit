@@ -480,9 +480,10 @@ pub(crate) mod runtime_jsonl {
                 r#"{"event_type":"mystery_control_event","channel":"control"}"#,
             )
             .expect_err("unknown event_type must fail");
-            assert!(err
-                .to_string()
-                .contains("unknown event_type `mystery_control_event`"));
+            assert!(
+                err.to_string()
+                    .contains("unknown event_type `mystery_control_event`")
+            );
         }
 
         #[test]

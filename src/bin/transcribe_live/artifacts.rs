@@ -702,63 +702,118 @@ fn build_preflight_manifest_model(
     }
 }
 
+fn next_atomic_write_nonce() -> u64 {
+    static NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+fn atomic_temp_path(target_path: &Path) -> PathBuf {
+    let parent = target_path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = target_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("artifact");
+    let temp_name = format!(
+        ".{file_name}.tmp-{}-{}",
+        std::process::id(),
+        next_atomic_write_nonce()
+    );
+    parent.join(temp_name)
+}
+
+#[cfg(unix)]
+fn sync_parent_directory(path: &Path) -> Result<(), CliError> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let dir = File::open(parent).map_err(|err| {
+        CliError::new(format!(
+            "failed to open artifact parent directory {} for fsync: {err}",
+            parent.display()
+        ))
+    })?;
+    dir.sync_all().map_err(io_to_cli)
+}
+
+#[cfg(not(unix))]
+fn sync_parent_directory(_path: &Path) -> Result<(), CliError> {
+    Ok(())
+}
+
+fn write_atomic_file<F>(target_path: &Path, label: &str, mut write_fn: F) -> Result<(), CliError>
+where
+    F: FnMut(&mut File) -> Result<(), CliError>,
+{
+    let parent = target_path.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent).map_err(|err| {
+        CliError::new(format!(
+            "failed to create {label} directory {}: {err}",
+            parent.display()
+        ))
+    })?;
+
+    let temp_path = atomic_temp_path(target_path);
+    let mut temp_file = fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&temp_path)
+        .map_err(|err| {
+            CliError::new(format!(
+                "failed to create temporary {label} file {}: {err}",
+                temp_path.display()
+            ))
+        })?;
+
+    if let Err(err) = write_fn(&mut temp_file) {
+        drop(temp_file);
+        let _ = fs::remove_file(&temp_path);
+        return Err(err);
+    }
+
+    temp_file.sync_all().map_err(io_to_cli)?;
+    drop(temp_file);
+
+    fs::rename(&temp_path, target_path).map_err(|err| {
+        let _ = fs::remove_file(&temp_path);
+        CliError::new(format!(
+            "failed to atomically replace {label} {}: {err}",
+            display_path(target_path)
+        ))
+    })?;
+    sync_parent_directory(target_path)?;
+    Ok(())
+}
+
 pub(super) fn write_runtime_manifest(
     config: &TranscribeConfig,
     report: &LiveRunReport,
 ) -> Result<(), CliError> {
-    if let Some(parent) = config.out_manifest.parent() {
-        fs::create_dir_all(parent).map_err(|err| {
+    let manifest_model = build_runtime_manifest_model(config, report);
+    write_atomic_file(&config.out_manifest, "runtime manifest", |file| {
+        serde_json::to_writer_pretty(&mut *file, &manifest_model).map_err(|err| {
             CliError::new(format!(
-                "failed to create runtime manifest directory {}: {err}",
-                parent.display()
+                "failed to serialize runtime manifest {}: {err}",
+                display_path(&config.out_manifest)
             ))
         })?;
-    }
-    let mut file = File::create(&config.out_manifest).map_err(|err| {
-        CliError::new(format!(
-            "failed to create runtime manifest {}: {err}",
-            display_path(&config.out_manifest)
-        ))
-    })?;
-    let manifest_model = build_runtime_manifest_model(config, report);
-    serde_json::to_writer_pretty(&mut file, &manifest_model).map_err(|err| {
-        CliError::new(format!(
-            "failed to serialize runtime manifest {}: {err}",
-            display_path(&config.out_manifest)
-        ))
-    })?;
-    writeln!(file).map_err(io_to_cli)?;
-    Ok(())
+        writeln!(file).map_err(io_to_cli)?;
+        Ok(())
+    })
 }
 
 pub(super) fn write_preflight_manifest(
     config: &TranscribeConfig,
     report: &PreflightReport,
 ) -> Result<(), CliError> {
-    if let Some(parent) = config.out_manifest.parent() {
-        fs::create_dir_all(parent).map_err(|err| {
+    let manifest_model = build_preflight_manifest_model(config, report);
+    write_atomic_file(&config.out_manifest, "preflight manifest", |file| {
+        serde_json::to_writer_pretty(&mut *file, &manifest_model).map_err(|err| {
             CliError::new(format!(
-                "failed to create manifest directory {}: {err}",
-                parent.display()
+                "failed to serialize preflight manifest {}: {err}",
+                display_path(&config.out_manifest)
             ))
         })?;
-    }
-
-    let mut file = File::create(&config.out_manifest).map_err(|err| {
-        CliError::new(format!(
-            "failed to create manifest {}: {err}",
-            display_path(&config.out_manifest)
-        ))
-    })?;
-    let manifest_model = build_preflight_manifest_model(config, report);
-    serde_json::to_writer_pretty(&mut file, &manifest_model).map_err(|err| {
-        CliError::new(format!(
-            "failed to serialize preflight manifest {}: {err}",
-            display_path(&config.out_manifest)
-        ))
-    })?;
-    writeln!(file).map_err(io_to_cli)?;
-    Ok(())
+        writeln!(file).map_err(io_to_cli)?;
+        Ok(())
+    })
 }
 
 #[cfg(test)]
@@ -766,6 +821,8 @@ mod tests {
     use super::*;
     use serde_json::Value;
     use std::collections::BTreeSet;
+    use std::io::Write;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn keys_set(value: &Value) -> BTreeSet<String> {
         value
@@ -778,6 +835,19 @@ mod tests {
 
     fn expected_set(keys: &[&str]) -> BTreeSet<String> {
         keys.iter().map(|key| (*key).to_string()).collect()
+    }
+
+    fn temp_test_dir(test_name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock drift")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "recordit-{test_name}-{}-{nanos}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).expect("create temp test dir");
+        dir
     }
 
     #[test]
@@ -847,5 +917,64 @@ mod tests {
                 "missing session_summary key {required}"
             );
         }
+    }
+
+    #[test]
+    fn write_atomic_file_preserves_existing_content_on_failure() {
+        let dir = temp_test_dir("atomic-preserve");
+        let target = dir.join("session.manifest.json");
+        fs::write(&target, "{\"status\":\"old\"}\n").expect("seed target");
+
+        let err = write_atomic_file(&target, "manifest", |file| {
+            file.write_all(br#"{"status":"partial"#).map_err(io_to_cli)?;
+            Err(CliError::new("simulated interruption"))
+        })
+        .expect_err("expected simulated interruption");
+        assert!(
+            err.to_string().contains("simulated interruption"),
+            "unexpected error: {err}"
+        );
+
+        let current = fs::read_to_string(&target).expect("read target");
+        assert_eq!(current, "{\"status\":\"old\"}\n");
+
+        let leftover_temps = fs::read_dir(&dir)
+            .expect("read temp dir")
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().to_string())
+            .filter(|name| name.starts_with(".session.manifest.json.tmp-"))
+            .collect::<Vec<_>>();
+        assert!(
+            leftover_temps.is_empty(),
+            "unexpected temporary artifacts left behind: {leftover_temps:?}"
+        );
+    }
+
+    #[test]
+    fn write_atomic_file_replaces_existing_content() {
+        let dir = temp_test_dir("atomic-replace");
+        let target = dir.join("session.manifest.json");
+        fs::write(&target, "{\"status\":\"old\"}\n").expect("seed target");
+
+        write_atomic_file(&target, "manifest", |file| {
+            file.write_all(br#"{"status":"new"}"#).map_err(io_to_cli)?;
+            file.write_all(b"\n").map_err(io_to_cli)?;
+            Ok(())
+        })
+        .expect("atomic write succeeds");
+
+        let current = fs::read_to_string(&target).expect("read target");
+        assert_eq!(current, "{\"status\":\"new\"}\n");
+
+        let leftover_temps = fs::read_dir(&dir)
+            .expect("read temp dir")
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().to_string())
+            .filter(|name| name.starts_with(".session.manifest.json.tmp-"))
+            .collect::<Vec<_>>();
+        assert!(
+            leftover_temps.is_empty(),
+            "unexpected temporary artifacts left behind: {leftover_temps:?}"
+        );
     }
 }
