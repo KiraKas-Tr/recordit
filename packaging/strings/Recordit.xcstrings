@@ -1,0 +1,292 @@
+{
+  "sourceLanguage": "en",
+  "strings": {
+    "onboarding.permissions.screen_recording.title": {
+      "comment": "Title for Screen Recording prerequisite in onboarding.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Needs permission"
+          }
+        }
+      }
+    },
+    "onboarding.permissions.screen_recording.body": {
+      "comment": "Explains why Screen Recording is required.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Screen Recording access is required to capture system audio."
+          }
+        }
+      }
+    },
+    "onboarding.permissions.microphone.title": {
+      "comment": "Title for microphone prerequisite in onboarding.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Needs permission"
+          }
+        }
+      }
+    },
+    "onboarding.permissions.microphone.body": {
+      "comment": "Explains why microphone access is required.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Microphone access is required to capture your voice."
+          }
+        }
+      }
+    },
+    "onboarding.permissions.open_settings.action": {
+      "comment": "Primary CTA that opens macOS privacy settings.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Open System Settings"
+          }
+        }
+      }
+    },
+    "onboarding.permissions.recheck.action": {
+      "comment": "Action label for re-running permission checks after user intervention.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Re-check access"
+          }
+        }
+      }
+    },
+    "onboarding.permissions.relaunch_hint.body": {
+      "comment": "Shown after Screen Recording permission changes on macOS.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "You may need to quit and reopen Recordit after changing Screen Recording access."
+          }
+        }
+      }
+    },
+    "onboarding.model.required.title": {
+      "comment": "Title for missing model state.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Model required"
+          }
+        }
+      }
+    },
+    "onboarding.model.required.body": {
+      "comment": "Explains why a model is needed for live transcription.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Choose a local model file to enable live transcription."
+          }
+        }
+      }
+    },
+    "onboarding.model.choose.action": {
+      "comment": "Primary CTA for opening file picker to select model.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Choose model"
+          }
+        }
+      }
+    },
+    "onboarding.model.record_only.action": {
+      "comment": "Fallback CTA to continue with record-only mode.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Use record-only mode"
+          }
+        }
+      }
+    },
+    "runtime.lifecycle.warmup": {
+      "comment": "Runtime phase label while initializing before transcript readiness.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Preparing session"
+          }
+        }
+      }
+    },
+    "runtime.lifecycle.active": {
+      "comment": "Runtime phase label while actively capturing/transcribing.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Listening"
+          }
+        }
+      }
+    },
+    "runtime.lifecycle.draining": {
+      "comment": "Runtime phase label while finalizing pending transcription work.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Finalizing session"
+          }
+        }
+      }
+    },
+    "runtime.status.ok.title": {
+      "comment": "Final status label for clean successful runs.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Session complete"
+          }
+        }
+      }
+    },
+    "runtime.status.degraded.title": {
+      "comment": "Final status label for successful but degraded/trust-notice runs.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Session completed with warnings"
+          }
+        }
+      }
+    },
+    "runtime.status.failed.title": {
+      "comment": "Final status label for failed runs.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Session failed"
+          }
+        }
+      }
+    },
+    "runtime.trust.degraded.body": {
+      "comment": "Primary degraded trust notice shown in session summary.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Quality may be reduced for part of this session."
+          }
+        }
+      }
+    },
+    "runtime.trust.reconciled.body": {
+      "comment": "Explains reconciliation effect after backlog pressure.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Some transcript segments were recovered after backlog pressure."
+          }
+        }
+      }
+    },
+    "runtime.trust.review.action": {
+      "comment": "CTA label to inspect trust notices.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Review trust notices"
+          }
+        }
+      }
+    },
+    "export.transcript.action": {
+      "comment": "Action label to export transcript text.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Export transcript"
+          }
+        }
+      }
+    },
+    "export.bundle.action": {
+      "comment": "Action label to export a session bundle artifact.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Export session bundle"
+          }
+        }
+      }
+    },
+    "export.diagnostics.action": {
+      "comment": "Action label to export diagnostics payload.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Export diagnostics"
+          }
+        }
+      }
+    },
+    "export.diagnostics.include_transcript_text.label": {
+      "comment": "Checkbox label controlling whether transcript text is included in diagnostics bundle.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Include transcript text in diagnostics"
+          }
+        }
+      }
+    },
+    "export.diagnostics.include_audio.label": {
+      "comment": "Checkbox label controlling whether audio payload is included in diagnostics bundle.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Include audio in diagnostics"
+          }
+        }
+      }
+    },
+    "export.privacy.warning.body": {
+      "comment": "Privacy warning shown before exporting sensitive diagnostics options.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Diagnostics may include sensitive content."
+          }
+        }
+      }
+    }
+  },
+  "version": "1.0"
+}
