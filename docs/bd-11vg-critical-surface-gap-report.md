@@ -52,14 +52,14 @@ These rows are the main blockers for any claim that the project has **complete r
 | `playback-functional` | `none` | no retained test lane found | coverage report must keep this explicit as uncovered |
 | `release-signing-notarization` | `docs-only` | runbook exists, but no archived execution evidence exists for a concrete RC | docs cannot be counted as e2e proof |
 | `dmg-install-open` | `docs-only` | build and manual steps exist without retained install/open logs | install-surface claims stay partial |
-| `session-history-search` | `local-test-only` | logic proof exists without a standardized retained evidence root | e2e completeness claim would overstate current reality |
-| `export-actions` | `local-test-only` | export logic is tested, but not retained as a product-journey evidence lane | downstream evidence contract needs expansion |
+| `session-history-search` | `local-test-only` | a stronger no-mock temp-filesystem lane now exists, but it still lacks packaged-app or retained product-journey evidence | e2e completeness claim would still overstate current reality |
+| `export-actions` | `local-test-only` | a stronger no-mock temp-filesystem lane now exists, but export proof is still not retained as a product-journey evidence lane | downstream evidence contract still needs expansion beyond service-level proof |
 
 ## Stable Downstream Contract
 
 Downstream beads should preserve these rules:
 
-- `bd-2mbp` must define the approved exception register against the exact seams already named in `main_bypass_or_limit`.
+- `bd-2mbp` now defines the approved exception register in `docs/bd-2mbp-critical-path-exception-register.csv`; downstream tooling should consume it directly rather than infer temporary allowances from prose.
 - `bd-1jc9` must treat any new critical-path mock/fake usage outside that register as drift.
 - `bd-13tm` must enforce that `retained-rich` and `retained-partial` mean concrete, inspectable evidence roots rather than informal logs.
 - `bd-3p9b` must fail or warn whenever a matrix row is `partial` or `uncovered` without a linked open bead and matching terminology downgrade.
