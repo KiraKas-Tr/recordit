@@ -133,7 +133,7 @@ public final class RuntimeViewModel {
         manifestService: ManifestService,
         modelService: ModelResolutionService,
         finalStatusMapper: ManifestFinalStatusMapper = ManifestFinalStatusMapper(),
-        finalizationTimeoutSeconds: TimeInterval = 4,
+        finalizationTimeoutSeconds: TimeInterval = 15,
         finalizationPollIntervalNanoseconds: UInt64 = 250_000_000,
         now: @escaping @Sendable () -> Date = { Date() },
         sleep: @escaping @Sendable (UInt64) async -> Void = { nanoseconds in
@@ -161,9 +161,18 @@ public final class RuntimeViewModel {
             return
         }
         do {
-            _ = try modelService.resolveModel(ModelResolutionRequest(explicitModelPath: explicitModelPath, backend: "whispercpp"))
+            let resolvedModel = try modelService.resolveModel(
+                ModelResolutionRequest(
+                    explicitModelPath: explicitModelPath,
+                    backend: "whispercpp"
+                )
+            )
             let result = try await runtimeService.startSession(
-                request: RuntimeStartRequest(mode: .live, outputRoot: outputRoot, modelPath: explicitModelPath)
+                request: RuntimeStartRequest(
+                    mode: .live,
+                    outputRoot: outputRoot,
+                    modelPath: resolvedModel.resolvedPath
+                )
             )
             activeSessionRoot = result.sessionRoot
             _ = transition(
@@ -443,12 +452,23 @@ public final class RuntimeViewModel {
             }
         }
 
+        // One final read attempt reduces deadline-edge races where the manifest lands
+        // right after the loop's last transient read failure.
+        if let manifest = try? manifestService.loadManifest(at: manifestPath) {
+            applyManifestFinalStatus(manifest, action: "stopCurrentRun.finalize")
+            return
+        }
+
+        let diagnostics = finalizationTimeoutDiagnostics(
+            sessionRoot: sessionRoot,
+            manifestPath: manifestPath
+        )
         _ = transitionToFailure(
             AppServiceError(
                 code: .timeout,
                 userMessage: "Session finalization timed out.",
                 remediation: "Open session details to inspect artifacts, then retry finalization.",
-                debugDetail: "timeout_seconds=\(finalizationTimeoutSeconds)"
+                debugDetail: "timeout_seconds=\(finalizationTimeoutSeconds), \(diagnostics)"
             ),
             allowedFrom: [.finalizing],
             action: "stopCurrentRun.finalize",
@@ -456,6 +476,22 @@ public final class RuntimeViewModel {
             invalidRemediation: "Refresh runtime state and retry finalization.",
             recoveryActions: [.safeFinalize, .retryFinalize, .openSessionArtifacts, .startNewSession]
         )
+    }
+
+    private func finalizationTimeoutDiagnostics(sessionRoot: URL, manifestPath: URL) -> String {
+        let fileManager = FileManager.default
+        let jsonlPath = sessionRoot.appendingPathComponent("session.jsonl")
+        let wavPath = sessionRoot.appendingPathComponent("session.wav")
+        let stderrPath = sessionRoot.appendingPathComponent("runtime.stderr.log")
+
+        return [
+            "session_root=\(sessionRoot.path)",
+            "manifest_path=\(manifestPath.path)",
+            "manifest_exists=\(fileManager.fileExists(atPath: manifestPath.path))",
+            "jsonl_exists=\(fileManager.fileExists(atPath: jsonlPath.path))",
+            "wav_exists=\(fileManager.fileExists(atPath: wavPath.path))",
+            "stderr_exists=\(fileManager.fileExists(atPath: stderrPath.path))",
+        ].joined(separator: ", ")
     }
 
     private func applyManifestFinalStatus(_ manifest: SessionManifestDTO, action: String) {

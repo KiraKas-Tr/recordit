@@ -72,6 +72,27 @@ private func validEnvelopeData() -> Data {
     ])
 }
 
+private func writeTempManifest(_ data: Data) -> URL {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("recordit-preflight-smoke-\(UUID().uuidString)", isDirectory: true)
+    do {
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let path = root.appendingPathComponent("session.manifest.json")
+        try data.write(to: path, options: .atomic)
+        return path
+    } catch {
+        fputs("preflight_smoke failed: could not write manifest fixture: \(error)\n", stderr)
+        exit(1)
+    }
+}
+
+private func invocationSummaryStdout(manifestPath: URL, exitCode: Int = 2) -> Data {
+    let payload = """
+    {"command":"preflight","mode":"live","exit_code":\(exitCode),"legacy_args":["--preflight"],"session":{"root":"\(manifestPath.deletingLastPathComponent().path)","input_wav":"\(manifestPath.deletingLastPathComponent().appendingPathComponent("session.input.wav").path)","wav":"\(manifestPath.deletingLastPathComponent().appendingPathComponent("session.wav").path)","jsonl":"\(manifestPath.deletingLastPathComponent().appendingPathComponent("session.jsonl").path)","manifest":"\(manifestPath.path)"}}
+    """
+    return Data(payload.utf8)
+}
+
 @MainActor
 private func runSmoke() {
     let parser = PreflightEnvelopeParser()
@@ -153,11 +174,13 @@ private func runSmoke() {
             stderr: Data()
         )
     )
+    let expectedOutputRoot = URL(fileURLWithPath: "/tmp/recordit-preflight-smoke-output", isDirectory: true)
     let runner = RecorditPreflightRunner(
         executable: "/usr/bin/env",
         commandRunner: stub,
         parser: parser,
-        environment: ["RECORDIT_TEST": "1"]
+        environment: ["RECORDIT_TEST": "1"],
+        preflightOutputRoot: expectedOutputRoot
     )
     let envelope: PreflightManifestEnvelopeDTO
     do {
@@ -169,10 +192,42 @@ private func runSmoke() {
     check(envelope.kind == "transcribe-live-preflight", "runner should return parsed envelope")
     check(stub.receivedExecutable == "/usr/bin/env", "runner should use configured executable")
     check(
-        stub.receivedArguments == ["recordit", "preflight", "--mode", "live", "--json"],
+        stub.receivedArguments == [
+            "recordit",
+            "preflight",
+            "--mode",
+            "live",
+            "--output-root",
+            expectedOutputRoot.path,
+            "--json",
+        ],
         "runner should use deterministic recordit preflight args"
     )
     check(stub.receivedEnvironment["RECORDIT_TEST"] == "1", "runner should pass through environment")
+
+    let manifestFixtureURL = writeTempManifest(validEnvelopeData())
+    let summaryStub = StubCommandRunner(
+        result: CommandExecutionResult(
+            exitCode: 2,
+            stdout: invocationSummaryStdout(manifestPath: manifestFixtureURL),
+            stderr: Data("preflight failed".utf8)
+        )
+    )
+    let summaryRunner = RecorditPreflightRunner(
+        executable: "/usr/bin/env",
+        commandRunner: summaryStub,
+        parser: parser,
+        environment: [:]
+    )
+    do {
+        let parsedFromManifest = try summaryRunner.runLivePreflight()
+        check(
+            parsedFromManifest.kind == "transcribe-live-preflight",
+            "runner should load preflight manifest from invocation summary output"
+        )
+    } catch {
+        check(false, "runner should parse preflight manifest from invocation summary: \(error)")
+    }
 }
 
 @main

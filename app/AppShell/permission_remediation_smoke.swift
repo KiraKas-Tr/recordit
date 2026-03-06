@@ -55,6 +55,20 @@ private final class SequenceCommandRunner: CommandRunning {
     }
 }
 
+private struct FailingCommandRunner: CommandRunning {
+    func run(
+        executable _: String,
+        arguments _: [String],
+        environment _: [String: String]
+    ) throws -> CommandExecutionResult {
+        CommandExecutionResult(
+            exitCode: 17,
+            stdout: Data(),
+            stderr: Data("permission diagnostics unavailable".utf8)
+        )
+    }
+}
+
 @MainActor
 private func runSmoke() {
     let failingPayload = encodeEnvelopeJSON(
@@ -101,7 +115,8 @@ private func runSmoke() {
     var openedURLs = [URL]()
     let viewModel = PermissionRemediationViewModel(
         runner: runner,
-        openSystemSettings: { openedURLs.append($0) }
+        openSystemSettings: { openedURLs.append($0) },
+        nativePermissionStatus: { _ in false }
     )
 
     viewModel.runPermissionCheck()
@@ -139,6 +154,64 @@ private func runSmoke() {
         "microphone settings URL should target Microphone privacy pane"
     )
     check(commandRunner.invocationCount == 2, "runner should be invoked once for initial check and once for re-check")
+
+    let failedRunner = RecorditPreflightRunner(
+        executable: "/usr/bin/env",
+        commandRunner: FailingCommandRunner(),
+        parser: PreflightEnvelopeParser(),
+        environment: [:]
+    )
+    let failedViewModel = PermissionRemediationViewModel(
+        runner: failedRunner,
+        openSystemSettings: { openedURLs.append($0) },
+        nativePermissionStatus: { _ in false }
+    )
+    failedViewModel.runPermissionCheck()
+    guard case let .ready(fallbackItems) = failedViewModel.state else {
+        check(false, "failing preflight should produce native-permission fallback ready state")
+        return
+    }
+    check(
+        fallbackItems.allSatisfy { $0.status == .missing },
+        "fallback state with native denied permissions should keep both permissions missing"
+    )
+    check(
+        Set(failedViewModel.missingPermissions) == Set([.screenRecording, .microphone]),
+        "failed state should fail-open both permissions for deep-link affordances"
+    )
+    check(
+        failedViewModel.openSettings(for: .screenRecording),
+        "screen settings deep-link should remain available in failed state"
+    )
+    check(
+        failedViewModel.openSettings(for: .microphone),
+        "microphone settings deep-link should remain available in failed state"
+    )
+
+    let runtimeOnlyFailureRunner = RecorditPreflightRunner(
+        executable: "/usr/bin/env",
+        commandRunner: SequenceCommandRunner(payloads: [failingPayload]),
+        parser: PreflightEnvelopeParser(),
+        environment: [:]
+    )
+    let nativeGrantedViewModel = PermissionRemediationViewModel(
+        runner: runtimeOnlyFailureRunner,
+        openSystemSettings: { openedURLs.append($0) },
+        nativePermissionStatus: { _ in true }
+    )
+    nativeGrantedViewModel.runPermissionCheck()
+    guard case let .ready(nativeGrantedItems) = nativeGrantedViewModel.state else {
+        check(false, "native-granted override should keep permission state ready")
+        return
+    }
+    check(
+        nativeGrantedItems.contains(where: { $0.permission == .screenRecording && $0.status == .missing }),
+        "runtime permission failures should remain missing even when native API reports granted"
+    )
+    check(
+        Set(nativeGrantedViewModel.missingPermissions) == Set([.screenRecording]),
+        "runtime permission failure should block onboarding for affected permission"
+    )
 }
 
 @main

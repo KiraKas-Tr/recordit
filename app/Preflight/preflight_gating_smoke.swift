@@ -140,6 +140,52 @@ private func runViewModelChecks() {
     check(!viewModel.canProceedToLiveTranscribe, "view model must block proceed until user acknowledges warnings")
     viewModel.acknowledgeWarningsForLiveTranscribe()
     check(viewModel.canProceedToLiveTranscribe, "view model should allow proceed after user acknowledgment")
+
+    let runtimePermissionFailureEnvelope = fixtureEnvelope(checks: [
+        fixtureCheck("model_path", .pass),
+        fixtureCheck("out_wav", .pass),
+        fixtureCheck("out_jsonl", .pass),
+        fixtureCheck("out_manifest", .pass),
+        fixtureCheck("screen_capture_access", .fail),
+        fixtureCheck("microphone_access", .fail),
+    ])
+    let runtimeFailureData: Data
+    do {
+        runtimeFailureData = try encoder.encode(runtimePermissionFailureEnvelope)
+    } catch {
+        fputs("preflight_gating_smoke failed: runtime failure fixture encode failed: \(error)\n", stderr)
+        exit(1)
+    }
+
+    let runtimeFailureRunner = RecorditPreflightRunner(
+        executable: "/usr/bin/env",
+        commandRunner: StubCommandRunner(stdoutData: runtimeFailureData),
+        parser: PreflightEnvelopeParser(),
+        environment: [:]
+    )
+    let fallbackViewModel = PreflightViewModel(
+        runner: runtimeFailureRunner,
+        gatingPolicy: PreflightGatingPolicy(),
+        nativePermissionStatus: { _ in true }
+    )
+    fallbackViewModel.runLivePreflight()
+    check(
+        !fallbackViewModel.canProceedToLiveTranscribe,
+        "runtime permission failures must block proceed in production mode"
+    )
+    if case let .completed(envelope) = fallbackViewModel.state {
+        check(envelope.overallStatus == .fail, "runtime permission failures should keep overall status fail")
+        let remainingPermissionFailures = envelope.checks.filter {
+            ($0.id == "screen_capture_access" || $0.id == "display_availability" || $0.id == "microphone_access")
+                && $0.status == .fail
+        }
+        check(
+            !remainingPermissionFailures.isEmpty,
+            "runtime permission checks should remain in fail state until helper probes succeed"
+        )
+    } else {
+        check(false, "fallback view model should complete with a runtime envelope")
+    }
 }
 
 @main

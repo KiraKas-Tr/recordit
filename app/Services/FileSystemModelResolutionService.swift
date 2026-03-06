@@ -4,13 +4,16 @@ import Foundation
 public struct FileSystemModelResolutionService: ModelResolutionService {
     private let environment: [String: String]
     private let currentDirectoryURL: URL
+    private let bundleResourceURL: URL?
 
     public init(
         environment: [String: String] = ProcessInfo.processInfo.environment,
-        currentDirectoryURL: URL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+        currentDirectoryURL: URL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath),
+        bundleResourceURL: URL? = Bundle.main.resourceURL
     ) {
         self.environment = environment
         self.currentDirectoryURL = currentDirectoryURL.standardizedFileURL
+        self.bundleResourceURL = bundleResourceURL?.standardizedFileURL
     }
 
     public func resolveModel(_ request: ModelResolutionRequest) throws -> ResolvedModelDTO {
@@ -164,20 +167,47 @@ public struct FileSystemModelResolutionService: ModelResolutionService {
     }
 
     private func defaultCandidates(for backend: BackendKind) -> [URL] {
+        var candidates = [URL]()
+
+        if let bundled = bundledModelCandidate(for: backend) {
+            candidates.append(bundled)
+        }
+
         switch backend {
         case .whispercpp:
-            return [
+            candidates.append(contentsOf: [
                 URL(fileURLWithPath: "artifacts/bench/models/whispercpp/ggml-tiny.en.bin"),
                 URL(fileURLWithPath: "models/ggml-tiny.en.bin"),
-            ]
+            ])
         case .whisperkit:
-            return [
+            candidates.append(contentsOf: [
                 URL(
                     fileURLWithPath:
                         "artifacts/bench/models/whisperkit/models/argmaxinc/whisperkit-coreml/openai_whisper-tiny"
                 ),
                 URL(fileURLWithPath: "models/whisperkit/openai_whisper-tiny"),
-            ]
+            ])
+        }
+
+        return candidates
+    }
+
+    private func bundledModelCandidate(for backend: BackendKind) -> URL? {
+        guard let bundleResourceURL else {
+            return nil
+        }
+
+        switch backend {
+        case .whispercpp:
+            return bundleResourceURL
+                .appendingPathComponent("runtime/models/whispercpp/ggml-tiny.en.bin")
+                .standardizedFileURL
+        case .whisperkit:
+            return bundleResourceURL
+                .appendingPathComponent(
+                    "runtime/models/whisperkit/models/argmaxinc/whisperkit-coreml/openai_whisper-tiny"
+                )
+                .standardizedFileURL
         }
     }
 }

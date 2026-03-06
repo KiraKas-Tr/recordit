@@ -45,11 +45,18 @@ public enum RuntimeExitClassification: Equatable, Sendable {
 public struct RuntimeProcessControlOutcome: Equatable, Sendable {
     public var action: RuntimeControlAction
     public var classification: RuntimeExitClassification
+    public var sessionRoot: URL?
     public var finishedAt: Date
 
-    public init(action: RuntimeControlAction, classification: RuntimeExitClassification, finishedAt: Date) {
+    public init(
+        action: RuntimeControlAction,
+        classification: RuntimeExitClassification,
+        sessionRoot: URL? = nil,
+        finishedAt: Date
+    ) {
         self.action = action
         self.classification = classification
+        self.sessionRoot = sessionRoot
         self.finishedAt = finishedAt
     }
 }
@@ -149,11 +156,20 @@ public protocol RuntimeBinaryResolving: Sendable {
 public struct RuntimeBinaryResolver: RuntimeBinaryResolving {
     public static let recorditEnvKey = "RECORDIT_RUNTIME_BINARY"
     public static let sequoiaCaptureEnvKey = "SEQUOIA_CAPTURE_BINARY"
+    private static let bundledRuntimeRelativeDirectories = [
+        "runtime/bin",
+        "bin",
+    ]
 
     private let environment: [String: String]
+    private let bundleResourceURL: URL?
 
-    public init(environment: [String: String] = ProcessInfo.processInfo.environment) {
+    public init(
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        bundleResourceURL: URL? = Bundle.main.resourceURL
+    ) {
         self.environment = environment
+        self.bundleResourceURL = bundleResourceURL
     }
 
     public func startupReadinessReport() -> RuntimeBinaryReadinessReport {
@@ -187,6 +203,10 @@ public struct RuntimeBinaryResolver: RuntimeBinaryResolving {
                 throw RuntimeProcessManagerError.binaryNotExecutable(path: overrideURL.path)
             }
             return overrideURL
+        }
+
+        if let bundled = bundledExecutable(named: name) {
+            return bundled
         }
 
         let pathComponents = (environment["PATH"] ?? "")
@@ -256,6 +276,31 @@ public struct RuntimeBinaryResolver: RuntimeBinaryResolving {
             )
         }
 
+        for candidate in bundledBinaryCandidates(named: name) {
+            if !fileManager.fileExists(atPath: candidate.path) {
+                continue
+            }
+            guard fileManager.isExecutableFile(atPath: candidate.path) else {
+                return RuntimeBinaryReadinessCheck(
+                    binaryName: name,
+                    overrideEnvKey: overrideEnvKey,
+                    status: .notExecutable,
+                    resolvedPath: candidate.path,
+                    userMessage: "Runtime binary is not executable.",
+                    remediation: "Reinstall Recordit.app or update \(overrideEnvKey) to an executable absolute path.",
+                    debugDetail: "bundled_not_executable=\(candidate.path)"
+                )
+            }
+            return RuntimeBinaryReadinessCheck(
+                binaryName: name,
+                overrideEnvKey: overrideEnvKey,
+                status: .ready,
+                resolvedPath: candidate.path,
+                userMessage: "\(name) is available.",
+                remediation: ""
+            )
+        }
+
         let pathComponents = (environment["PATH"] ?? "")
             .split(separator: ":")
             .map(String.init)
@@ -281,9 +326,31 @@ public struct RuntimeBinaryResolver: RuntimeBinaryResolving {
             status: .missing,
             resolvedPath: nil,
             userMessage: "Required runtime binary is missing.",
-            remediation: "Install \(name) or set \(overrideEnvKey) to an absolute executable path.",
-            debugDetail: "PATH_search_failed"
+            remediation: "Reinstall Recordit.app or set \(overrideEnvKey) to an absolute executable path.",
+            debugDetail: "bundled_and_PATH_search_failed"
         )
+    }
+
+    private func bundledExecutable(named name: String) -> URL? {
+        let fileManager = FileManager.default
+        for candidate in bundledBinaryCandidates(named: name) {
+            if fileManager.isExecutableFile(atPath: candidate.path) {
+                return candidate
+            }
+        }
+        return nil
+    }
+
+    private func bundledBinaryCandidates(named name: String) -> [URL] {
+        guard let resourceURL = bundleResourceURL?.standardizedFileURL else {
+            return []
+        }
+        return Self.bundledRuntimeRelativeDirectories.map { relativeDirectory in
+            resourceURL
+                .appendingPathComponent(relativeDirectory, isDirectory: true)
+                .appendingPathComponent(name)
+                .standardizedFileURL
+        }
     }
 }
 
@@ -293,17 +360,24 @@ public actor RuntimeProcessManager {
         var sessionRoot: URL
         var commandLine: RuntimeCommandLine
         var startedAt: Date
+        var stdoutLogURL: URL
+        var stderrLogURL: URL
+        var stdoutHandle: FileHandle
+        var stderrHandle: FileHandle
     }
 
     private let binaryResolver: RuntimeBinaryResolving
+    private let processEnvironment: [String: String]?
     private let now: @Sendable () -> Date
     private var managedProcesses: [Int32: ManagedProcess] = [:]
 
     public init(
         binaryResolver: RuntimeBinaryResolving = RuntimeBinaryResolver(),
+        processEnvironment: [String: String]? = nil,
         now: @escaping @Sendable () -> Date = { Date() }
     ) {
         self.binaryResolver = binaryResolver
+        self.processEnvironment = processEnvironment
         self.now = now
     }
 
@@ -333,14 +407,31 @@ public actor RuntimeProcessManager {
     public func launch(request: RuntimeStartRequest) throws -> RuntimeProcessLaunch {
         let command = try commandLine(for: request)
         let sessionRoot = try absolutePath(request.outputRoot, field: "outputRoot")
+        let stdoutLogURL = sessionRoot
+            .appendingPathComponent("runtime.stdout.log", isDirectory: false)
+            .standardizedFileURL
+        let stderrLogURL = sessionRoot
+            .appendingPathComponent("runtime.stderr.log", isDirectory: false)
+            .standardizedFileURL
 
         let process = Process()
         process.executableURL = command.executableURL
         process.arguments = command.arguments
+        if let processEnvironment {
+            process.environment = processEnvironment
+        }
+        let (stdoutHandle, stderrHandle) = try makeRuntimeLogHandles(
+            sessionRoot: sessionRoot,
+            stdoutLogURL: stdoutLogURL,
+            stderrLogURL: stderrLogURL
+        )
+        process.standardOutput = stdoutHandle
+        process.standardError = stderrHandle
 
         do {
             try process.run()
         } catch {
+            closeLogHandles(stdoutHandle: stdoutHandle, stderrHandle: stderrHandle)
             throw RuntimeProcessManagerError.launchFailed(detail: String(describing: error))
         }
 
@@ -350,7 +441,11 @@ public actor RuntimeProcessManager {
             process: process,
             sessionRoot: sessionRoot,
             commandLine: command,
-            startedAt: startedAt
+            startedAt: startedAt,
+            stdoutLogURL: stdoutLogURL,
+            stderrLogURL: stderrLogURL,
+            stdoutHandle: stdoutHandle,
+            stderrHandle: stderrHandle
         )
 
         return RuntimeProcessLaunch(
@@ -395,8 +490,14 @@ public actor RuntimeProcessManager {
             classification = .timedOut
         }
 
+        closeLogHandles(stdoutHandle: managed.stdoutHandle, stderrHandle: managed.stderrHandle)
         managedProcesses.removeValue(forKey: processIdentifier)
-        return RuntimeProcessControlOutcome(action: action, classification: classification, finishedAt: now())
+        return RuntimeProcessControlOutcome(
+            action: action,
+            classification: classification,
+            sessionRoot: managed.sessionRoot,
+            finishedAt: now()
+        )
     }
 
     public func pollTermination(processIdentifier: Int32) -> RuntimeExitClassification? {
@@ -410,8 +511,40 @@ public actor RuntimeProcessManager {
         }
 
         let classification = classifyTermination(process: process, timedOut: false)
+        closeLogHandles(stdoutHandle: managed.stdoutHandle, stderrHandle: managed.stderrHandle)
         managedProcesses.removeValue(forKey: processIdentifier)
         return classification
+    }
+
+    private func makeRuntimeLogHandles(
+        sessionRoot: URL,
+        stdoutLogURL: URL,
+        stderrLogURL: URL
+    ) throws -> (FileHandle, FileHandle) {
+        let fileManager = FileManager.default
+        do {
+            try fileManager.createDirectory(at: sessionRoot, withIntermediateDirectories: true)
+            if !fileManager.fileExists(atPath: stdoutLogURL.path) {
+                fileManager.createFile(atPath: stdoutLogURL.path, contents: Data())
+            }
+            if !fileManager.fileExists(atPath: stderrLogURL.path) {
+                fileManager.createFile(atPath: stderrLogURL.path, contents: Data())
+            }
+            let stdoutHandle = try FileHandle(forWritingTo: stdoutLogURL)
+            let stderrHandle = try FileHandle(forWritingTo: stderrLogURL)
+            try stdoutHandle.truncate(atOffset: 0)
+            try stderrHandle.truncate(atOffset: 0)
+            return (stdoutHandle, stderrHandle)
+        } catch {
+            throw RuntimeProcessManagerError.launchFailed(
+                detail: "failed preparing runtime logs in \(sessionRoot.path): \(error)"
+            )
+        }
+    }
+
+    private func closeLogHandles(stdoutHandle: FileHandle, stderrHandle: FileHandle) {
+        try? stdoutHandle.close()
+        try? stderrHandle.close()
     }
 
     private func buildRecorditArguments(request: RuntimeStartRequest, sessionRoot: URL) throws -> [String] {

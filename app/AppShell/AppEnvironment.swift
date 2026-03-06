@@ -82,6 +82,15 @@ public struct FileSystemManifestService: ManifestService {
 }
 
 public struct AppEnvironment {
+    private static let defaultPathSegments: [String] = [
+        "/opt/homebrew/bin",
+        "/usr/local/bin",
+        "/usr/bin",
+        "/bin",
+        "/usr/sbin",
+        "/sbin",
+    ]
+
     public var runtimeService: any RuntimeService
     public var manifestService: any ManifestService
     public var modelService: any ModelResolutionService
@@ -116,10 +125,50 @@ public struct AppEnvironment {
 
     public static func production() -> AppEnvironment {
         let sessionLibraryService = FileSystemSessionLibraryService()
+        var runtimeEnvironment = normalizedProcessEnvironment(base: ProcessInfo.processInfo.environment)
+        let resolver = RuntimeBinaryResolver(environment: runtimeEnvironment)
+        let readinessReport = resolver.startupReadinessReport()
+
+        if let recorditPath = readinessReport.checks
+            .first(where: { $0.binaryName == "recordit" && $0.isReady })?
+            .resolvedPath {
+            let recorditDirectory = URL(fileURLWithPath: recorditPath)
+                .deletingLastPathComponent()
+                .path
+            runtimeEnvironment = normalizedProcessEnvironment(
+                base: runtimeEnvironment,
+                prependingPathSegments: [recorditDirectory]
+            )
+        }
+
+        var modelEnvironment = runtimeEnvironment
+
+        let bootstrapModelService = FileSystemModelResolutionService(environment: modelEnvironment)
+        if let resolvedDefaultModel = try? bootstrapModelService.resolveModel(
+            ModelResolutionRequest(explicitModelPath: nil, backend: "whispercpp")
+        ) {
+            let resolvedPath = resolvedDefaultModel.resolvedPath.path
+            modelEnvironment["RECORDIT_ASR_MODEL"] = resolvedPath
+            runtimeEnvironment["RECORDIT_ASR_MODEL"] = resolvedPath
+        }
+
+        var preflightEnvironment: [String: String] = [:]
+        if let resolvedModelPath = modelEnvironment["RECORDIT_ASR_MODEL"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+            !resolvedModelPath.isEmpty {
+            preflightEnvironment["RECORDIT_ASR_MODEL"] = resolvedModelPath
+        }
+        preflightEnvironment["PATH"] = runtimeEnvironment["PATH"]
+
+        let processManager = RuntimeProcessManager(
+            binaryResolver: RuntimeBinaryResolver(environment: runtimeEnvironment),
+            processEnvironment: runtimeEnvironment
+        )
+
         return AppEnvironment(
-            runtimeService: ProcessBackedRuntimeService(),
+            runtimeService: ProcessBackedRuntimeService(processManager: processManager),
             manifestService: FileSystemManifestService(),
-            modelService: FileSystemModelResolutionService(),
+            modelService: FileSystemModelResolutionService(environment: modelEnvironment),
             jsonlTailService: FileSystemJsonlTailService(),
             sessionLibraryService: sessionLibraryService,
             artifactIntegrityService: FileSystemArtifactIntegrityService(),
@@ -127,8 +176,35 @@ public struct AppEnvironment {
             startupMigrationRepairService: StartupMigrationRepairService(
                 sessionLibraryService: sessionLibraryService
             ),
-            preflightRunner: RecorditPreflightRunner()
+            preflightRunner: RecorditPreflightRunner(environment: preflightEnvironment)
         )
+    }
+
+    private static func normalizedProcessEnvironment(
+        base: [String: String],
+        prependingPathSegments: [String] = []
+    ) -> [String: String] {
+        var environment = base
+        let existingSegments = (base["PATH"] ?? "")
+            .split(separator: ":")
+            .map(String.init)
+        let orderedSegments = prependingPathSegments + existingSegments + defaultPathSegments
+
+        var seen = Set<String>()
+        var normalizedSegments: [String] = []
+        normalizedSegments.reserveCapacity(orderedSegments.count)
+        for segment in orderedSegments {
+            let trimmed = segment.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else {
+                continue
+            }
+            if seen.insert(trimmed).inserted {
+                normalizedSegments.append(trimmed)
+            }
+        }
+
+        environment["PATH"] = normalizedSegments.joined(separator: ":")
+        return environment
     }
 
     public static func preview() -> AppEnvironment {

@@ -1,0 +1,254 @@
+import Foundation
+import SwiftUI
+
+@main
+struct RecorditApp: App {
+    private let launchConfiguration = LaunchConfiguration.current()
+
+    var body: some Scene {
+        WindowGroup("Recordit") {
+            MainWindowView(
+                environment: launchConfiguration.environment,
+                firstRun: launchConfiguration.firstRun
+            )
+        }
+        .windowResizability(.contentSize)
+    }
+}
+
+private struct LaunchConfiguration {
+    private enum UITestPreflightScenario: String {
+        case permissionRecovery = "permission_recovery"
+        case permissionCheckFailure = "permission_check_failure"
+    }
+    private enum UITestRuntimeScenario: String {
+        case stopFailure = "stop_failure"
+    }
+
+    let environment: AppEnvironment
+    let firstRun: Bool?
+
+    static func current(processInfo: ProcessInfo = .processInfo) -> LaunchConfiguration {
+        let environmentVariables = processInfo.environment
+        let useUITestEnvironment = environmentVariables["RECORDIT_UI_TEST_MODE"] == "1"
+            || processInfo.arguments.contains("--ui-test-mode")
+
+        if useUITestEnvironment {
+            let preflightScenario = UITestPreflightScenario(
+                rawValue: environmentVariables["RECORDIT_UI_TEST_PREFLIGHT_SCENARIO"] ?? ""
+            )
+            let runtimeScenario = UITestRuntimeScenario(
+                rawValue: environmentVariables["RECORDIT_UI_TEST_RUNTIME_SCENARIO"] ?? ""
+            )
+            return LaunchConfiguration(
+                environment: makeUITestEnvironment(
+                    preflightScenario: preflightScenario,
+                    runtimeScenario: runtimeScenario
+                ),
+                firstRun: parseBool(environmentVariables["RECORDIT_FORCE_FIRST_RUN"]) ?? true
+            )
+        }
+
+        return LaunchConfiguration(
+            environment: .production(),
+            firstRun: parseBool(environmentVariables["RECORDIT_FORCE_FIRST_RUN"])
+        )
+    }
+
+    private static func parseBool(_ rawValue: String?) -> Bool? {
+        guard let normalized = rawValue?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+              !normalized.isEmpty else {
+            return nil
+        }
+
+        switch normalized {
+        case "1", "true", "yes":
+            return true
+        case "0", "false", "no":
+            return false
+        default:
+            return nil
+        }
+    }
+
+    private static func makeUITestEnvironment(
+        preflightScenario: UITestPreflightScenario?,
+        runtimeScenario: UITestRuntimeScenario?
+    ) -> AppEnvironment {
+        var environment = AppEnvironment.preview()
+
+        if let preflightScenario {
+            switch preflightScenario {
+            case .permissionRecovery:
+                let runner = RecorditPreflightRunner(
+                    executable: "/usr/bin/env",
+                    commandRunner: ScriptedPreflightCommandRunner(
+                        payloads: [
+                            permissionDeniedPayloadData(),
+                            permissionGrantedPayloadData(),
+                        ]
+                    ),
+                    parser: PreflightEnvelopeParser(),
+                    environment: [:]
+                )
+                environment = environment.replacing(preflightRunner: runner)
+            case .permissionCheckFailure:
+                let runner = RecorditPreflightRunner(
+                    executable: "/usr/bin/env",
+                    commandRunner: ScriptedFailingPreflightCommandRunner(),
+                    parser: PreflightEnvelopeParser(),
+                    environment: [:]
+                )
+                environment = environment.replacing(preflightRunner: runner)
+            }
+        }
+
+        if runtimeScenario == .stopFailure {
+            environment = environment.replacing(
+                runtimeService: ScriptedUITestRuntimeService(failStop: true)
+            )
+        }
+
+        return environment
+    }
+
+    private static func permissionDeniedPayloadData() -> Data {
+        preflightPayloadData(
+            overallStatus: "FAIL",
+            screenStatus: "FAIL",
+            screenDetail: "Screen Recording permission denied.",
+            screenRemediation: "Open System Settings and grant Screen Recording access, then Re-check.",
+            microphoneStatus: "FAIL",
+            microphoneDetail: "Microphone permission denied.",
+            microphoneRemediation: "Open System Settings and grant Microphone access, then Re-check."
+        )
+    }
+
+    private static func permissionGrantedPayloadData() -> Data {
+        preflightPayloadData(
+            overallStatus: "PASS",
+            screenStatus: "PASS",
+            screenDetail: "Screen Recording access granted.",
+            screenRemediation: "",
+            microphoneStatus: "PASS",
+            microphoneDetail: "Microphone access granted.",
+            microphoneRemediation: ""
+        )
+    }
+
+    private static func preflightPayloadData(
+        overallStatus: String,
+        screenStatus: String,
+        screenDetail: String,
+        screenRemediation: String,
+        microphoneStatus: String,
+        microphoneDetail: String,
+        microphoneRemediation: String
+    ) -> Data {
+        let payload: [String: Any] = [
+            "schema_version": "1",
+            "kind": "transcribe-live-preflight",
+            "generated_at_utc": "2026-03-05T00:00:00Z",
+            "overall_status": overallStatus,
+            "config": [
+                "out_wav": "/tmp/recordit-uitest.wav",
+                "out_jsonl": "/tmp/recordit-uitest.jsonl",
+                "out_manifest": "/tmp/recordit-uitest.manifest.json",
+                "asr_backend": "whispercpp",
+                "asr_model_requested": "/tmp/mock-model.bin",
+                "asr_model_resolved": "/tmp/mock-model.bin",
+                "asr_model_source": "ui-test fixture",
+                "sample_rate_hz": 48_000,
+            ],
+            "checks": [
+                [
+                    "id": "model_path",
+                    "status": "PASS",
+                    "detail": "model path resolved",
+                    "remediation": "",
+                ],
+                [
+                    "id": "screen_capture_access",
+                    "status": screenStatus,
+                    "detail": screenDetail,
+                    "remediation": screenRemediation,
+                ],
+                [
+                    "id": "microphone_access",
+                    "status": microphoneStatus,
+                    "detail": microphoneDetail,
+                    "remediation": microphoneRemediation,
+                ],
+            ],
+        ]
+        return (try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys])) ?? Data()
+    }
+}
+
+private final class ScriptedPreflightCommandRunner: CommandRunning {
+    private let payloads: [Data]
+    private var cursor = 0
+    private let lock = NSLock()
+
+    init(payloads: [Data]) {
+        self.payloads = payloads.isEmpty ? [Data()] : payloads
+    }
+
+    func run(
+        executable _: String,
+        arguments _: [String],
+        environment _: [String: String]
+    ) throws -> CommandExecutionResult {
+        lock.lock()
+        let index = min(cursor, payloads.count - 1)
+        let payload = payloads[index]
+        cursor += 1
+        lock.unlock()
+
+        return CommandExecutionResult(exitCode: 0, stdout: payload, stderr: Data())
+    }
+}
+
+private struct ScriptedFailingPreflightCommandRunner: CommandRunning {
+    func run(
+        executable _: String,
+        arguments _: [String],
+        environment _: [String: String]
+    ) throws -> CommandExecutionResult {
+        let stderr = Data("permission diagnostics unavailable".utf8)
+        return CommandExecutionResult(exitCode: 17, stdout: Data(), stderr: stderr)
+    }
+}
+
+private actor ScriptedUITestRuntimeService: RuntimeService {
+    private let failStop: Bool
+    private var nextProcessIdentifier: Int32 = 5100
+
+    init(failStop: Bool) {
+        self.failStop = failStop
+    }
+
+    func startSession(request: RuntimeStartRequest) async throws -> RuntimeLaunchResult {
+        let processIdentifier = nextProcessIdentifier
+        nextProcessIdentifier += 1
+        return RuntimeLaunchResult(
+            processIdentifier: processIdentifier,
+            sessionRoot: request.outputRoot,
+            startedAt: Date()
+        )
+    }
+
+    func controlSession(
+        processIdentifier _: Int32,
+        action: RuntimeControlAction
+    ) async throws -> RuntimeControlResult {
+        if failStop, action == .stop {
+            throw AppServiceError(
+                code: .runtimeUnavailable,
+                userMessage: "Runtime stop failed in UI test fixture.",
+                remediation: "Use recovery actions to retry stop or inspect artifacts."
+            )
+        }
+        return RuntimeControlResult(accepted: true, detail: "scripted")
+    }
+}

@@ -151,37 +151,73 @@ public struct PreflightEnvelopeParser {
 }
 
 public struct RecorditPreflightRunner {
-    public static let deterministicArguments = ["preflight", "--mode", "live", "--json"]
+    public static func deterministicArguments(outputRoot: URL) -> [String] {
+        [
+            "preflight",
+            "--mode",
+            "live",
+            "--output-root",
+            outputRoot.path,
+            "--json",
+        ]
+    }
 
     private let executable: String
     private let commandRunner: CommandRunning
     private let parser: PreflightEnvelopeParser
     private let environment: [String: String]
+    private let preflightOutputRoot: URL
 
     public init(
         executable: String = "/usr/bin/env",
         commandRunner: CommandRunning = ProcessCommandRunner(),
         parser: PreflightEnvelopeParser = PreflightEnvelopeParser(),
-        environment: [String: String] = [:]
+        environment: [String: String] = [:],
+        preflightOutputRoot: URL? = nil
     ) {
         self.executable = executable
         self.commandRunner = commandRunner
         self.parser = parser
         self.environment = environment
+        self.preflightOutputRoot = (preflightOutputRoot ?? Self.defaultPreflightOutputRoot()).standardizedFileURL
     }
 
     public func runLivePreflight() throws -> PreflightManifestEnvelopeDTO {
+        do {
+            try FileManager.default.createDirectory(
+                at: preflightOutputRoot,
+                withIntermediateDirectories: true
+            )
+        } catch {
+            throw AppServiceError(
+                code: .ioFailure,
+                userMessage: "Preflight output directory could not be prepared.",
+                remediation: "Verify writable disk access for temporary files, then rerun preflight.",
+                debugDetail: preflightOutputRoot.path
+            )
+        }
+
+        let arguments = Self.deterministicArguments(outputRoot: preflightOutputRoot)
         let invocation: [String]
         if executable == "/usr/bin/env" {
-            invocation = ["recordit"] + Self.deterministicArguments
+            invocation = ["recordit"] + arguments
         } else {
-            invocation = Self.deterministicArguments
+            invocation = arguments
         }
         let result = try commandRunner.run(
             executable: executable,
             arguments: invocation,
             environment: environment
         )
+
+        if let manifestData = try loadManifestDataFromRecorditSummary(stdout: result.stdout) {
+            return try parser.parse(data: manifestData)
+        }
+
+        if !result.stdout.isEmpty, let parsedFromStdout = tryParseEnvelopeFromStdout(result.stdout) {
+            return parsedFromStdout
+        }
+
         guard result.exitCode == 0 else {
             throw AppServiceError(
                 code: .preflightFailed,
@@ -190,6 +226,7 @@ public struct RecorditPreflightRunner {
                 debugDetail: String(data: result.stderr, encoding: .utf8)
             )
         }
+
         guard !result.stdout.isEmpty else {
             throw AppServiceError(
                 code: .manifestInvalid,
@@ -197,6 +234,61 @@ public struct RecorditPreflightRunner {
                 remediation: "Run preflight again and ensure `--json` output is enabled."
             )
         }
-        return try parser.parse(data: result.stdout)
+
+        throw AppServiceError(
+            code: .manifestInvalid,
+            userMessage: "Preflight output is malformed.",
+            remediation: "Re-run preflight and verify JSON output contract compatibility."
+        )
+    }
+
+    private func tryParseEnvelopeFromStdout(_ stdout: Data) -> PreflightManifestEnvelopeDTO? {
+        do {
+            return try parser.parse(data: stdout)
+        } catch let error as AppServiceError where error.code == .manifestInvalid {
+            return nil
+        } catch {
+            return nil
+        }
+    }
+
+    private func loadManifestDataFromRecorditSummary(stdout: Data) throws -> Data? {
+        guard
+            let rawOutput = String(data: stdout, encoding: .utf8),
+            !rawOutput.isEmpty
+        else {
+            return nil
+        }
+
+        for rawLine in rawOutput.split(whereSeparator: \.isNewline).reversed() {
+            let line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard line.hasPrefix("{"), line.hasSuffix("}") else {
+                continue
+            }
+
+            guard
+                let jsonData = line.data(using: .utf8),
+                let payload = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any],
+                (payload["command"] as? String) == "preflight",
+                let session = payload["session"] as? [String: Any],
+                let manifestPath = session["manifest"] as? String,
+                !manifestPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            else {
+                continue
+            }
+
+            let manifestURL = URL(fileURLWithPath: manifestPath).standardizedFileURL
+            guard FileManager.default.fileExists(atPath: manifestURL.path) else {
+                continue
+            }
+            return try Data(contentsOf: manifestURL)
+        }
+        return nil
+    }
+
+    private static func defaultPreflightOutputRoot() -> URL {
+        FileManager.default.temporaryDirectory
+            .appendingPathComponent("recordit-preflight-live", isDirectory: true)
+            .standardizedFileURL
     }
 }

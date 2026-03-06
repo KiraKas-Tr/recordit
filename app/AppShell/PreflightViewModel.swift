@@ -1,4 +1,20 @@
 import Foundation
+import AVFoundation
+import CoreGraphics
+
+private func defaultPreflightNativePermissionStatus(_ permission: RemediablePermission) -> Bool {
+    // Keep UI automation deterministic by honoring fixture-only outcomes.
+    if ProcessInfo.processInfo.environment["RECORDIT_UI_TEST_MODE"] == "1" {
+        return false
+    }
+
+    switch permission {
+    case .screenRecording:
+        return CGPreflightScreenCaptureAccess()
+    case .microphone:
+        return AVCaptureDevice.authorizationStatus(for: .audio) == .authorized
+    }
+}
 
 @MainActor
 public final class PreflightViewModel {
@@ -46,13 +62,16 @@ public final class PreflightViewModel {
 
     private let runner: RecorditPreflightRunner
     private let gatingPolicy: PreflightGatingPolicy
+    private let nativePermissionStatus: (RemediablePermission) -> Bool
 
     public init(
         runner: RecorditPreflightRunner = RecorditPreflightRunner(),
-        gatingPolicy: PreflightGatingPolicy = PreflightGatingPolicy()
+        gatingPolicy: PreflightGatingPolicy = PreflightGatingPolicy(),
+        nativePermissionStatus: ((RemediablePermission) -> Bool)? = nil
     ) {
         self.runner = runner
         self.gatingPolicy = gatingPolicy
+        self.nativePermissionStatus = nativePermissionStatus ?? defaultPreflightNativePermissionStatus
     }
 
     public var canProceedToLiveTranscribe: Bool {
@@ -79,8 +98,19 @@ public final class PreflightViewModel {
         warningAcknowledged = false
         do {
             let envelope = try runner.runLivePreflight()
-            gatingEvaluation = gatingPolicy.evaluate(envelope)
-            state = .completed(envelope)
+            // Production preflight must reflect helper-runtime truth. Keep native
+            // permission normalization only for deterministic UI automation fixtures.
+            let effectiveEnvelope: PreflightManifestEnvelopeDTO
+            if ProcessInfo.processInfo.environment["RECORDIT_UI_TEST_MODE"] == "1" {
+                effectiveEnvelope = Self.normalizePermissionChecks(
+                    in: envelope,
+                    nativePermissionStatus: nativePermissionStatus
+                )
+            } else {
+                effectiveEnvelope = envelope
+            }
+            gatingEvaluation = gatingPolicy.evaluate(effectiveEnvelope)
+            state = .completed(effectiveEnvelope)
         } catch let serviceError as AppServiceError {
             gatingEvaluation = nil
             state = .failed(serviceError)
@@ -95,5 +125,64 @@ public final class PreflightViewModel {
                 )
             )
         }
+    }
+
+    private static func normalizePermissionChecks(
+        in envelope: PreflightManifestEnvelopeDTO,
+        nativePermissionStatus: (RemediablePermission) -> Bool
+    ) -> PreflightManifestEnvelopeDTO {
+        let nativeScreenGranted = nativePermissionStatus(.screenRecording)
+        let nativeMicrophoneGranted = nativePermissionStatus(.microphone)
+
+        var normalizedChecks = [PreflightCheckDTO]()
+        normalizedChecks.reserveCapacity(envelope.checks.count)
+
+        for check in envelope.checks {
+            switch check.id {
+            case "screen_capture_access", "display_availability":
+                if check.status == .fail, nativeScreenGranted {
+                    normalizedChecks.append(
+                        PreflightCheckDTO(
+                            id: check.id,
+                            status: .pass,
+                            detail: "App-level Screen Recording permission is granted. Runtime check reported: \(check.detail)",
+                            remediation: "If runtime capture still fails, quit and reopen Recordit, then re-run preflight."
+                        )
+                    )
+                    continue
+                }
+            case "microphone_access":
+                if check.status == .fail, nativeMicrophoneGranted {
+                    normalizedChecks.append(
+                        PreflightCheckDTO(
+                            id: check.id,
+                            status: .pass,
+                            detail: "App-level Microphone permission is granted. Runtime check reported: \(check.detail)",
+                            remediation: "If runtime capture still fails, verify active input device and re-run preflight."
+                        )
+                    )
+                    continue
+                }
+            default:
+                break
+            }
+
+            normalizedChecks.append(check)
+        }
+
+        var normalizedEnvelope = envelope
+        normalizedEnvelope.checks = normalizedChecks
+        normalizedEnvelope.overallStatus = normalizedOverallStatus(for: normalizedChecks)
+        return normalizedEnvelope
+    }
+
+    private static func normalizedOverallStatus(for checks: [PreflightCheckDTO]) -> PreflightStatus {
+        if checks.contains(where: { $0.status == .fail }) {
+            return .fail
+        }
+        if checks.contains(where: { $0.status == .warn }) {
+            return .warn
+        }
+        return .pass
     }
 }

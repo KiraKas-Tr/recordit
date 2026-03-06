@@ -85,11 +85,18 @@ public actor ProcessBackedRuntimeService: RuntimeService {
             case .success:
                 return RuntimeControlResult(accepted: true, detail: "Process finished cleanly.")
             case .nonZeroExit(let code):
+                let stderrDetail = Self.runtimeStderrDetail(sessionRoot: outcome.sessionRoot)
+                let debugDetail: String
+                if let stderrDetail, !stderrDetail.isEmpty {
+                    debugDetail = "exit_code=\(code), \(stderrDetail)"
+                } else {
+                    debugDetail = "exit_code=\(code)"
+                }
                 throw AppServiceError(
                     code: .processExitedUnexpectedly,
                     userMessage: "Runtime process ended with an error.",
                     remediation: "Open diagnostics and retry the session.",
-                    debugDetail: "exit_code=\(code)"
+                    debugDetail: debugDetail
                 )
             case .crashed(let signal):
                 throw AppServiceError(
@@ -116,6 +123,43 @@ public actor ProcessBackedRuntimeService: RuntimeService {
         } catch let managerError as RuntimeProcessManagerError {
             throw Self.mapManagerError(managerError)
         }
+    }
+
+    private static func runtimeStderrDetail(sessionRoot: URL?) -> String? {
+        guard let sessionRoot else {
+            return nil
+        }
+        let stderrPath = sessionRoot
+            .appendingPathComponent("runtime.stderr.log", isDirectory: false)
+            .standardizedFileURL
+        guard FileManager.default.fileExists(atPath: stderrPath.path) else {
+            return "stderr_log_missing=\(stderrPath.path)"
+        }
+
+        guard let data = try? Data(contentsOf: stderrPath), !data.isEmpty else {
+            return "stderr_log=\(stderrPath.path) (empty)"
+        }
+
+        let maxBytes = 4096
+        let tailData: Data
+        if data.count > maxBytes {
+            tailData = data.suffix(maxBytes)
+        } else {
+            tailData = data
+        }
+        let rawTail = String(decoding: tailData, as: UTF8.self)
+        let normalizedTail = rawTail
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
+            .split(separator: "\n")
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+            .joined(separator: " | ")
+
+        if normalizedTail.isEmpty {
+            return "stderr_log=\(stderrPath.path) (non-empty, non-text)"
+        }
+        return "stderr_log=\(stderrPath.path), stderr_tail=\(normalizedTail)"
     }
 
     private static func mapManagerError(_ error: RuntimeProcessManagerError) -> AppServiceError {
