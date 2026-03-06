@@ -23,6 +23,7 @@ private struct LaunchConfiguration {
         case activeDisplayUnavailable = "active_display_unavailable"
         case microphoneRuntimeFailure = "microphone_runtime_failure"
         case screenRuntimeFailure = "screen_runtime_failure"
+        case modelPathBlocked = "model_path_blocked"
     }
     private enum UITestRuntimeScenario: String {
         case stopFailure = "stop_failure"
@@ -134,6 +135,16 @@ private struct LaunchConfiguration {
                     environment: [:]
                 )
                 environment = environment.replacing(preflightRunner: runner)
+            case .modelPathBlocked:
+                let runner = RecorditPreflightRunner(
+                    executable: "/usr/bin/env",
+                    commandRunner: ScriptedPreflightCommandRunner(
+                        payloads: [modelPathBlockedPayloadData()]
+                    ),
+                    parser: PreflightEnvelopeParser(),
+                    environment: [:]
+                )
+                environment = environment.replacing(preflightRunner: runner)
             }
         }
 
@@ -226,6 +237,70 @@ private struct LaunchConfiguration {
             microphoneDetail: "Microphone access granted.",
             microphoneRemediation: ""
         )
+    }
+
+    private static func modelPathBlockedPayloadData() -> Data {
+        let payload: [String: Any] = [
+            "schema_version": "1",
+            "kind": "transcribe-live-preflight",
+            "generated_at_utc": "2026-03-05T00:00:00Z",
+            "overall_status": "FAIL",
+            "config": [
+                "out_wav": "/tmp/out.wav",
+                "out_jsonl": "/tmp/out.jsonl",
+                "out_manifest": "/tmp/out.manifest.json",
+                "asr_backend": "whispercpp",
+                "asr_model_requested": "/tmp/model.bin",
+                "asr_model_resolved": "",
+                "asr_model_source": "missing",
+                "sample_rate_hz": 48_000,
+            ],
+            "checks": [
+                [
+                    "id": ReadinessContractID.modelPath.rawValue,
+                    "status": "FAIL",
+                    "detail": "Model path missing.",
+                    "remediation": "Provide a compatible model.",
+                ],
+                [
+                    "id": ReadinessContractID.outWav.rawValue,
+                    "status": "PASS",
+                    "detail": "WAV output path ready.",
+                    "remediation": "",
+                ],
+                [
+                    "id": ReadinessContractID.outJsonl.rawValue,
+                    "status": "PASS",
+                    "detail": "JSONL output path ready.",
+                    "remediation": "",
+                ],
+                [
+                    "id": ReadinessContractID.outManifest.rawValue,
+                    "status": "PASS",
+                    "detail": "Manifest output path ready.",
+                    "remediation": "",
+                ],
+                [
+                    "id": ReadinessContractID.screenCaptureAccess.rawValue,
+                    "status": "PASS",
+                    "detail": "Screen Recording access granted.",
+                    "remediation": "",
+                ],
+                [
+                    "id": ReadinessContractID.displayAvailability.rawValue,
+                    "status": "PASS",
+                    "detail": "Active display available.",
+                    "remediation": "",
+                ],
+                [
+                    "id": ReadinessContractID.microphoneAccess.rawValue,
+                    "status": "PASS",
+                    "detail": "Microphone access granted.",
+                    "remediation": "",
+                ],
+            ],
+        ]
+        return (try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys])) ?? Data()
     }
 
     private static func preflightPayloadData(

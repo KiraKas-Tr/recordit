@@ -194,6 +194,34 @@ private func runSmoke() async throws {
         """
     )
 
+
+    let gracefulFinalizeScript = binDir.appendingPathComponent("recordit-graceful-finalize.sh")
+    try makeExecutableScript(
+        at: gracefulFinalizeScript,
+        body: """
+        #!/bin/sh
+        out_root=""
+        while [ "$#" -gt 0 ]; do
+          case "$1" in
+            --output-root) out_root="$2"; shift 2 ;;
+            *) shift ;;
+          esac
+        done
+        [ -n "$out_root" ] && mkdir -p "$out_root"
+        : > "$out_root/graceful-finalize.ready"
+        trap 'printf INT > "$out_root/stop-signal.txt"; exit 0' INT
+        while :; do
+          if [ -f "$out_root/session.stop.request" ]; then
+            printf REQUEST > "$out_root/stop-signal.txt"
+            printf '{}' > "$out_root/session.manifest.json"
+            printf 'partial transcript\n' > "$out_root/session.jsonl"
+            : > "$out_root/session.wav"
+            exit 0
+          fi
+        done
+        """
+    )
+
     let cancelPollNormalizationScript = binDir.appendingPathComponent("recordit-cancel-poll-normalization.sh")
     try makeExecutableScript(
         at: cancelPollNormalizationScript,
@@ -399,6 +427,43 @@ private func runSmoke() async throws {
         check(signal == "REQUEST", "stop should honor the graceful stop-request handshake before forced fallback")
         let requestPath = outputRoot.appendingPathComponent("session.stop.request")
         check(!FileManager.default.fileExists(atPath: requestPath.path), "stop handling should clean up the graceful stop request marker once control settles")
+    }
+
+    // Marker-driven graceful stop should also drive RuntimeViewModel finalization to completion.
+    do {
+        let processService = makeRuntimeService(recorditPath: gracefulFinalizeScript, sequoiaPath: captureScript, stopTimeoutSeconds: 0.4)
+        let outputRoot = tempRoot.appendingPathComponent("live-graceful-stop-finalize", isDirectory: true)
+        try FileManager.default.createDirectory(at: outputRoot, withIntermediateDirectories: true)
+
+        let viewModel = RuntimeViewModel(
+            runtimeService: processService,
+            manifestService: PresenceCheckedManifestService(status: "ok"),
+            modelService: modelService,
+            finalizationTimeoutSeconds: 1,
+            finalizationPollIntervalNanoseconds: 10_000_000
+        )
+
+        await viewModel.startLive(outputRoot: outputRoot, explicitModelPath: nil)
+        guard case .running = viewModel.state else {
+            check(false, "marker-driven graceful finalize smoke should reach running state before stop")
+            return
+        }
+        let readyPath = outputRoot.appendingPathComponent("graceful-finalize.ready")
+        await waitForFile(at: readyPath, timeoutSeconds: 2, message: "graceful finalize helper should signal readiness before stop")
+        await viewModel.stopCurrentRun()
+        check(viewModel.state == .completed, "marker-driven graceful stop should finalize to completed state")
+        check(viewModel.suggestedRecoveryActions.isEmpty, "successful graceful stop finalization should not advertise recovery actions")
+        check(viewModel.interruptionRecoveryContext == nil, "successful graceful stop finalization should not retain interruption recovery context")
+        let signalPath = outputRoot.appendingPathComponent("stop-signal.txt")
+        await waitForFile(at: signalPath, timeoutSeconds: 1, message: "graceful finalize helper should write stop signal")
+        let signal = try readTrimmedUTF8File(signalPath, message: "graceful finalize helper should write readable stop signal")
+        check(signal == "REQUEST", "marker-driven stop should still prefer the graceful request handshake on the finalization path")
+        let manifestPath = outputRoot.appendingPathComponent("session.manifest.json")
+        check(FileManager.default.fileExists(atPath: manifestPath.path), "marker-driven graceful stop should leave a final manifest for bounded finalization")
+        let transcriptPath = outputRoot.appendingPathComponent("session.jsonl")
+        check(FileManager.default.fileExists(atPath: transcriptPath.path), "marker-driven graceful stop should retain transcript artifacts for the finalized session")
+        let requestPath = outputRoot.appendingPathComponent("session.stop.request")
+        check(!FileManager.default.fileExists(atPath: requestPath.path), "marker-driven graceful stop should clean up the stop-request marker after finalization")
     }
 
     // Stop should fall back to interrupt when the graceful handshake does not complete.

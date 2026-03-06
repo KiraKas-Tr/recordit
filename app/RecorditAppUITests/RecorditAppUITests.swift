@@ -175,6 +175,55 @@ final class RecorditAppUITests: XCTestCase {
         XCTAssertFalse(nextButton.isEnabled)
     }
 
+    func testModelPathBlockKeepsLiveOnboardingBlockedButRecordOnlyStillWorks() {
+        let app = launchApp(preflightScenario: "model_path_blocked")
+
+        XCTAssertTrue(app.staticTexts["onboarding_title"].waitForExistence(timeout: 5))
+        let nextButton = app.buttons["onboarding_next"]
+        XCTAssertTrue(nextButton.waitForExistence(timeout: 5))
+
+        advanceOnboardingStep(app, nextButton: nextButton, expectedStepTitle: "Permissions")
+        ensurePermissionsStep(app)
+        let runPermissionChecksButton = app.buttons["onboarding_run_permission_checks"]
+        XCTAssertTrue(runPermissionChecksButton.waitForExistence(timeout: 5))
+        activate(runPermissionChecksButton)
+        XCTAssertTrue(waitForEnabled(nextButton, timeout: 8))
+
+        advanceOnboardingStep(app, nextButton: nextButton, expectedStepTitle: "Model Setup")
+        let validateModelSetupButton = app.buttons["onboarding_validate_model_setup"]
+        XCTAssertTrue(validateModelSetupButton.waitForExistence(timeout: 5))
+        activate(validateModelSetupButton)
+
+        let runPreflightButton = app.buttons["onboarding_run_preflight"]
+        XCTAssertTrue(runPreflightButton.waitForExistence(timeout: 5))
+        activate(runPreflightButton)
+
+        XCTAssertTrue(app.staticTexts["preflight_row_model_path_fail"].waitForExistence(timeout: 5))
+        XCTAssertFalse(nextButton.isEnabled)
+        let openMainRuntimeButton = app.buttons["onboarding_open_main_runtime"]
+        XCTAssertTrue(openMainRuntimeButton.waitForExistence(timeout: 5))
+        activate(openMainRuntimeButton)
+
+        let runtimeStatus = app.staticTexts["runtime_status"]
+        XCTAssertTrue(runtimeStatus.waitForExistence(timeout: 5))
+        let modeControl = app.segmentedControls.firstMatch
+        XCTAssertTrue(modeControl.waitForExistence(timeout: 5))
+        let recordOnlyButton = modeControl.buttons["Record Only"]
+        XCTAssertTrue(recordOnlyButton.waitForExistence(timeout: 5))
+        activate(recordOnlyButton)
+
+        let startButton = app.buttons["start_live_transcribe"]
+        XCTAssertTrue(startButton.waitForExistence(timeout: 5))
+        activate(startButton)
+        XCTAssertTrue(waitForLabelContains(runtimeStatus, text: "Running", timeout: 8))
+
+        let stopButton = app.buttons["stop_live_transcribe"]
+        XCTAssertTrue(stopButton.waitForExistence(timeout: 5))
+        activate(stopButton)
+        XCTAssertTrue(waitForLabelContains(runtimeStatus, text: "Completed", timeout: 10))
+        XCTAssertTrue(app.staticTexts["Session Summary"].waitForExistence(timeout: 5))
+    }
+
     func testScreenRuntimeFailureShowsDedicatedBlockerWithoutPermissionDeepLinks() {
         let app = launchApp(
             preflightScenario: "screen_runtime_failure",

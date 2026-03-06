@@ -1836,10 +1836,10 @@ fn run_fake_capture_session(
         chunk_frames
     );
     println!(
-        "WAV written: {} (source fixture: {}, frames: {}, restarts: {}, output_rate: {} Hz)",
+        "WAV written: {} (source fixture: {}, output_frames: {}, restarts: {}, output_rate: {} Hz)",
         config.output.display(),
         fixture.display(),
-        frame_count,
+        output_frames,
         restart_count,
         fixture_rate_hz
     );
