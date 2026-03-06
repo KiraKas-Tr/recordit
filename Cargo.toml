@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.100"
+ctrlc = "3.4.7"
 crossbeam-channel = "0.5.15"
 hound = "3.5.1"
 serde = { version = "1.0.228", features = ["derive"] }

@@ -19,9 +19,10 @@ usage() {
 Usage: $0 [options]
 
 Runs a signed-app live-stream smoke gate with deterministic fake capture input.
-The gate validates two packaged scenarios:
-- live-stream model doctor succeeds in the signed app executable
-- live-stream runtime emits the expected packaged artifacts and manifest labels
+The gate validates packaged default semantics plus runtime compatibility:
+- `Recordit.app` is the default packaged launch path (`run-recordit-app`)
+- live-stream model doctor succeeds in the signed compatibility runtime executable
+- live-stream runtime emits expected packaged artifacts and manifest labels
 
 Options:
   --out-dir PATH            Output directory (default: <packaged-root>/gates/gate_packaged_live_smoke/<utc-stamp>)
@@ -151,6 +152,7 @@ mkdir -p "$DOCTOR_DIR" "$RUNTIME_DIR" "$STAGED_INPUT_DIR" "$SHARED_STAGE_DIR"
 STAGED_MODEL="$SHARED_STAGE_DIR/$(basename "$MODEL")"
 STAGED_FIXTURE="$STAGED_INPUT_DIR/$(basename "$FIXTURE")"
 STAGED_HELPER="$SHARED_STAGE_DIR/whisper-cli"
+RECORDIT_RUN_PLAN="$OUT_DIR/recordit_run_plan.log"
 
 if [[ ! -f "$STAGED_MODEL" ]]; then
   EXISTING_STAGED_MODEL="$(find "$PACKAGED_ROOT/gates/gate_packaged_live_smoke" -path "*/staged_inputs/$(basename "$MODEL")" -type f -print -quit 2>/dev/null || true)"
@@ -169,14 +171,25 @@ chmod +x "$STAGED_HELPER"
 
 (
   cd "$ROOT"
+  make sign-recordit-app SIGN_IDENTITY="$SIGN_IDENTITY" >/dev/null
   make sign-transcribe SIGN_IDENTITY="$SIGN_IDENTITY" >/dev/null
 )
 
-APP_BIN="$ROOT/dist/SequoiaTranscribe.app/Contents/MacOS/SequoiaTranscribe"
-if [[ ! -x "$APP_BIN" ]]; then
-  echo "error: expected signed app executable not found: $APP_BIN" >&2
+RECORDIT_APP_BUNDLE="$ROOT/dist/Recordit.app"
+if [[ ! -d "$RECORDIT_APP_BUNDLE" ]]; then
+  echo "error: expected Recordit app bundle not found: $RECORDIT_APP_BUNDLE" >&2
   exit 1
 fi
+
+set +e
+(
+  cd "$ROOT"
+  make -n run-recordit-app SIGN_IDENTITY="$SIGN_IDENTITY"
+) >"$RECORDIT_RUN_PLAN" 2>&1
+RECORDIT_PLAN_EXIT_CODE=$?
+set -e
+
+APP_BIN="$("$ROOT/scripts/resolve_sequoiatranscribe_compat.sh" --root "$ROOT")"
 
 DOCTOR_STDOUT="$DOCTOR_DIR/model_doctor.stdout.log"
 DOCTOR_TIME="$DOCTOR_DIR/model_doctor.time.txt"
@@ -229,6 +242,9 @@ RUNTIME_EXIT_CODE=$?
 set -e
 
 python3 "$ROOT/scripts/gate_packaged_live_smoke_summary.py" \
+  --recordit-plan-exit-code "$RECORDIT_PLAN_EXIT_CODE" \
+  --recordit-run-plan "$RECORDIT_RUN_PLAN" \
+  --recordit-app-bundle "$RECORDIT_APP_BUNDLE" \
   --doctor-exit-code "$DOCTOR_EXIT_CODE" \
   --doctor-stdout "$DOCTOR_STDOUT" \
   --runtime-exit-code "$RUNTIME_EXIT_CODE" \
@@ -252,6 +268,8 @@ cat >"$STATUS_TXT" <<STATUS
 status=$status
 detail=$detail
 summary_path=$SUMMARY_CSV
+recordit_run_plan_path=$RECORDIT_RUN_PLAN
+recordit_app_bundle_path=$RECORDIT_APP_BUNDLE
 doctor_stdout_path=$DOCTOR_STDOUT
 doctor_time_path=$DOCTOR_TIME
 runtime_manifest_path=$RUNTIME_MANIFEST

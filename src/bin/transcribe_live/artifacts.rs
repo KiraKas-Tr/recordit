@@ -926,7 +926,8 @@ mod tests {
         fs::write(&target, "{\"status\":\"old\"}\n").expect("seed target");
 
         let err = write_atomic_file(&target, "manifest", |file| {
-            file.write_all(br#"{"status":"partial"#).map_err(io_to_cli)?;
+            file.write_all(br#"{"status":"partial"#)
+                .map_err(io_to_cli)?;
             Err(CliError::new("simulated interruption"))
         })
         .expect_err("expected simulated interruption");

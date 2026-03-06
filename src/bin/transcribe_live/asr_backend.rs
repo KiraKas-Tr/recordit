@@ -838,10 +838,9 @@ mod tests {
             TempAudioPolicy::RetainOnFailure,
         )
         .expect_err("symlink scratch path should be rejected");
-        assert!(
-            err.to_string()
-                .contains("refusing to overwrite unsafe PCM scratch symlink")
-        );
+        assert!(err
+            .to_string()
+            .contains("refusing to overwrite unsafe PCM scratch symlink"));
 
         let _ = fs::remove_file(&path);
         let _ = fs::remove_file(&target);

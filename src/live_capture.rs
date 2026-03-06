@@ -15,7 +15,8 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -30,6 +31,27 @@ const PROGRESSIVE_WAV_MATERIALIZE_MIN_NEW_CHUNKS: usize = 8;
 const FAKE_CAPTURE_FIXTURE_ENV: &str = "RECORDIT_FAKE_CAPTURE_FIXTURE";
 const FAKE_CAPTURE_RESTART_COUNT_ENV: &str = "RECORDIT_FAKE_CAPTURE_RESTART_COUNT";
 const FAKE_CAPTURE_REALTIME_ENV: &str = "RECORDIT_FAKE_CAPTURE_REALTIME";
+
+static STOP_CAPTURE_REQUESTED: AtomicBool = AtomicBool::new(false);
+static STOP_CAPTURE_SIGNAL_HANDLER_READY: OnceLock<()> = OnceLock::new();
+
+fn ensure_stop_capture_signal_handler() -> Result<()> {
+    if STOP_CAPTURE_SIGNAL_HANDLER_READY.get().is_some() {
+        return Ok(());
+    }
+
+    ctrlc::set_handler(|| {
+        STOP_CAPTURE_REQUESTED.store(true, Ordering::Relaxed);
+    })
+    .context("failed to install capture stop signal handler")?;
+
+    let _ = STOP_CAPTURE_SIGNAL_HANDLER_READY.set(());
+    Ok(())
+}
+
+fn stop_capture_requested() -> bool {
+    STOP_CAPTURE_REQUESTED.load(Ordering::Relaxed)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SampleRateMismatchPolicy {
@@ -1836,6 +1858,8 @@ pub fn run_streaming_capture_session(
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create output directory {}", parent.display()))?;
     }
+    ensure_stop_capture_signal_handler()?;
+    STOP_CAPTURE_REQUESTED.store(false, Ordering::Relaxed);
 
     if duration_secs == 0 {
         println!(
@@ -1921,11 +1945,11 @@ pub fn run_streaming_capture_session(
     let mut progressive_snapshot_state = None;
     let mut runtime_event_cursor = RuntimeEventCursor::default();
 
-    while deadline.is_none_or(|end| Instant::now() < end) {
+    while deadline.is_none_or(|end| Instant::now() < end) && !stop_capture_requested() {
         let mut last_chunk_at = Instant::now();
         let mut interrupted = false;
 
-        while deadline.is_none_or(|end| Instant::now() < end) {
+        while deadline.is_none_or(|end| Instant::now() < end) && !stop_capture_requested() {
             match consumer.recv_timeout(CALLBACK_RECV_TIMEOUT) {
                 Ok(chunk_slot) => {
                     let chunk = TimedChunk {
@@ -1990,6 +2014,9 @@ pub fn run_streaming_capture_session(
                         consumer.stats_snapshot(),
                         callback_audit.snapshot(),
                     )?;
+                    if stop_capture_requested() {
+                        break;
+                    }
                     let idle_gap = Instant::now().saturating_duration_since(last_chunk_at);
                     if idle_gap >= interruption_policy.idle_timeout {
                         interrupted = true;
@@ -2006,6 +2033,10 @@ pub fn run_streaming_capture_session(
         stream
             .stop_capture()
             .context("failed to stop stream capture")?;
+
+        if stop_capture_requested() {
+            break;
+        }
 
         if !interrupted {
             break;
@@ -2047,7 +2078,7 @@ pub fn run_streaming_capture_session(
     let transport_stats = consumer.stats_snapshot();
     let callback_audit_snapshot = callback_audit.snapshot();
 
-    if mic_chunks.is_empty() || sys_chunks.is_empty() {
+    if mic_chunks.is_empty() && sys_chunks.is_empty() {
         bail!(
             "missing captured data (mic chunks: {}, system chunks: {})",
             mic_chunks.len(),
@@ -2055,14 +2086,58 @@ pub fn run_streaming_capture_session(
         );
     }
 
-    let mic_rate = mic_chunks[0].sample_rate_hz;
-    let sys_rate = sys_chunks[0].sample_rate_hz;
+    if mic_chunks.is_empty() {
+        eprintln!(
+            "warning: microphone channel produced no chunks; continuing with silence-filled mic channel."
+        );
+    }
+    if sys_chunks.is_empty() {
+        eprintln!(
+            "warning: system-audio channel produced no chunks; continuing with silence-filled system channel."
+        );
+    }
+
+    let fallback_rate = mic_chunks
+        .first()
+        .map(|chunk| chunk.sample_rate_hz)
+        .or_else(|| sys_chunks.first().map(|chunk| chunk.sample_rate_hz))
+        .unwrap_or(target_rate_hz);
+    let mic_rate = mic_chunks
+        .first()
+        .map(|chunk| chunk.sample_rate_hz)
+        .unwrap_or(fallback_rate);
+    let sys_rate = sys_chunks
+        .first()
+        .map(|chunk| chunk.sample_rate_hz)
+        .unwrap_or(fallback_rate);
 
     let output_rate_hz =
         resolve_output_sample_rate(target_rate_hz, mic_rate, sys_rate, mismatch_policy)?;
-    let base_pts = mic_chunks[0].pts_seconds.min(sys_chunks[0].pts_seconds);
-    let (mic, mic_resample) = paint_chunks_timeline(&mic_chunks, base_pts, output_rate_hz);
-    let (sys, sys_resample) = paint_chunks_timeline(&sys_chunks, base_pts, output_rate_hz);
+    let base_pts = mic_chunks
+        .first()
+        .map(|chunk| chunk.pts_seconds)
+        .into_iter()
+        .chain(sys_chunks.first().map(|chunk| chunk.pts_seconds))
+        .fold(f64::INFINITY, f64::min);
+    let base_pts = if base_pts.is_finite() { base_pts } else { 0.0 };
+
+    let (mut mic, mic_resample) = if mic_chunks.is_empty() {
+        (Vec::new(), ResampleStats::default())
+    } else {
+        paint_chunks_timeline(&mic_chunks, base_pts, output_rate_hz)
+    };
+    let (mut sys, sys_resample) = if sys_chunks.is_empty() {
+        (Vec::new(), ResampleStats::default())
+    } else {
+        paint_chunks_timeline(&sys_chunks, base_pts, output_rate_hz)
+    };
+
+    if mic.is_empty() && !sys.is_empty() {
+        mic.resize(sys.len(), 0.0);
+    } else if sys.is_empty() && !mic.is_empty() {
+        sys.resize(mic.len(), 0.0);
+    }
+
     write_interleaved_stereo_wav(&output, output_rate_hz, &mic, &sys)?;
 
     println!(

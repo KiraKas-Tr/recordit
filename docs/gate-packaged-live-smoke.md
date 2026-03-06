@@ -1,9 +1,15 @@
 # Gate: Packaged Live-Stream Smoke
 
-This gate validates the signed transcribe app executable in live-stream mode
-using deterministic fake capture input. It is the packaged companion to the
-debug-side live gates and produces machine-readable evidence for packaged live
-readiness.
+This gate validates packaged default launch semantics plus signed runtime
+compatibility in live-stream mode using deterministic fake capture input. It is
+the packaged companion to the debug-side live gates and produces
+machine-readable evidence for packaged live readiness.
+
+Superseded-context note (ADR-005): `Recordit.app` is now the canonical
+user-facing default entrypoint (`docs/adr-005-recordit-default-entrypoint.md`).
+This gate keeps signed `SequoiaTranscribe.app` runtime checks as a
+compatibility/fallback evidence lane, while also proving default packaged launch
+semantics remain aligned with `Recordit.app`.
 
 ## Run
 
@@ -25,6 +31,7 @@ Default artifact root:
 
 Expected outputs:
 
+- `recordit_run_plan.log`
 - `model_doctor/model_doctor.stdout.log`
 - `model_doctor/model_doctor.time.txt`
 - `runtime/runtime.stdout.log`
@@ -42,27 +49,29 @@ Expected outputs:
 
 Core checks:
 
-1. `doctor_exit_ok=true`
-2. `doctor_banner_ok=true`
-3. `runtime_exit_ok=true`
-4. `runtime_kind_ok=true` (`kind=transcribe-live-runtime`)
-5. `runtime_mode_ok=true` (`runtime_mode=live-stream`, taxonomy `live-stream`, selector `--live-stream`)
-6. `runtime_mode_status_ok=true`
-7. `runtime_input_capture_ok=true` (`session.input.wav` materialized and non-zero bytes)
-8. `runtime_out_wav_truth_ok=true` (`out_wav_materialized=true`, manifest bytes > 0, file exists)
-9. `runtime_first_stable_emit_ok=true` (active phase observed and stable first-emit evidence present)
-10. `runtime_terminal_live_mode_ok=true`
-11. `runtime_terminal_replay_suppressed_ok=true`
-12. `runtime_trust_surface_ok=true`
-13. `runtime_degradation_surface_ok=true`
-14. `runtime_artifact_root_ok=true`
-15. `runtime_manifest_jsonl_match_ok=true`
-16. `runtime_manifest_out_manifest_match_ok=true`
-17. `runtime_transcript_surface_ok=true`
+1. `recordit_launch_semantics_ok=true` (`run-recordit-app` plan opens `dist/Recordit.app`)
+2. `doctor_exit_ok=true`
+3. `doctor_banner_ok=true`
+4. `runtime_exit_ok=true`
+5. `runtime_kind_ok=true` (`kind=transcribe-live-runtime`)
+6. `runtime_mode_ok=true` (`runtime_mode=live-stream`, taxonomy `live-stream`, selector `--live-stream`)
+7. `runtime_mode_status_ok=true`
+8. `runtime_input_capture_ok=true` (`session.input.wav` materialized and non-zero bytes)
+9. `runtime_out_wav_truth_ok=true` (`out_wav_materialized=true`, manifest bytes > 0, file exists)
+10. `runtime_first_stable_emit_ok=true` (active phase observed and stable first-emit evidence present)
+11. `runtime_terminal_live_mode_ok=true`
+12. `runtime_terminal_replay_suppressed_ok=true`
+13. `runtime_trust_surface_ok=true`
+14. `runtime_degradation_surface_ok=true`
+15. `runtime_artifact_root_ok=true`
+16. `runtime_manifest_jsonl_match_ok=true`
+17. `runtime_manifest_out_manifest_match_ok=true`
+18. `runtime_transcript_surface_ok=true`
 
 Interpretation:
 
-- the gate runs the signed app executable (`dist/SequoiaTranscribe.app/Contents/MacOS/SequoiaTranscribe`) after `make sign-transcribe`
+- the gate first verifies `run-recordit-app` plan semantics still target `dist/Recordit.app`
+- the gate resolves the compatibility runtime executable via `scripts/resolve_sequoiatranscribe_compat.sh` (defaulting to `dist/SequoiaTranscribe.app/Contents/MacOS/SequoiaTranscribe`) after `make sign-transcribe`
 - runtime scenario uses `RECORDIT_FAKE_CAPTURE_FIXTURE` for deterministic input while still validating signed-app artifact semantics
 - trust/degradation checks enforce manifest-shape consistency so downstream review work can rely on packaged artifacts without re-deriving contract assumptions
 - `status.txt` is a quick PASS/FAIL envelope; `summary.csv` is the canonical machine-readable evidence artifact

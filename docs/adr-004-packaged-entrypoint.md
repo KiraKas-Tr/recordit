@@ -1,7 +1,8 @@
 # ADR-004: Packaged Beta Entrypoint and Bundle Strategy
 
 - Date: 2026-02-28
-- Status: Accepted
+- Status: Superseded by ADR-005 (2026-03-05)
+- Superseded by: `docs/adr-005-recordit-default-entrypoint.md`
 - Related bead: `bd-4d9`
 
 ## Context

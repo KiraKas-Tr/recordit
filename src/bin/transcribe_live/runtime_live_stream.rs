@@ -751,6 +751,7 @@ pub(super) fn run_live_stream_pipeline(
         backend_id,
         benchmark_track(active_channel_mode),
         &wall_ms_runs,
+        config.out_manifest.parent(),
     )?;
 
     let report = LiveRunReport {

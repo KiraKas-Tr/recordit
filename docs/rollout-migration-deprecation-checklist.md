@@ -16,6 +16,10 @@ It answers four operational questions:
 
 ## Current Decision Boundary
 
+Superseded-entrypoint context (2026-03-05):
+- `docs/adr-005-recordit-default-entrypoint.md` supersedes `docs/adr-004-packaged-entrypoint.md` for user-facing default policy.
+- references here to `SequoiaTranscribe.app` are compatibility/fallback guidance, not product-default UX direction.
+
 Primary operator surface:
 
 - `recordit` is the canonical human-first shell for:
@@ -80,7 +84,7 @@ Definition of done for this stage:
 
 ### Stage 2: Ship Dual-Surface Support
 
-- [ ] Treat `recordit` as the default recommended entrypoint for humans and new automation.
+- [ ] Complete remaining cutover work so shipped release artifacts match ADR-005 default policy (`Recordit.app` as user-facing default).
 - [ ] Keep `transcribe-live` stable for:
   - existing scripts
   - compatibility gates

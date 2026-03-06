@@ -1,10 +1,10 @@
 use std::collections::BTreeSet;
 
 use super::{
-    BackpressureTransitionReason, ChannelPressureSnapshot, LiveRunReport, OUT_WAV_SEMANTICS,
-    OVERLAP_WINDOW_MS, ResolvedModelPath, TerminalRenderActionKind, TerminalRenderMode,
-    TranscribeConfig, TranscriptEvent, build_terminal_render_actions, display_path,
-    input_wav_semantics, model_checksum_info, reconstruct_transcript_per_channel,
+    build_terminal_render_actions, display_path, input_wav_semantics, model_checksum_info,
+    reconstruct_transcript_per_channel, BackpressureTransitionReason, ChannelPressureSnapshot,
+    LiveRunReport, ResolvedModelPath, TerminalRenderActionKind, TerminalRenderMode,
+    TranscribeConfig, TranscriptEvent, OUT_WAV_SEMANTICS, OVERLAP_WINDOW_MS,
 };
 
 pub(super) fn stable_terminal_summary_lines(events: &[TranscriptEvent]) -> Vec<String> {
