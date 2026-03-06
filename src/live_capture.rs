@@ -1,22 +1,21 @@
 use crate::capture_api::{
-    CallbackContractSummary, CaptureCallbackAuditSummary, CaptureChunk, CaptureChunkKind,
-    CaptureChunkSummary, CaptureDegradationEvent, CaptureEvent, CaptureEventCode,
-    CaptureRecoveryAction, CaptureResampleSummary, CaptureRunSummary,
+    capture_telemetry_path_for_output, CallbackContractSummary, CaptureCallbackAuditSummary,
+    CaptureChunk, CaptureChunkKind, CaptureChunkSummary, CaptureDegradationEvent, CaptureEvent,
+    CaptureEventCode, CaptureRecoveryAction, CaptureResampleSummary, CaptureRunSummary,
     CaptureSampleRatePolicySummary, CaptureSink, CaptureStream, CaptureStreamSummary,
     CaptureSummary, CaptureTransportSummary, ResampleSummary, StreamingCaptureResult,
-    capture_telemetry_path_for_output,
 };
-use crate::rt_transport::{PreallocatedProducer, preallocated_spsc};
-use anyhow::{Context, Result, bail};
+use crate::rt_transport::{preallocated_spsc, PreallocatedProducer};
+use anyhow::{bail, Context, Result};
 use crossbeam_channel::RecvTimeoutError;
 use hound::{SampleFormat, WavSpec, WavWriter};
 use screencapturekit::prelude::*;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -51,6 +50,20 @@ fn ensure_stop_capture_signal_handler() -> Result<()> {
 
 fn stop_capture_requested() -> bool {
     STOP_CAPTURE_REQUESTED.load(Ordering::Relaxed)
+}
+
+fn stop_capture_requested_or_marker(path: Option<&Path>) -> bool {
+    if stop_capture_requested() {
+        return true;
+    }
+    let Some(path) = path else {
+        return false;
+    };
+    if path.exists() {
+        STOP_CAPTURE_REQUESTED.store(true, Ordering::Relaxed);
+        return true;
+    }
+    false
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -105,6 +118,7 @@ pub struct LiveCaptureConfig {
     pub target_rate_hz: u32,
     pub mismatch_policy: SampleRateMismatchPolicy,
     pub callback_contract_mode: CallbackContractMode,
+    pub stop_request_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1624,6 +1638,7 @@ pub fn config_from_cli_args(args: &[String]) -> Result<LiveCaptureConfig> {
             5,
             CallbackContractMode::Warn,
         )?,
+        stop_request_path: None,
     })
 }
 
@@ -1650,6 +1665,7 @@ fn run_fake_capture_session(
             .with_context(|| format!("failed to create output directory {}", parent.display()))?;
     }
 
+    let stop_request_path = config.stop_request_path.as_deref();
     let (fixture_rate_hz, mic_samples, system_samples) = read_fixture_stereo_channels(fixture)?;
     let frame_count = mic_samples.len().min(system_samples.len());
     if config.mismatch_policy == SampleRateMismatchPolicy::Strict
@@ -1685,10 +1701,13 @@ fn run_fake_capture_session(
     }
 
     let mut frame_start = 0usize;
-    while frame_start < frame_count {
+    while frame_start < frame_count && !stop_capture_requested_or_marker(stop_request_path) {
         let frame_end = (frame_start + chunk_frames).min(frame_count);
         let pts_seconds = frame_start as f64 / fixture_rate_hz as f64;
         maybe_sleep_for_replay(replay_realtime, replay_started, pts_seconds)?;
+        if stop_capture_requested_or_marker(stop_request_path) {
+            break;
+        }
 
         sink.on_chunk(CaptureChunk {
             stream: CaptureStream::SystemAudio,
@@ -1754,6 +1773,14 @@ fn run_fake_capture_session(
         frame_start = frame_end;
     }
 
+    if mic_chunks.is_empty() && sys_chunks.is_empty() {
+        bail!(
+            "missing captured data (mic chunks: {}, system chunks: {})",
+            mic_chunks.len(),
+            sys_chunks.len()
+        );
+    }
+
     if progressive_materializations == 0 && !mic_chunks.is_empty() && !sys_chunks.is_empty() {
         if materialize_progressive_wav_snapshot_incremental(
             &config.output,
@@ -1769,14 +1796,11 @@ fn run_fake_capture_session(
         }
     }
 
-    fs::copy(fixture, &config.output).with_context(|| {
-        format!(
-            "failed to copy fake capture fixture {} -> {}",
-            fixture.display(),
-            config.output.display()
-        )
-    })?;
-
+    let output_frames = mic_chunks
+        .iter()
+        .map(|chunk| chunk.mono_samples.len())
+        .sum::<usize>()
+        .max(sys_chunks.iter().map(|chunk| chunk.mono_samples.len()).sum::<usize>());
     let telemetry_path = telemetry_path_for_output(&config.output);
     let telemetry = RunTelemetry {
         output_wav_path: config.output.clone(),
@@ -1790,7 +1814,7 @@ fn run_fake_capture_session(
         system_resample: ResampleStats::default(),
         mic_chunks: mic_chunk_count,
         system_chunks: system_chunk_count,
-        output_frames: frame_count,
+        output_frames,
         restart_count: restart_count as usize,
         transport: crate::rt_transport::TransportStatsSnapshot {
             capacity: CALLBACK_RING_CAPACITY as u64,
@@ -1877,6 +1901,8 @@ pub fn run_streaming_capture_session(
     println!("Sample-rate mismatch policy: {}", mismatch_policy.as_str());
     println!("Callback contract mode: {:?}", callback_contract_mode);
 
+    let stop_request_path = config.stop_request_path.as_deref();
+
     let content = SCShareableContent::get().context(
         "failed to get shareable content (screen recording permission + active display required)",
     )?;
@@ -1945,11 +1971,15 @@ pub fn run_streaming_capture_session(
     let mut progressive_snapshot_state = None;
     let mut runtime_event_cursor = RuntimeEventCursor::default();
 
-    while deadline.is_none_or(|end| Instant::now() < end) && !stop_capture_requested() {
+    while deadline.is_none_or(|end| Instant::now() < end)
+        && !stop_capture_requested_or_marker(stop_request_path)
+    {
         let mut last_chunk_at = Instant::now();
         let mut interrupted = false;
 
-        while deadline.is_none_or(|end| Instant::now() < end) && !stop_capture_requested() {
+        while deadline.is_none_or(|end| Instant::now() < end)
+            && !stop_capture_requested_or_marker(stop_request_path)
+        {
             match consumer.recv_timeout(CALLBACK_RECV_TIMEOUT) {
                 Ok(chunk_slot) => {
                     let chunk = TimedChunk {
@@ -2014,7 +2044,7 @@ pub fn run_streaming_capture_session(
                         consumer.stats_snapshot(),
                         callback_audit.snapshot(),
                     )?;
-                    if stop_capture_requested() {
+                    if stop_capture_requested_or_marker(stop_request_path) {
                         break;
                     }
                     let idle_gap = Instant::now().saturating_duration_since(last_chunk_at);
@@ -2034,7 +2064,7 @@ pub fn run_streaming_capture_session(
             .stop_capture()
             .context("failed to stop stream capture")?;
 
-        if stop_capture_requested() {
+        if stop_capture_requested_or_marker(stop_request_path) {
             break;
         }
 
@@ -2230,17 +2260,19 @@ pub fn run_capture_session(config: &LiveCaptureConfig) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        CallbackAuditSnapshot, CallbackContractMode, CallbackContractViolation,
-        FAKE_CAPTURE_FIXTURE_ENV, FAKE_CAPTURE_REALTIME_ENV, FAKE_CAPTURE_RESTART_COUNT_ENV,
-        InterruptionPolicy, LiveCaptureConfig, RecoveryAction, ResampleStats, RunTelemetry,
-        RuntimeEventCursor, SampleRateMismatchPolicy, TimedChunk, build_capture_run_summary,
-        build_degradation_events, callback_recovery_breakdown, can_restart_capture,
-        config_from_cli_args, emit_runtime_event_deltas, enforce_callback_contract,
-        materialize_progressive_wav_snapshot, materialize_progressive_wav_snapshot_incremental,
-        maybe_sleep_for_replay, paint_chunks_timeline, recovery_action_for_callback_violation,
+        build_capture_run_summary, build_degradation_events, callback_recovery_breakdown,
+        can_restart_capture, config_from_cli_args, emit_runtime_event_deltas,
+        enforce_callback_contract, materialize_progressive_wav_snapshot,
+        materialize_progressive_wav_snapshot_incremental, maybe_sleep_for_replay, now_unix,
+        paint_chunks_timeline, recovery_action_for_callback_violation,
         recovery_action_for_interruption, resample_linear_mono, resolve_output_sample_rate,
         run_capture_session, run_fake_capture_session, run_streaming_capture_session,
-        should_materialize_progressive_snapshot, telemetry_path_for_output, write_run_telemetry,
+        should_materialize_progressive_snapshot, stop_capture_requested,
+        stop_capture_requested_or_marker, telemetry_path_for_output, write_run_telemetry,
+        CallbackAuditSnapshot, CallbackContractMode, CallbackContractViolation, InterruptionPolicy,
+        LiveCaptureConfig, RecoveryAction, ResampleStats, RunTelemetry, RuntimeEventCursor,
+        SampleRateMismatchPolicy, TimedChunk, FAKE_CAPTURE_FIXTURE_ENV, FAKE_CAPTURE_REALTIME_ENV,
+        FAKE_CAPTURE_RESTART_COUNT_ENV, STOP_CAPTURE_REQUESTED,
     };
     use crate::capture_api::{
         CaptureChunk, CaptureChunkKind, CaptureEvent, CaptureEventCode, CaptureRecoveryAction,
@@ -2251,6 +2283,7 @@ mod tests {
     use std::ffi::OsString;
     use std::fs;
     use std::path::{Path, PathBuf};
+    use std::sync::atomic::Ordering;
     use std::sync::{Mutex, OnceLock};
     use std::time::{Duration, Instant};
 
@@ -2387,6 +2420,7 @@ mod tests {
             target_rate_hz: 16_000,
             mismatch_policy: SampleRateMismatchPolicy::AdaptStreamRate,
             callback_contract_mode: CallbackContractMode::Warn,
+            stop_request_path: None,
         };
 
         let _lock = env_lock()
@@ -2465,6 +2499,7 @@ mod tests {
             target_rate_hz: 200,
             mismatch_policy: SampleRateMismatchPolicy::AdaptStreamRate,
             callback_contract_mode: CallbackContractMode::Warn,
+            stop_request_path: None,
         };
 
         let _lock = env_lock()
@@ -2510,6 +2545,85 @@ mod tests {
     }
 
     #[test]
+    fn fake_capture_stop_marker_halts_replay_before_full_fixture_is_consumed() {
+        struct StopMarkerSink {
+            marker: PathBuf,
+            chunk_count: usize,
+        }
+
+        impl CaptureSink for StopMarkerSink {
+            fn on_chunk(&mut self, _chunk: CaptureChunk) -> std::result::Result<(), String> {
+                self.chunk_count += 1;
+                if self.chunk_count == 1 {
+                    fs::write(&self.marker, b"stop\n")
+                        .map_err(|err| format!("failed to write stop marker: {err}"))?;
+                }
+                Ok(())
+            }
+
+            fn on_event(&mut self, _event: CaptureEvent) -> std::result::Result<(), String> {
+                Ok(())
+            }
+        }
+
+        STOP_CAPTURE_REQUESTED.store(false, Ordering::Relaxed);
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock should be monotonic")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "recordit-fake-capture-stop-marker-{}-{}",
+            std::process::id(),
+            stamp
+        ));
+        let fixture = root.join("fixture.wav");
+        let output = root.join("runtime.wav");
+        let marker = root.join("session.stop.request");
+
+        fs::create_dir_all(&root).expect("temp test root should be creatable");
+        write_fixture_stereo_wav(&fixture, 200, 40);
+
+        let config = LiveCaptureConfig {
+            duration_secs: 1,
+            output: output.clone(),
+            target_rate_hz: 200,
+            mismatch_policy: SampleRateMismatchPolicy::AdaptStreamRate,
+            callback_contract_mode: CallbackContractMode::Warn,
+            stop_request_path: Some(marker.clone()),
+        };
+
+        let _lock = env_lock()
+            .lock()
+            .expect("fake capture env lock should not be poisoned");
+        let _fixture_env = ScopedEnvVar::unset(FAKE_CAPTURE_FIXTURE_ENV);
+        let _restart_env = ScopedEnvVar::unset(FAKE_CAPTURE_RESTART_COUNT_ENV);
+        let _realtime_env = ScopedEnvVar::unset(FAKE_CAPTURE_REALTIME_ENV);
+        let mut sink = StopMarkerSink {
+            marker: marker.clone(),
+            chunk_count: 0,
+        };
+        let result = run_fake_capture_session(&config, &fixture, 0, &mut sink)
+            .expect("fake capture replay should stop cleanly when marker appears");
+        let telemetry_path = telemetry_path_for_output(&output);
+        let telemetry =
+            fs::read_to_string(&telemetry_path).expect("telemetry should be readable UTF-8");
+        assert_eq!(sink.chunk_count, 2, "marker should stop replay after one chunk pair");
+        assert_eq!(result.summary.system_audio.chunk_count, 1);
+        assert_eq!(result.summary.microphone.chunk_count, 1);
+        assert!(telemetry.contains("\"output_frames\": 4"));
+        assert!(telemetry.contains("\"mic_chunks\": 1"));
+        assert!(telemetry.contains("\"system_chunks\": 1"));
+        assert!(output.is_file(), "partial progressive WAV should still be materialized");
+
+        let _ = fs::remove_file(marker);
+        let _ = fs::remove_file(output);
+        let _ = fs::remove_file(fixture);
+        let _ = fs::remove_file(telemetry_path);
+        let _ = fs::remove_dir(root);
+        STOP_CAPTURE_REQUESTED.store(false, Ordering::Relaxed);
+    }
+
+    #[test]
     fn maybe_sleep_for_replay_respects_realtime_toggle() {
         let accelerated_start = Instant::now();
         maybe_sleep_for_replay(false, accelerated_start, 0.05)
@@ -2551,6 +2665,7 @@ mod tests {
             target_rate_hz: 200,
             mismatch_policy: SampleRateMismatchPolicy::AdaptStreamRate,
             callback_contract_mode: CallbackContractMode::Warn,
+            stop_request_path: None,
         };
         let wrapper_config = LiveCaptureConfig {
             duration_secs: 1,
@@ -2558,6 +2673,7 @@ mod tests {
             target_rate_hz: 200,
             mismatch_policy: SampleRateMismatchPolicy::AdaptStreamRate,
             callback_contract_mode: CallbackContractMode::Warn,
+            stop_request_path: None,
         };
 
         let _lock = env_lock()
@@ -3030,21 +3146,15 @@ mod tests {
 
         let events = build_degradation_events(&telemetry, 1_700_000_000);
         assert!(!events.is_empty());
-        assert!(
-            events
-                .iter()
-                .any(|event| event.generated_unix == 1_700_000_000)
-        );
-        assert!(
-            events
-                .iter()
-                .any(|event| event.recovery_action == CaptureRecoveryAction::RestartStream)
-        );
-        assert!(
-            events
-                .iter()
-                .any(|event| event.source == "missing_format_description")
-        );
+        assert!(events
+            .iter()
+            .any(|event| event.generated_unix == 1_700_000_000));
+        assert!(events
+            .iter()
+            .any(|event| event.recovery_action == CaptureRecoveryAction::RestartStream));
+        assert!(events
+            .iter()
+            .any(|event| event.source == "missing_format_description"));
     }
 
     #[test]
@@ -3187,11 +3297,10 @@ mod tests {
             .events
             .iter()
             .any(|event| event.code == CaptureEventCode::StreamInterruption && event.count == 1));
-        assert!(
-            sink.events
-                .iter()
-                .any(|event| event.code == CaptureEventCode::QueueFullDrops && event.count == 2)
-        );
+        assert!(sink
+            .events
+            .iter()
+            .any(|event| event.code == CaptureEventCode::QueueFullDrops && event.count == 2));
         assert!(sink.events.iter().any(|event| event.code
             == CaptureEventCode::MissingFormatDescription
             && event.count == 1));
@@ -3213,11 +3322,10 @@ mod tests {
         emit_runtime_event_deltas(&mut sink, &mut cursor, 1, transport_b, callback_b)
             .expect("incremental update should succeed");
         assert_eq!(sink.events.len(), 5);
-        assert!(
-            sink.events
-                .iter()
-                .any(|event| event.code == CaptureEventCode::QueueFullDrops && event.count == 3)
-        );
+        assert!(sink
+            .events
+            .iter()
+            .any(|event| event.code == CaptureEventCode::QueueFullDrops && event.count == 3));
         assert!(sink.events.iter().any(|event| event.code
             == CaptureEventCode::MissingFormatDescription
             && event.count == 3));
@@ -3268,5 +3376,38 @@ mod tests {
         let lines = callback_recovery_breakdown(snapshot);
         assert_eq!(lines.len(), 1);
         assert!(lines[0].contains("missing_format_description"));
+    }
+    #[test]
+    fn stop_capture_marker_sets_stop_requested_flag() {
+        STOP_CAPTURE_REQUESTED.store(false, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "recordit-stop-request-marker-{}-{}",
+            std::process::id(),
+            now_unix()
+        ));
+        fs::create_dir_all(&root).expect("temp test root should be creatable");
+        let marker = root.join("session.stop.request");
+        fs::write(&marker, b"stop\n").expect("marker should be writable");
+
+        assert!(stop_capture_requested_or_marker(Some(&marker)));
+        assert!(stop_capture_requested());
+
+        let _ = fs::remove_file(&marker);
+        let _ = fs::remove_dir(&root);
+        STOP_CAPTURE_REQUESTED.store(false, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn missing_stop_capture_marker_does_not_request_stop() {
+        STOP_CAPTURE_REQUESTED.store(false, Ordering::Relaxed);
+        let marker = std::env::temp_dir().join(format!(
+            "recordit-missing-stop-request-{}-{}",
+            std::process::id(),
+            now_unix()
+        ));
+        let _ = fs::remove_file(&marker);
+
+        assert!(!stop_capture_requested_or_marker(Some(&marker)));
+        assert!(!stop_capture_requested());
     }
 }

@@ -143,7 +143,10 @@ pub(super) fn run_preflight(config: &TranscribeConfig) -> Result<PreflightReport
     checks.push(check_model_path(config));
     checks.push(check_output_target(CHECK_ID_OUT_WAV, &config.out_wav));
     checks.push(check_output_target(CHECK_ID_OUT_JSONL, &config.out_jsonl));
-    checks.push(check_output_target(CHECK_ID_OUT_MANIFEST, &config.out_manifest));
+    checks.push(check_output_target(
+        CHECK_ID_OUT_MANIFEST,
+        &config.out_manifest,
+    ));
     checks.push(check_sample_rate(config.sample_rate_hz));
     checks.push(check_screen_capture_access());
     checks.push(check_microphone_stream(config.sample_rate_hz));
@@ -531,10 +534,7 @@ mod tests {
                     backend_runtime.insert(id.clone());
                 }
                 other => {
-                    assert!(
-                        false,
-                        "unexpected readiness domain in contract: {other}"
-                    );
+                    assert!(false, "unexpected readiness domain in contract: {other}");
                 }
             }
         }
@@ -547,7 +547,10 @@ mod tests {
             runtime_preflight,
             as_set(&PREFLIGHT_RUNTIME_PREFLIGHT_CHECK_IDS)
         );
-        assert_eq!(backend_runtime, as_set(&PREFLIGHT_BACKEND_RUNTIME_CHECK_IDS));
+        assert_eq!(
+            backend_runtime,
+            as_set(&PREFLIGHT_BACKEND_RUNTIME_CHECK_IDS)
+        );
 
         let diagnostic_entries = json["diagnostic_only_check_ids"]
             .as_array()

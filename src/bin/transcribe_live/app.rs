@@ -2290,7 +2290,10 @@ fn write_benchmark_artifact(
     }
     if let Some(root) = fallback_root {
         let fallback = root.to_path_buf();
-        if !candidate_roots.iter().any(|candidate| candidate == &fallback) {
+        if !candidate_roots
+            .iter()
+            .any(|candidate| candidate == &fallback)
+        {
             candidate_roots.push(fallback);
         }
     }
@@ -2544,6 +2547,7 @@ fn run_live_capture_session(config: &TranscribeConfig) -> Result<(), CliError> {
         target_rate_hz: config.sample_rate_hz,
         mismatch_policy: LiveCaptureSampleRateMismatchPolicy::AdaptStreamRate,
         callback_contract_mode: LiveCaptureCallbackMode::Warn,
+        stop_request_path: None,
     };
     run_capture_session(&live_capture_config)
         .map_err(|err| CliError::new(format!("live capture session failed: {err}")))?;
@@ -6633,6 +6637,7 @@ mod tests {
             target_rate_hz: 200,
             mismatch_policy: LiveCaptureSampleRateMismatchPolicy::AdaptStreamRate,
             callback_contract_mode: LiveCaptureCallbackMode::Warn,
+            stop_request_path: None,
         };
 
         let _guard = env_lock().lock().unwrap();
