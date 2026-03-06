@@ -5,6 +5,10 @@ Last updated: 2026-03-05
 
 This document defines the canonical ownership boundaries for the macOS SwiftUI app shell described in `plan/recordit-user-interfaces-journey.md`.
 
+For cross-language/runtime authority boundaries, pair this with:
+- `docs/runtime-boundary-ownership-contract.md`
+- `contracts/readiness-contract-ids.v1.json`
+
 ## Goal
 
 Keep UI code decoupled from runtime process internals so teams can work in parallel and we can test logic without launching real subprocesses from view code.

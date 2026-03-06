@@ -55,11 +55,7 @@ public final class AppShellViewModel {
         }
 
         guard preflight.canProceedToLiveTranscribe else {
-            onboardingGateFailure = AppServiceError(
-                code: .preflightFailed,
-                userMessage: "Run preflight checks before finishing setup.",
-                remediation: "Resolve failed checks and acknowledge warnings before continuing."
-            )
+            onboardingGateFailure = Self.preflightGateFailure(for: preflight)
             return false
         }
 
@@ -96,5 +92,38 @@ public final class AppShellViewModel {
             return nil
         }
         return sessionID
+    }
+
+    private static func preflightGateFailure(for preflight: PreflightViewModel) -> AppServiceError {
+        let fallbackRemediationSuffix = preflight.canOfferRecordOnlyFallback
+            ? " Record Only remains available while Live Transcribe is blocked."
+            : ""
+
+        switch preflight.primaryBlockingDomain {
+        case .tccCapture:
+            return AppServiceError(
+                code: .permissionDenied,
+                userMessage: "Live Transcribe is blocked by capture permission readiness.",
+                remediation: "Grant Screen Recording and Microphone access, ensure an active display, then rerun preflight."
+            )
+        case .backendModel:
+            return AppServiceError(
+                code: .modelUnavailable,
+                userMessage: "Live Transcribe is blocked by backend/model readiness.",
+                remediation: "Fix model path/backend compatibility and rerun preflight.\(fallbackRemediationSuffix)"
+            )
+        case .runtimePreflight, .backendRuntime:
+            return AppServiceError(
+                code: .preflightFailed,
+                userMessage: "Live Transcribe is blocked by runtime preflight checks.",
+                remediation: "Resolve failed runtime checks, rerun preflight, and review diagnostics.\(fallbackRemediationSuffix)"
+            )
+        case .diagnosticOnly, .unknown, .none:
+            return AppServiceError(
+                code: .preflightFailed,
+                userMessage: "Run preflight checks before finishing setup.",
+                remediation: "Resolve failed checks and acknowledge warnings before continuing."
+            )
+        }
     }
 }

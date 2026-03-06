@@ -172,10 +172,8 @@ public final class PermissionRemediationViewModel {
         nativePermissionStatus: ((RemediablePermission) -> Bool)? = nil
     ) -> [PermissionRemediationItem] {
         let resolvedNativePermissionStatus = nativePermissionStatus ?? defaultNativePermissionStatus
-        let screenChecks = envelope.checks.filter {
-            $0.id == "screen_capture_access" || $0.id == "display_availability"
-        }
-        let microphoneChecks = envelope.checks.filter { $0.id == "microphone_access" }
+        let screenChecks = envelope.checks.filter { ReadinessContract.screenPermissionIDs.contains($0.id) }
+        let microphoneChecks = envelope.checks.filter { $0.id == ReadinessContract.microphonePermissionID }
 
         return [
             buildItem(

@@ -16,12 +16,15 @@ private func fixtureCheck(_ id: String, _ status: PreflightStatus) -> PreflightC
     )
 }
 
-private func fixtureEnvelope(checks: [PreflightCheckDTO]) -> PreflightManifestEnvelopeDTO {
+private func fixtureEnvelope(
+    checks: [PreflightCheckDTO],
+    overallStatus: PreflightStatus = .warn
+) -> PreflightManifestEnvelopeDTO {
     PreflightManifestEnvelopeDTO(
         schemaVersion: "1",
         kind: "transcribe-live-preflight",
         generatedAtUTC: "2026-03-05T00:00:00Z",
-        overallStatus: .warn,
+        overallStatus: overallStatus,
         config: PreflightConfigDTO(
             outWav: "/tmp/out.wav",
             outJsonl: "/tmp/out.jsonl",
@@ -49,17 +52,7 @@ private struct StubCommandRunner: CommandRunning {
 }
 
 private func runPolicyChecks() {
-    let expectedKnown: Set<String> = [
-        "model_path",
-        "out_wav",
-        "out_jsonl",
-        "out_manifest",
-        "screen_capture_access",
-        "display_availability",
-        "microphone_access",
-        "sample_rate",
-        "backend_runtime",
-    ]
+    let expectedKnown: Set<String> = ReadinessContract.knownContractIDs
 
     check(
         PreflightGatingPolicy.knownContractCheckIDs == expectedKnown,
@@ -78,46 +71,105 @@ private func runPolicyChecks() {
             "warn check \(id) must map to warnRequiresAcknowledgement"
         )
     }
+    for id in ReadinessContract.tccCaptureIDs {
+        check(
+            ReadinessContract.domain(forCheckID: id) == .tccCapture,
+            "tcc check \(id) must map to tcc_capture domain"
+        )
+    }
+    for id in ReadinessContract.backendModelIDs {
+        check(
+            ReadinessContract.domain(forCheckID: id) == .backendModel,
+            "backend model check \(id) must map to backend_model domain"
+        )
+    }
+    for id in ReadinessContract.runtimePreflightIDs {
+        check(
+            ReadinessContract.domain(forCheckID: id) == .runtimePreflight,
+            "runtime preflight check \(id) must map to runtime_preflight domain"
+        )
+    }
+    for id in ReadinessContract.backendRuntimeIDs {
+        check(
+            ReadinessContract.domain(forCheckID: id) == .backendRuntime,
+            "backend runtime check \(id) must map to backend_runtime domain"
+        )
+    }
 
     let policy = PreflightGatingPolicy()
 
     let blockedEnvelope = fixtureEnvelope(checks: [
-        fixtureCheck("model_path", .fail),
-        fixtureCheck("backend_runtime", .warn),
+        fixtureCheck(ReadinessContractID.modelPath.rawValue, .fail),
+        fixtureCheck(ReadinessContractID.backendRuntime.rawValue, .warn),
     ])
     let blocked = policy.evaluate(blockedEnvelope)
     check(blocked.blockingFailures.count == 1, "model_path fail must block")
-    check(blocked.blockingFailures[0].check.id == "model_path", "unexpected blocking ID")
+    check(
+        blocked.blockingFailures[0].check.id == ReadinessContractID.modelPath.rawValue,
+        "unexpected blocking ID"
+    )
+    check(blocked.primaryBlockingDomain == .backendModel, "model_path fail should map to backend_model domain")
+    check(blocked.recordOnlyFallbackEligible, "backend/model blockers should keep Record Only fallback eligible")
     check(!blocked.canProceed(acknowledgingWarnings: false), "blocking fail must prevent proceed")
     check(!blocked.canProceed(acknowledgingWarnings: true), "blocking fail must prevent proceed even with warning ack")
 
     let warnOnlyEnvelope = fixtureEnvelope(checks: [
-        fixtureCheck("model_path", .pass),
-        fixtureCheck("out_wav", .pass),
-        fixtureCheck("out_jsonl", .pass),
-        fixtureCheck("out_manifest", .pass),
-        fixtureCheck("screen_capture_access", .pass),
-        fixtureCheck("microphone_access", .pass),
-        fixtureCheck("sample_rate", .warn),
-        fixtureCheck("backend_runtime", .warn),
+        fixtureCheck(ReadinessContractID.modelPath.rawValue, .pass),
+        fixtureCheck(ReadinessContractID.outWav.rawValue, .pass),
+        fixtureCheck(ReadinessContractID.outJsonl.rawValue, .pass),
+        fixtureCheck(ReadinessContractID.outManifest.rawValue, .pass),
+        fixtureCheck(ReadinessContractID.screenCaptureAccess.rawValue, .pass),
+        fixtureCheck(ReadinessContractID.microphoneAccess.rawValue, .pass),
+        fixtureCheck(ReadinessContractID.sampleRate.rawValue, .warn),
+        fixtureCheck(ReadinessContractID.backendRuntime.rawValue, .warn),
     ])
     let warnOnly = policy.evaluate(warnOnlyEnvelope)
     check(warnOnly.blockingFailures.isEmpty, "warn-only envelope should not have blockers")
     check(warnOnly.warningContinuations.count == 2, "warn-only envelope should require warning ack")
+    check(!warnOnly.recordOnlyFallbackEligible, "warn-only envelope should not be treated as fallback-eligible")
     check(!warnOnly.canProceed(acknowledgingWarnings: false), "warn-only envelope must require explicit acknowledgment")
     check(warnOnly.canProceed(acknowledgingWarnings: true), "warn-only envelope should proceed after acknowledgment")
+
+    let runtimePreflightBlockedEnvelope = fixtureEnvelope(checks: [
+        fixtureCheck(ReadinessContractID.modelPath.rawValue, .pass),
+        fixtureCheck(ReadinessContractID.outWav.rawValue, .fail),
+        fixtureCheck(ReadinessContractID.screenCaptureAccess.rawValue, .pass),
+        fixtureCheck(ReadinessContractID.microphoneAccess.rawValue, .pass),
+    ])
+    let runtimePreflightBlocked = policy.evaluate(runtimePreflightBlockedEnvelope)
+    check(
+        runtimePreflightBlocked.primaryBlockingDomain == .runtimePreflight,
+        "out_wav fail should map to runtime_preflight domain"
+    )
+    check(
+        !runtimePreflightBlocked.recordOnlyFallbackEligible,
+        "runtime preflight blockers should not automatically mark Record Only fallback eligible"
+    )
+
+    let diagnosticOnlyEnvelope = fixtureEnvelope(checks: [
+        fixtureCheck(ReadinessContractID.modelReadability.rawValue, .fail),
+    ])
+    let diagnosticOnly = policy.evaluate(diagnosticOnlyEnvelope)
+    check(
+        diagnosticOnly.mappedChecks.first?.isKnownContractID == true,
+        "diagnostic-only IDs should be tracked as known contract IDs"
+    )
+    check(
+        diagnosticOnly.unknownCheckIDs.isEmpty,
+        "diagnostic-only IDs should not be reported as unknown"
+    )
 }
 
 @MainActor
 private func runViewModelChecks() {
     let warnEnvelope = fixtureEnvelope(checks: [
-        fixtureCheck("model_path", .pass),
-        fixtureCheck("out_wav", .pass),
-        fixtureCheck("out_jsonl", .pass),
-        fixtureCheck("out_manifest", .pass),
-        fixtureCheck("display_availability", .pass),
-        fixtureCheck("microphone_access", .pass),
-        fixtureCheck("sample_rate", .warn),
+        fixtureCheck(ReadinessContractID.modelPath.rawValue, .pass),
+        fixtureCheck(ReadinessContractID.outWav.rawValue, .pass),
+        fixtureCheck(ReadinessContractID.outJsonl.rawValue, .pass),
+        fixtureCheck(ReadinessContractID.outManifest.rawValue, .pass),
+        fixtureCheck(ReadinessContractID.displayAvailability.rawValue, .pass),
+        fixtureCheck(ReadinessContractID.microphoneAccess.rawValue, .pass),
+        fixtureCheck(ReadinessContractID.sampleRate.rawValue, .warn),
     ])
     let encoder = JSONEncoder()
     let data: Data
@@ -141,14 +193,17 @@ private func runViewModelChecks() {
     viewModel.acknowledgeWarningsForLiveTranscribe()
     check(viewModel.canProceedToLiveTranscribe, "view model should allow proceed after user acknowledgment")
 
-    let runtimePermissionFailureEnvelope = fixtureEnvelope(checks: [
-        fixtureCheck("model_path", .pass),
-        fixtureCheck("out_wav", .pass),
-        fixtureCheck("out_jsonl", .pass),
-        fixtureCheck("out_manifest", .pass),
-        fixtureCheck("screen_capture_access", .fail),
-        fixtureCheck("microphone_access", .fail),
-    ])
+    let runtimePermissionFailureEnvelope = fixtureEnvelope(
+        checks: [
+            fixtureCheck(ReadinessContractID.modelPath.rawValue, .pass),
+            fixtureCheck(ReadinessContractID.outWav.rawValue, .pass),
+            fixtureCheck(ReadinessContractID.outJsonl.rawValue, .pass),
+            fixtureCheck(ReadinessContractID.outManifest.rawValue, .pass),
+            fixtureCheck(ReadinessContractID.screenCaptureAccess.rawValue, .fail),
+            fixtureCheck(ReadinessContractID.microphoneAccess.rawValue, .fail),
+        ],
+        overallStatus: .fail
+    )
     let runtimeFailureData: Data
     do {
         runtimeFailureData = try encoder.encode(runtimePermissionFailureEnvelope)
@@ -173,10 +228,19 @@ private func runViewModelChecks() {
         !fallbackViewModel.canProceedToLiveTranscribe,
         "runtime permission failures must block proceed in production mode"
     )
+    check(
+        fallbackViewModel.primaryBlockingDomain == .tccCapture,
+        "runtime permission failures should map to tcc_capture domain"
+    )
+    check(
+        !fallbackViewModel.canOfferRecordOnlyFallback,
+        "permission blockers should keep Record Only fallback disabled"
+    )
     if case let .completed(envelope) = fallbackViewModel.state {
         check(envelope.overallStatus == .fail, "runtime permission failures should keep overall status fail")
         let remainingPermissionFailures = envelope.checks.filter {
-            ($0.id == "screen_capture_access" || $0.id == "display_availability" || $0.id == "microphone_access")
+            (ReadinessContract.screenPermissionIDs.contains($0.id)
+                || $0.id == ReadinessContract.microphonePermissionID)
                 && $0.status == .fail
         }
         check(

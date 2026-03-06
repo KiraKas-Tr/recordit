@@ -88,6 +88,14 @@ public final class PreflightViewModel {
         return evaluation.requiresWarningAcknowledgement && !warningAcknowledged
     }
 
+    public var primaryBlockingDomain: ReadinessDomain? {
+        gatingEvaluation?.primaryBlockingDomain
+    }
+
+    public var canOfferRecordOnlyFallback: Bool {
+        gatingEvaluation?.recordOnlyFallbackEligible ?? false
+    }
+
     public func acknowledgeWarningsForLiveTranscribe() {
         warningAcknowledged = true
     }
@@ -138,33 +146,31 @@ public final class PreflightViewModel {
         normalizedChecks.reserveCapacity(envelope.checks.count)
 
         for check in envelope.checks {
-            switch check.id {
-            case "screen_capture_access", "display_availability":
-                if check.status == .fail, nativeScreenGranted {
-                    normalizedChecks.append(
-                        PreflightCheckDTO(
-                            id: check.id,
-                            status: .pass,
-                            detail: "App-level Screen Recording permission is granted. Runtime check reported: \(check.detail)",
-                            remediation: "If runtime capture still fails, quit and reopen Recordit, then re-run preflight."
-                        )
+            if ReadinessContract.screenPermissionIDs.contains(check.id),
+               check.status == .fail,
+               nativeScreenGranted {
+                normalizedChecks.append(
+                    PreflightCheckDTO(
+                        id: check.id,
+                        status: .pass,
+                        detail: "App-level Screen Recording permission is granted. Runtime check reported: \(check.detail)",
+                        remediation: "If runtime capture still fails, quit and reopen Recordit, then re-run preflight."
                     )
-                    continue
-                }
-            case "microphone_access":
-                if check.status == .fail, nativeMicrophoneGranted {
-                    normalizedChecks.append(
-                        PreflightCheckDTO(
-                            id: check.id,
-                            status: .pass,
-                            detail: "App-level Microphone permission is granted. Runtime check reported: \(check.detail)",
-                            remediation: "If runtime capture still fails, verify active input device and re-run preflight."
-                        )
+                )
+                continue
+            }
+            if check.id == ReadinessContract.microphonePermissionID,
+               check.status == .fail,
+               nativeMicrophoneGranted {
+                normalizedChecks.append(
+                    PreflightCheckDTO(
+                        id: check.id,
+                        status: .pass,
+                        detail: "App-level Microphone permission is granted. Runtime check reported: \(check.detail)",
+                        remediation: "If runtime capture still fails, verify active input device and re-run preflight."
                     )
-                    continue
-                }
-            default:
-                break
+                )
+                continue
             }
 
             normalizedChecks.append(check)

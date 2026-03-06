@@ -351,19 +351,19 @@ private struct PreviewPreflightCommandRunner: CommandRunning {
             ],
             "checks": [
                 [
-                    "id": "model_path",
+                    "id": ReadinessContractID.modelPath.rawValue,
                     "status": "PASS",
                     "detail": "model path resolved",
                     "remediation": "",
                 ],
                 [
-                    "id": "screen_capture_access",
+                    "id": ReadinessContractID.screenCaptureAccess.rawValue,
                     "status": "PASS",
                     "detail": "screen access granted",
                     "remediation": "",
                 ],
                 [
-                    "id": "microphone_access",
+                    "id": ReadinessContractID.microphoneAccess.rawValue,
                     "status": "PASS",
                     "detail": "microphone access granted",
                     "remediation": "",

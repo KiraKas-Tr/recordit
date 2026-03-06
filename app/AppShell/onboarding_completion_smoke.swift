@@ -110,9 +110,65 @@ private func preflightPassPayload() -> Data {
             "sample_rate_hz": 48_000,
         ],
         "checks": [
-            ["id": "model_path", "status": "PASS", "detail": "ok", "remediation": ""],
-            ["id": "screen_capture_access", "status": "PASS", "detail": "ok", "remediation": ""],
-            ["id": "microphone_access", "status": "PASS", "detail": "ok", "remediation": ""],
+            ["id": ReadinessContractID.modelPath.rawValue, "status": "PASS", "detail": "ok", "remediation": ""],
+            ["id": ReadinessContractID.screenCaptureAccess.rawValue, "status": "PASS", "detail": "ok", "remediation": ""],
+            ["id": ReadinessContractID.microphoneAccess.rawValue, "status": "PASS", "detail": "ok", "remediation": ""],
+        ],
+    ]
+    return (try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys])) ?? Data()
+}
+
+private func preflightModelBlockedPayload() -> Data {
+    let payload: [String: Any] = [
+        "schema_version": "1",
+        "kind": "transcribe-live-preflight",
+        "generated_at_utc": "2026-03-05T00:00:00Z",
+        "overall_status": "FAIL",
+        "config": [
+            "out_wav": "/tmp/out.wav",
+            "out_jsonl": "/tmp/out.jsonl",
+            "out_manifest": "/tmp/out.manifest.json",
+            "asr_backend": "whispercpp",
+            "asr_model_requested": "/tmp/model.bin",
+            "asr_model_resolved": "/tmp/model.bin",
+            "asr_model_source": "fixture",
+            "sample_rate_hz": 48_000,
+        ],
+        "checks": [
+            [
+                "id": ReadinessContractID.modelPath.rawValue,
+                "status": "FAIL",
+                "detail": "model path missing",
+                "remediation": "Provide a compatible model."
+            ],
+            ["id": ReadinessContractID.screenCaptureAccess.rawValue, "status": "PASS", "detail": "ok", "remediation": ""],
+            ["id": ReadinessContractID.microphoneAccess.rawValue, "status": "PASS", "detail": "ok", "remediation": ""],
+        ],
+    ]
+    return (try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys])) ?? Data()
+}
+
+private func preflightRuntimeBlockedPayload() -> Data {
+    let payload: [String: Any] = [
+        "schema_version": "1",
+        "kind": "transcribe-live-preflight",
+        "generated_at_utc": "2026-03-05T00:00:00Z",
+        "overall_status": "FAIL",
+        "config": [
+            "out_wav": "/tmp/out.wav",
+            "out_jsonl": "/tmp/out.jsonl",
+            "out_manifest": "/tmp/out.manifest.json",
+            "asr_backend": "whispercpp",
+            "asr_model_requested": "/tmp/model.bin",
+            "asr_model_resolved": "/tmp/model.bin",
+            "asr_model_source": "fixture",
+            "sample_rate_hz": 48_000,
+        ],
+        "checks": [
+            ["id": ReadinessContractID.modelPath.rawValue, "status": "PASS", "detail": "ok", "remediation": ""],
+            ["id": ReadinessContractID.outWav.rawValue, "status": "FAIL", "detail": "output path not writable", "remediation": "Choose writable output path."],
+            ["id": ReadinessContractID.screenCaptureAccess.rawValue, "status": "PASS", "detail": "ok", "remediation": ""],
+            ["id": ReadinessContractID.microphoneAccess.rawValue, "status": "PASS", "detail": "ok", "remediation": ""],
         ],
     ]
     return (try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys])) ?? Data()
@@ -205,6 +261,52 @@ private func runSmoke() {
         "completion should fail when preflight has not produced a passable evaluation"
     )
     check(relaunch.onboardingGateFailure?.code == .preflightFailed, "preflight failure should map to preflightFailed")
+
+    let backendBlockedPreflight = PreflightViewModel(
+        runner: RecorditPreflightRunner(
+            executable: "/usr/bin/env",
+            commandRunner: StubCommandRunner(payload: preflightModelBlockedPayload()),
+            parser: PreflightEnvelopeParser(),
+            environment: [:]
+        ),
+        gatingPolicy: PreflightGatingPolicy()
+    )
+    backendBlockedPreflight.runLivePreflight()
+    check(
+        !relaunch.completeOnboardingIfReady(modelSetup: validModel, preflight: backendBlockedPreflight),
+        "completion should fail when backend/model readiness blocks live preflight"
+    )
+    check(
+        relaunch.onboardingGateFailure?.code == .modelUnavailable,
+        "backend/model readiness blockers should map to modelUnavailable"
+    )
+    check(
+        relaunch.onboardingGateFailure?.remediation.contains("Record Only remains available") == true,
+        "backend/model readiness blockers should surface Record Only fallback guidance"
+    )
+
+    let runtimeBlockedPreflight = PreflightViewModel(
+        runner: RecorditPreflightRunner(
+            executable: "/usr/bin/env",
+            commandRunner: StubCommandRunner(payload: preflightRuntimeBlockedPayload()),
+            parser: PreflightEnvelopeParser(),
+            environment: [:]
+        ),
+        gatingPolicy: PreflightGatingPolicy()
+    )
+    runtimeBlockedPreflight.runLivePreflight()
+    check(
+        !relaunch.completeOnboardingIfReady(modelSetup: validModel, preflight: runtimeBlockedPreflight),
+        "completion should fail when runtime preflight readiness blocks live preflight"
+    )
+    check(
+        relaunch.onboardingGateFailure?.code == .preflightFailed,
+        "runtime preflight blockers should map to preflightFailed"
+    )
+    check(
+        relaunch.onboardingGateFailure?.remediation.contains("Record Only remains available") == false,
+        "runtime preflight blockers should not advertise Record Only fallback"
+    )
 }
 
 @main

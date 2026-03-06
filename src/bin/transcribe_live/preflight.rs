@@ -1,5 +1,54 @@
 use super::*;
 
+const CHECK_ID_MODEL_PATH: &str = "model_path";
+const CHECK_ID_MODEL_READABILITY: &str = "model_readability";
+const CHECK_ID_OUT_WAV: &str = "out_wav";
+const CHECK_ID_OUT_JSONL: &str = "out_jsonl";
+const CHECK_ID_OUT_MANIFEST: &str = "out_manifest";
+const CHECK_ID_SAMPLE_RATE: &str = "sample_rate";
+const CHECK_ID_SCREEN_CAPTURE_ACCESS: &str = "screen_capture_access";
+const CHECK_ID_DISPLAY_AVAILABILITY: &str = "display_availability";
+const CHECK_ID_MICROPHONE_ACCESS: &str = "microphone_access";
+const CHECK_ID_BACKEND_RUNTIME: &str = "backend_runtime";
+
+#[cfg(test)]
+const PREFLIGHT_BLOCKING_CHECK_IDS: [&str; 7] = [
+    CHECK_ID_MODEL_PATH,
+    CHECK_ID_OUT_WAV,
+    CHECK_ID_OUT_JSONL,
+    CHECK_ID_OUT_MANIFEST,
+    CHECK_ID_SCREEN_CAPTURE_ACCESS,
+    CHECK_ID_DISPLAY_AVAILABILITY,
+    CHECK_ID_MICROPHONE_ACCESS,
+];
+
+#[cfg(test)]
+const PREFLIGHT_WARN_ACK_CHECK_IDS: [&str; 2] = [CHECK_ID_SAMPLE_RATE, CHECK_ID_BACKEND_RUNTIME];
+
+#[cfg(test)]
+const MODEL_DOCTOR_DIAGNOSTIC_ONLY_CHECK_IDS: [&str; 1] = [CHECK_ID_MODEL_READABILITY];
+
+#[cfg(test)]
+const PREFLIGHT_TCC_CAPTURE_CHECK_IDS: [&str; 3] = [
+    CHECK_ID_SCREEN_CAPTURE_ACCESS,
+    CHECK_ID_DISPLAY_AVAILABILITY,
+    CHECK_ID_MICROPHONE_ACCESS,
+];
+
+#[cfg(test)]
+const PREFLIGHT_BACKEND_MODEL_CHECK_IDS: [&str; 1] = [CHECK_ID_MODEL_PATH];
+
+#[cfg(test)]
+const PREFLIGHT_RUNTIME_PREFLIGHT_CHECK_IDS: [&str; 4] = [
+    CHECK_ID_OUT_WAV,
+    CHECK_ID_OUT_JSONL,
+    CHECK_ID_OUT_MANIFEST,
+    CHECK_ID_SAMPLE_RATE,
+];
+
+#[cfg(test)]
+const PREFLIGHT_BACKEND_RUNTIME_CHECK_IDS: [&str; 1] = [CHECK_ID_BACKEND_RUNTIME];
+
 pub(super) fn run_model_doctor(config: &TranscribeConfig) -> Result<PreflightReport, CliError> {
     let mut checks = Vec::new();
     checks.push(check_backend_runtime(config.asr_backend));
@@ -8,7 +57,7 @@ pub(super) fn run_model_doctor(config: &TranscribeConfig) -> Result<PreflightRep
         Ok(resolved) => {
             let expected_kind = expected_model_kind(config.asr_backend);
             checks.push(PreflightCheck::pass(
-                "model_path",
+                CHECK_ID_MODEL_PATH,
                 format!(
                     "model path resolved: {} via {} (expected {expected_kind} for backend {})",
                     display_path(&resolved.path),
@@ -20,12 +69,12 @@ pub(super) fn run_model_doctor(config: &TranscribeConfig) -> Result<PreflightRep
         }
         Err(err) => {
             checks.push(PreflightCheck::fail(
-                "model_path",
+                CHECK_ID_MODEL_PATH,
                 err.to_string(),
                 "Pass --asr-model, set RECORDIT_ASR_MODEL, or install the backend default asset in the documented location.",
             ));
             checks.push(PreflightCheck::fail(
-                "model_readability",
+                CHECK_ID_MODEL_READABILITY,
                 "skipped because model_path did not validate".to_string(),
                 "Fix model_path first, then rerun --model-doctor.",
             ));
@@ -45,11 +94,11 @@ fn check_model_asset_readability(resolved: &ResolvedModelPath) -> PreflightCheck
     if resolved.path.is_file() {
         return match File::open(&resolved.path) {
             Ok(_) => PreflightCheck::pass(
-                "model_readability",
+                CHECK_ID_MODEL_READABILITY,
                 format!("model file is readable: {}", display_path(&resolved.path)),
             ),
             Err(err) => PreflightCheck::fail(
-                "model_readability",
+                CHECK_ID_MODEL_READABILITY,
                 format!(
                     "cannot read model file {}: {err}",
                     display_path(&resolved.path)
@@ -62,14 +111,14 @@ fn check_model_asset_readability(resolved: &ResolvedModelPath) -> PreflightCheck
     if resolved.path.is_dir() {
         return match fs::read_dir(&resolved.path) {
             Ok(_) => PreflightCheck::pass(
-                "model_readability",
+                CHECK_ID_MODEL_READABILITY,
                 format!(
                     "model directory is readable: {}",
                     display_path(&resolved.path)
                 ),
             ),
             Err(err) => PreflightCheck::fail(
-                "model_readability",
+                CHECK_ID_MODEL_READABILITY,
                 format!(
                     "cannot read model directory {}: {err}",
                     display_path(&resolved.path)
@@ -80,7 +129,7 @@ fn check_model_asset_readability(resolved: &ResolvedModelPath) -> PreflightCheck
     }
 
     PreflightCheck::fail(
-        "model_readability",
+        CHECK_ID_MODEL_READABILITY,
         format!(
             "model path is neither a file nor directory: {}",
             display_path(&resolved.path)
@@ -92,9 +141,9 @@ fn check_model_asset_readability(resolved: &ResolvedModelPath) -> PreflightCheck
 pub(super) fn run_preflight(config: &TranscribeConfig) -> Result<PreflightReport, CliError> {
     let mut checks = Vec::new();
     checks.push(check_model_path(config));
-    checks.push(check_output_target("out_wav", &config.out_wav));
-    checks.push(check_output_target("out_jsonl", &config.out_jsonl));
-    checks.push(check_output_target("out_manifest", &config.out_manifest));
+    checks.push(check_output_target(CHECK_ID_OUT_WAV, &config.out_wav));
+    checks.push(check_output_target(CHECK_ID_OUT_JSONL, &config.out_jsonl));
+    checks.push(check_output_target(CHECK_ID_OUT_MANIFEST, &config.out_manifest));
     checks.push(check_sample_rate(config.sample_rate_hz));
     checks.push(check_screen_capture_access());
     checks.push(check_microphone_stream(config.sample_rate_hz));
@@ -114,7 +163,7 @@ fn check_model_path(config: &TranscribeConfig) -> PreflightCheck {
         Ok(resolved) => {
             let expected_kind = expected_model_kind(config.asr_backend);
             PreflightCheck::pass(
-                "model_path",
+                CHECK_ID_MODEL_PATH,
                 format!(
                     "model path resolved: {} via {} (expected {expected_kind} for backend {})",
                     display_path(&resolved.path),
@@ -124,7 +173,7 @@ fn check_model_path(config: &TranscribeConfig) -> PreflightCheck {
             )
         }
         Err(err) => PreflightCheck::fail(
-            "model_path",
+            CHECK_ID_MODEL_PATH,
             err.to_string(),
             "Pass --asr-model, set RECORDIT_ASR_MODEL, or install the backend default asset in the documented location.",
         ),
@@ -175,11 +224,11 @@ fn check_output_target(id: &'static str, path: &Path) -> PreflightCheck {
 
 fn check_sample_rate(sample_rate_hz: u32) -> PreflightCheck {
     if sample_rate_hz == 48_000 {
-        return PreflightCheck::pass("sample_rate", "sample rate is 48000 Hz");
+        return PreflightCheck::pass(CHECK_ID_SAMPLE_RATE, "sample rate is 48000 Hz");
     }
 
     PreflightCheck::warn(
-        "sample_rate",
+        CHECK_ID_SAMPLE_RATE,
         format!("non-default sample rate configured: {sample_rate_hz} Hz"),
         "Use --sample-rate 48000 unless you intentionally need a different rate.",
     )
@@ -190,7 +239,7 @@ fn check_screen_capture_access() -> PreflightCheck {
         Ok(content) => content,
         Err(err) => {
             return PreflightCheck::fail(
-                "screen_capture_access",
+                CHECK_ID_SCREEN_CAPTURE_ACCESS,
                 format!("failed to query ScreenCaptureKit content: {err}"),
                 "Grant Screen Recording permission and ensure at least one active display.",
             );
@@ -200,14 +249,14 @@ fn check_screen_capture_access() -> PreflightCheck {
     let displays = content.displays();
     if displays.is_empty() {
         return PreflightCheck::fail(
-            "display_availability",
+            CHECK_ID_DISPLAY_AVAILABILITY,
             "ScreenCaptureKit returned no displays".to_string(),
             "Connect/enable a display and retry. Closed-lid headless mode is unsupported.",
         );
     }
 
     PreflightCheck::pass(
-        "screen_capture_access",
+        CHECK_ID_SCREEN_CAPTURE_ACCESS,
         format!(
             "ScreenCaptureKit access OK; displays available={}",
             displays.len()
@@ -220,7 +269,7 @@ fn check_microphone_stream(sample_rate_hz: u32) -> PreflightCheck {
         Ok(content) => content,
         Err(err) => {
             return PreflightCheck::fail(
-                "microphone_access",
+                CHECK_ID_MICROPHONE_ACCESS,
                 format!("cannot initialize microphone preflight (shareable content error): {err}"),
                 "Grant Screen Recording first, then rerun preflight.",
             );
@@ -230,7 +279,7 @@ fn check_microphone_stream(sample_rate_hz: u32) -> PreflightCheck {
     let displays = content.displays();
     if displays.is_empty() {
         return PreflightCheck::fail(
-            "microphone_access",
+            CHECK_ID_MICROPHONE_ACCESS,
             "cannot run microphone preflight without an active display".to_string(),
             "Connect/enable a display and rerun preflight.",
         );
@@ -269,7 +318,7 @@ fn check_microphone_stream(sample_rate_hz: u32) -> PreflightCheck {
         .is_none()
     {
         return PreflightCheck::fail(
-            "microphone_access",
+            CHECK_ID_MICROPHONE_ACCESS,
             "failed to register microphone output handler".to_string(),
             "Retry preflight; if it persists, restart the app/session.",
         );
@@ -277,7 +326,7 @@ fn check_microphone_stream(sample_rate_hz: u32) -> PreflightCheck {
 
     if let Err(err) = stream.start_capture() {
         return PreflightCheck::fail(
-            "microphone_access",
+            CHECK_ID_MICROPHONE_ACCESS,
             format!("failed to start microphone capture: {err}"),
             "Grant Microphone permission and verify an input device is connected and enabled.",
         );
@@ -299,7 +348,7 @@ fn check_microphone_stream(sample_rate_hz: u32) -> PreflightCheck {
     let stop_result = stream.stop_capture();
     if let Err(err) = stop_result {
         return PreflightCheck::warn(
-            "microphone_access",
+            CHECK_ID_MICROPHONE_ACCESS,
             format!("microphone stream started but stop_capture reported: {err}"),
             "Retry preflight; if repeated, restart the app/session.",
         );
@@ -307,12 +356,12 @@ fn check_microphone_stream(sample_rate_hz: u32) -> PreflightCheck {
 
     if observed_mic {
         PreflightCheck::pass(
-            "microphone_access",
+            CHECK_ID_MICROPHONE_ACCESS,
             "observed at least one microphone sample buffer".to_string(),
         )
     } else {
         PreflightCheck::fail(
-            "microphone_access",
+            CHECK_ID_MICROPHONE_ACCESS,
             "no microphone sample buffer observed within 2s".to_string(),
             "Grant Microphone permission, unmute/select input device, and speak briefly during preflight.",
         )
@@ -328,11 +377,11 @@ fn check_backend_runtime(backend: AsrBackend) -> PreflightCheck {
 
     match command_stdout("which", &[tool_name]) {
         Ok(path) => PreflightCheck::pass(
-            "backend_runtime",
+            CHECK_ID_BACKEND_RUNTIME,
             format!("detected backend helper binary `{tool_name}` at {path}"),
         ),
         Err(_) => PreflightCheck::warn(
-            "backend_runtime",
+            CHECK_ID_BACKEND_RUNTIME,
             format!("backend helper binary `{tool_name}` not found in PATH"),
             "Install backend tooling or keep using Rust-native integration once wired.",
         ),
@@ -409,4 +458,125 @@ pub(super) fn print_model_doctor_report(report: &PreflightReport) {
         warn_count,
         fail_count
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::Value;
+    use std::collections::BTreeSet;
+    use std::fs;
+    use std::path::PathBuf;
+
+    fn as_set(ids: &[&str]) -> BTreeSet<String> {
+        ids.iter().map(|id| (*id).to_string()).collect()
+    }
+
+    #[test]
+    fn preflight_check_ids_match_readiness_contract() {
+        let contract_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("contracts")
+            .join("readiness-contract-ids.v1.json");
+        let raw = fs::read_to_string(&contract_path).expect("failed to read readiness contract");
+        let json: Value =
+            serde_json::from_str(&raw).expect("failed to parse readiness contract json");
+
+        let entries = json["preflight_check_ids"]
+            .as_array()
+            .expect("preflight_check_ids must be an array");
+
+        let mut blocking = BTreeSet::new();
+        let mut warn_ack = BTreeSet::new();
+        let mut tcc_capture = BTreeSet::new();
+        let mut backend_model = BTreeSet::new();
+        let mut runtime_preflight = BTreeSet::new();
+        let mut backend_runtime = BTreeSet::new();
+        for entry in entries {
+            let id = entry["id"]
+                .as_str()
+                .expect("preflight_check_ids[].id must be a string")
+                .to_string();
+            let class = entry["class"]
+                .as_str()
+                .expect("preflight_check_ids[].class must be a string");
+            match class {
+                "blocking" => {
+                    blocking.insert(id.clone());
+                }
+                "warn_ack_required" => {
+                    warn_ack.insert(id.clone());
+                }
+                other => {
+                    assert_eq!(
+                        other, "warn_ack_required",
+                        "unexpected readiness class in contract"
+                    );
+                }
+            }
+
+            let domain = entry["domain"]
+                .as_str()
+                .expect("preflight_check_ids[].domain must be a string");
+            match domain {
+                "tcc_capture" => {
+                    tcc_capture.insert(id.clone());
+                }
+                "backend_model" => {
+                    backend_model.insert(id.clone());
+                }
+                "runtime_preflight" => {
+                    runtime_preflight.insert(id.clone());
+                }
+                "backend_runtime" => {
+                    backend_runtime.insert(id.clone());
+                }
+                other => {
+                    assert!(
+                        false,
+                        "unexpected readiness domain in contract: {other}"
+                    );
+                }
+            }
+        }
+
+        assert_eq!(blocking, as_set(&PREFLIGHT_BLOCKING_CHECK_IDS));
+        assert_eq!(warn_ack, as_set(&PREFLIGHT_WARN_ACK_CHECK_IDS));
+        assert_eq!(tcc_capture, as_set(&PREFLIGHT_TCC_CAPTURE_CHECK_IDS));
+        assert_eq!(backend_model, as_set(&PREFLIGHT_BACKEND_MODEL_CHECK_IDS));
+        assert_eq!(
+            runtime_preflight,
+            as_set(&PREFLIGHT_RUNTIME_PREFLIGHT_CHECK_IDS)
+        );
+        assert_eq!(backend_runtime, as_set(&PREFLIGHT_BACKEND_RUNTIME_CHECK_IDS));
+
+        let diagnostic_entries = json["diagnostic_only_check_ids"]
+            .as_array()
+            .expect("diagnostic_only_check_ids must be an array");
+        let mut diagnostic_only = BTreeSet::new();
+        for entry in diagnostic_entries {
+            let id = entry["id"]
+                .as_str()
+                .expect("diagnostic_only_check_ids[].id must be a string")
+                .to_string();
+            let domain = entry["domain"]
+                .as_str()
+                .expect("diagnostic_only_check_ids[].domain must be a string");
+            assert_eq!(domain, "diagnostic_only");
+            diagnostic_only.insert(id);
+        }
+        assert_eq!(
+            diagnostic_only,
+            as_set(&MODEL_DOCTOR_DIAGNOSTIC_ONLY_CHECK_IDS)
+        );
+    }
+
+    #[test]
+    fn diagnostic_only_model_doctor_check_ids_do_not_overlap_live_gating_ids() {
+        let blocking = as_set(&PREFLIGHT_BLOCKING_CHECK_IDS);
+        let warn_ack = as_set(&PREFLIGHT_WARN_ACK_CHECK_IDS);
+        let diagnostic = as_set(&MODEL_DOCTOR_DIAGNOSTIC_ONLY_CHECK_IDS);
+
+        assert!(blocking.is_disjoint(&diagnostic));
+        assert!(warn_ack.is_disjoint(&diagnostic));
+    }
 }

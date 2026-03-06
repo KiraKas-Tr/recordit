@@ -35,6 +35,19 @@ Use these classes for all changes proposed after phase A:
 | `Additive-only` | Existing keys/values are frozen, but new sibling keys/rows/options may be added. | Add new optional fields, new optional flags, new docs. |
 | `Provisional/internal` | Useful today, but not the compatibility boundary for v1. | May refactor freely if frozen surfaces stay intact. |
 
+## SwiftUI↔Rust Readiness Boundary Contract
+
+Canonical readiness vocabulary is now tracked in:
+
+- `contracts/readiness-contract-ids.v1.json`
+- `docs/runtime-boundary-ownership-contract.md`
+
+Compatibility rule:
+
+- existing readiness IDs and their class semantics are `Frozen` within `v1`
+- adding new readiness IDs is `Additive-only` if existing IDs/classes keep their meaning
+- renaming/removing IDs or reclassifying existing IDs is breaking and requires a new versioned contract file
+
 ## Legacy CLI Contract
 
 Contract owner: `transcribe-live`

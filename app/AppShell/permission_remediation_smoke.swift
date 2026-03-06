@@ -74,13 +74,13 @@ private func runSmoke() {
     let failingPayload = encodeEnvelopeJSON(
         fixtureEnvelope(checks: [
             [
-                "id": "screen_capture_access",
+                "id": ReadinessContractID.screenCaptureAccess.rawValue,
                 "status": "FAIL",
                 "detail": "screen capture not authorized",
                 "remediation": "Grant Screen Recording in System Settings.",
             ],
             [
-                "id": "microphone_access",
+                "id": ReadinessContractID.microphoneAccess.rawValue,
                 "status": "PASS",
                 "detail": "microphone sample observed",
                 "remediation": "",
@@ -90,13 +90,13 @@ private func runSmoke() {
     let passingPayload = encodeEnvelopeJSON(
         fixtureEnvelope(checks: [
             [
-                "id": "screen_capture_access",
+                "id": ReadinessContractID.screenCaptureAccess.rawValue,
                 "status": "PASS",
                 "detail": "screen access granted",
                 "remediation": "",
             ],
             [
-                "id": "microphone_access",
+                "id": ReadinessContractID.microphoneAccess.rawValue,
                 "status": "PASS",
                 "detail": "microphone sample observed",
                 "remediation": "",
