@@ -82,6 +82,10 @@ Use this lightweight mapping:
 - Task completion note links to files changed and validation commands run.
 - ADRs link to the exact issue ids and benchmark artifacts used as authority.
 - Benchmark docs include timestamp and commit linkage.
+- Coverage/readiness summaries should follow
+  [`docs/bd-k993-coverage-claim-policy.md`](./bd-k993-coverage-claim-policy.md) so
+  terms like `simulation-covered`, `partial`, `real-environment verified`, and
+  stronger claims such as `fully verified` are used consistently.
 - Session handoff/checkpoint notes should use the evidence ledger in
   [`docs/session-end-hygiene-checklist.md`](./session-end-hygiene-checklist.md) so
   validation, artifact roots, residual risks, and follow-up issue ids are always linked

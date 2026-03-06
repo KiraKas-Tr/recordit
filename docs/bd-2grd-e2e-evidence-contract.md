@@ -24,8 +24,8 @@ Every new conforming lane should produce one evidence root with the following mi
   paths.env
   logs/
     <phase>.log
-    <phase>.stdout.log
-    <phase>.stderr.log
+    <phase>.stdout
+    <phase>.stderr
   artifacts/
     ... lane-specific retained files ...
 ```
@@ -137,6 +137,7 @@ Each `phases[]` entry in `evidence_contract.json` must include:
 - `stderr_relpath` — retained stderr log if split
 - `primary_artifact_relpath` — the main resulting file artifact for the phase when applicable
 - `extra_artifact_relpaths` — optional extra retained files / bundles
+- `result_bundle_relpath` — optional retained directory-style bundle, such as an `.xcresult`
 - `notes` — optional explanatory note for warns/skips, and required when `exit_classification=flake_retried`
 
 `ended_at_utc` must not be earlier than `started_at_utc`.
@@ -149,7 +150,7 @@ Each `phases[]` entry in `evidence_contract.json` must include:
 - `required=true` with `status=fail` means the lane-level `overall_status` must be `fail`.
 - `flake_retried` is allowed only when a retained log explains the retry, `notes` summarize the retry context, and the final `status` is not `skipped`.
 - All retained relative paths must resolve inside the evidence root; symlink escapes outside the root are invalid.
-- `primary_artifact_relpath` may be empty only for pure gating/check phases with no output artifact beyond logs. Directory-style bundles belong in `result_bundle_relpath` instead.
+- `primary_artifact_relpath` may be empty only for pure gating/check phases with no output artifact beyond logs. Directory-style bundles belong in `result_bundle_relpath`, which must resolve to a directory when present.
 
 ## Minimal status model
 
@@ -191,6 +192,7 @@ python3 scripts/validate_e2e_evidence_contract.py --root tests/e2e_evidence_cont
 python3 scripts/validate_e2e_evidence_contract.py --root tests/e2e_evidence_contract/fixtures/recordit-e2e-evidence-minimal-skipped --expect-lane-type shell-e2e
 python3 scripts/validate_e2e_evidence_contract.py --root tests/e2e_evidence_contract/fixtures/recordit-e2e-evidence-xctest-multiphase-pass --expect-lane-type xctest-evidence
 python3 scripts/validate_e2e_evidence_contract.py --root tests/e2e_evidence_contract/fixtures/recordit-e2e-evidence-xcuitest-multiphase-pass --expect-lane-type xcuitest-evidence
+python3 scripts/validate_e2e_evidence_contract.py --root tests/e2e_evidence_contract/fixtures/recordit-e2e-evidence-hybrid-multiphase-pass --expect-lane-type hybrid-e2e
 ```
 
 The validator enforces:

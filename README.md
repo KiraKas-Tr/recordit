@@ -40,7 +40,8 @@ Sequoia Capture is a macOS 15+ Rust project that records:
 - `docs/bd-1msp-packaged-gate-retarget.md`: packaged gate retarget evidence for Recordit-default launch semantics + runtime compatibility checks
 - `docs/bd-yu7n-recordit-signing-notary-paths.md`: signing/notarization/gatekeeper path retarget evidence for `Recordit.app`
 - `docs/bd-14y4-sequoiatranscribe-fallback-policy.md`: strict non-default fallback policy for legacy `SequoiaTranscribe` usage
-- `docs/beads-governance.md`: issue decomposition and traceability governance
+- `docs/bd-k993-coverage-claim-policy.md`: canonical terminology policy for truthful coverage/readiness claims
+- `docs/beads-governance.md`: issue decomposition, traceability governance, and evidence-linking workflow
 
 ## Commands
 

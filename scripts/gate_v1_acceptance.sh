@@ -109,6 +109,15 @@ if [[ ! -f "$FIXTURE" ]]; then
   exit 2
 fi
 
+case "$RECORDIT_HANDOFF_INJECT_FAILURE" in
+  ""|artifact_compare_manifest|artifact_compare_recordit|artifact_compare_capture|artifact_compare_model|manifest_parity_recordit|runtime_prepare_missing_manifest|runtime_prepare_missing_handoff_env)
+    ;;
+  *)
+    echo "error: unsupported RECORDIT_HANDOFF_INJECT_FAILURE value: $RECORDIT_HANDOFF_INJECT_FAILURE" >&2
+    exit 2
+    ;;
+esac
+
 LOG_DIR="$OUT_DIR/logs"
 SUMMARY_JSON="$OUT_DIR/summary.json"
 STATUS_JSON="$OUT_DIR/status.json"
@@ -161,15 +170,6 @@ fi
 if [[ -f "$PREBUILT_RUNTIME_HANDOFF_ENV" ]]; then
   PREBUILT_RUNTIME_HANDOFF_ENV_PRESENT=1
 fi
-
-case "$RECORDIT_HANDOFF_INJECT_FAILURE" in
-  ""|artifact_compare_manifest|artifact_compare_recordit|artifact_compare_capture|artifact_compare_model|manifest_parity_recordit|runtime_prepare_missing_manifest|runtime_prepare_missing_handoff_env)
-    ;;
-  *)
-    echo "error: unsupported RECORDIT_HANDOFF_INJECT_FAILURE value: $RECORDIT_HANDOFF_INJECT_FAILURE" >&2
-    exit 2
-    ;;
-esac
 
 if [[ "$RECORDIT_HANDOFF_INJECT_FAILURE" == "runtime_prepare_missing_manifest" ]]; then
   rm -f "$PREBUILT_RUNTIME_MANIFEST"

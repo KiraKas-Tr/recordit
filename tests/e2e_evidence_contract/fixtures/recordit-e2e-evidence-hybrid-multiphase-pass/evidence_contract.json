@@ -1,0 +1,54 @@
+{
+  "contract_name": "recordit-e2e-evidence",
+  "contract_version": "1",
+  "scenario_id": "recordit-hybrid-smoke",
+  "lane_type": "hybrid-e2e",
+  "generated_at_utc": "2026-03-06T12:35:00Z",
+  "artifact_root_relpath": "artifacts",
+  "overall_status": "pass",
+  "paths_env_relpath": "paths.env",
+  "status_txt_relpath": "status.txt",
+  "summary_csv_relpath": "summary.csv",
+  "summary_json_relpath": "summary.json",
+  "phases": [
+    {
+      "phase_id": "prepare_runtime",
+      "title": "Prepare runtime inputs",
+      "required": true,
+      "status": "pass",
+      "exit_classification": "success",
+      "started_at_utc": "2026-03-06T12:30:00Z",
+      "ended_at_utc": "2026-03-06T12:32:00Z",
+      "command_display": "scripts/prepare_recordit_runtime_inputs.sh",
+      "command_argv": [
+        "scripts/prepare_recordit_runtime_inputs.sh"
+      ],
+      "log_relpath": "logs/prepare_runtime.log",
+      "stdout_relpath": "logs/prepare_runtime.stdout",
+      "stderr_relpath": "logs/prepare_runtime.stderr",
+      "primary_artifact_relpath": "artifacts/runtime-inputs.txt"
+    },
+    {
+      "phase_id": "verify_app_state",
+      "title": "Verify packaged app state",
+      "required": true,
+      "status": "pass",
+      "exit_classification": "success",
+      "started_at_utc": "2026-03-06T12:32:05Z",
+      "ended_at_utc": "2026-03-06T12:34:30Z",
+      "command_display": "scripts/gate_packaged_live_smoke.sh --hybrid-check",
+      "command_argv": [
+        "scripts/gate_packaged_live_smoke.sh",
+        "--hybrid-check"
+      ],
+      "log_relpath": "logs/verify_app_state.log",
+      "stdout_relpath": "logs/verify_app_state.stdout",
+      "stderr_relpath": "logs/verify_app_state.stderr",
+      "primary_artifact_relpath": "artifacts/hybrid-summary.txt",
+      "extra_artifact_relpaths": [
+        "artifacts/hybrid-report.json"
+      ],
+      "result_bundle_relpath": "bundles/HybridEvidenceBundle"
+    }
+  ]
+}

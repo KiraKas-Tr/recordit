@@ -127,3 +127,21 @@ output_path.parent.mkdir(parents=True, exist_ok=True)
 output_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 PY
 }
+
+evidence_render_contract() {
+  local evidence_root="$1"
+  local scenario_id="$2"
+  local lane_type="$3"
+  local phase_manifest="$4"
+  shift 4
+
+  local lib_dir
+  lib_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+  python3 "$lib_dir/render_shell_e2e_evidence_contract.py" \
+    --root "$evidence_root" \
+    --scenario-id "$scenario_id" \
+    --lane-type "$lane_type" \
+    --phase-manifest "$phase_manifest" \
+    "$@"
+}

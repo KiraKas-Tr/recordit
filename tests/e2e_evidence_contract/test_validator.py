@@ -221,6 +221,16 @@ class E2EEvidenceContractValidatorTests(unittest.TestCase):
         self.assertEqual(payload["phase_count"], 2)
         self.assertEqual(payload["overall_status"], "pass")
 
+    def test_multiphase_hybrid_example_fixture_passes_validator(self) -> None:
+        root = PROJECT_ROOT / "tests" / "e2e_evidence_contract" / "fixtures" / "recordit-e2e-evidence-hybrid-multiphase-pass"
+        result = self.run_validator(root, "--expect-lane-type", "hybrid-e2e")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["scenario_id"], "recordit-hybrid-smoke")
+        self.assertEqual(payload["phase_count"], 2)
+        self.assertEqual(payload["overall_status"], "pass")
+
     def test_valid_minimal_packaged_evidence_root_passes(self) -> None:
         root = self.make_evidence_root()
         result = self.run_validator(root, "--expect-lane-type", "packaged-e2e")
@@ -651,6 +661,20 @@ class E2EEvidenceContractValidatorTests(unittest.TestCase):
         payload = json.loads(result.stdout)
         self.assertFalse(payload["ok"])
         self.assertIn("artifact_root_relpath must stay within the evidence root", payload["error"])
+
+
+    def test_result_bundle_relpath_must_resolve_to_directory(self) -> None:
+        root = self.make_evidence_root(scenario_id="result-bundle-file")
+        manifest_path = root / "evidence_contract.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["phases"][0]["result_bundle_relpath"] = "artifacts/launch.txt"
+        manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+
+        result = self.run_validator(root)
+        self.assertEqual(result.returncode, 1)
+        payload = json.loads(result.stdout)
+        self.assertFalse(payload["ok"])
+        self.assertIn("result_bundle_relpath must resolve to a directory", payload["error"])
 
 
 if __name__ == "__main__":
