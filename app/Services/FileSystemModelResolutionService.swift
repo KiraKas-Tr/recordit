@@ -46,7 +46,7 @@ public struct FileSystemModelResolutionService: ModelResolutionService {
             throw AppServiceError(
                 code: .invalidInput,
                 userMessage: "Model backend is not supported.",
-                remediation: "Use `whispercpp` or `whisperkit` in v1 model setup.",
+                remediation: "Use `whispercpp` in the standard v1 setup path. WhisperKit remains an advanced/manual option.",
                 debugDetail: "backend=\(raw)"
             )
         }

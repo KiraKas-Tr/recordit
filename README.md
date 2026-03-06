@@ -463,8 +463,8 @@ cargo run --bin transcribe-live -- [--asr-model <local-model-path>] [flags...]
   - for representative modes, materialized according to the mode-specific input/output semantics described in the manifest
   - runtime manifest records `out_wav_materialized` and `out_wav_bytes` so artifact truth does not depend on reading the filesystem out-of-band
 - backend values:
-  - `whispercpp` (primary)
-  - `whisperkit` (fallback)
+  - `whispercpp` (primary and the only standard v1 setup path for `Recordit.app`)
+  - `whisperkit` (advanced/manual compatibility path until packaged parity exists)
   - `moonshine` (placeholder; adapter not wired yet)
 - model resolution precedence:
   - `--asr-model <path>` (explicit override, highest priority)

@@ -66,16 +66,16 @@ public final class ModelSetupViewModel {
         BackendOption(
             id: "whisperkit",
             displayName: "WhisperKit",
-            isSelectable: true,
+            isSelectable: false,
             requiredModelPathKind: .directory,
-            remediation: "Use a model folder path for WhisperKit."
+            remediation: "WhisperKit remains an advanced/manual path until packaged parity exists. Use Whisper.cpp in standard setup."
         ),
         BackendOption(
             id: "moonshine",
             displayName: "Moonshine",
             isSelectable: false,
             requiredModelPathKind: .directory,
-            remediation: "Moonshine is not available in this app setup yet. Choose Whisper.cpp or WhisperKit."
+            remediation: "Moonshine is not available in this app setup yet. Use Whisper.cpp in standard setup."
         ),
     ]
 
@@ -155,7 +155,7 @@ public final class ModelSetupViewModel {
                 AppServiceError(
                     code: .invalidInput,
                     userMessage: "This transcription backend is not supported in setup.",
-                    remediation: "Choose Whisper.cpp or WhisperKit.",
+                    remediation: "Choose Whisper.cpp in standard setup. WhisperKit remains an advanced/manual path.",
                     debugDetail: "backend=\(backend)"
                 )
             )
@@ -222,7 +222,7 @@ public final class ModelSetupViewModel {
             throw AppServiceError(
                 code: .invalidInput,
                 userMessage: "This transcription backend is not supported in setup.",
-                remediation: "Choose Whisper.cpp or WhisperKit.",
+                remediation: "Choose Whisper.cpp in standard setup. WhisperKit remains an advanced/manual path.",
                 debugDetail: "backend=\(backend)"
             )
         }

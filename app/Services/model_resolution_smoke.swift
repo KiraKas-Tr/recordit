@@ -96,15 +96,14 @@ private func runSmoke() {
     check(viewModel.diagnostics?.asrModelChecksumStatus == "available", "diagnostics should surface checksum status")
 
     viewModel.chooseBackend("whisperkit")
-    check(!viewModel.canStartLiveTranscribe, "invalid backend/path combination should block live transcribe")
+    check(viewModel.selectedBackend == "whispercpp", "advanced/manual backend should not replace selected backend")
+    check(!viewModel.canStartLiveTranscribe, "advanced/manual backend should not be startable from standard setup")
     if case let .invalid(error) = viewModel.state {
-        check(error.code == .invalidInput, "invalid backend/path should report invalidInput")
-        check(
-            error.userMessage.contains("model folder"),
-            "invalid backend/path should include plain-language folder guidance"
-        )
+        check(error.code == .invalidInput, "advanced/manual backend should report invalidInput")
+        check(error.userMessage.contains("not available"), "advanced/manual backend should use plain-language unavailability copy")
+        check(error.remediation.contains("advanced/manual"), "advanced/manual backend should explain the narrowed v1 path")
     } else {
-        check(false, "view model should be invalid for incompatible backend/path")
+        check(false, "advanced/manual backend should produce invalid state")
     }
 
     let originalBackend = viewModel.selectedBackend
@@ -120,7 +119,7 @@ private func runSmoke() {
 
     let selectableBackends = Set(ModelSetupViewModel.selectableBackends)
     check(selectableBackends.contains("whispercpp"), "whispercpp should remain selectable")
-    check(selectableBackends.contains("whisperkit"), "whisperkit should remain selectable")
+    check(!selectableBackends.contains("whisperkit"), "whisperkit should stay out of the standard selectable setup list")
     check(!selectableBackends.contains("moonshine"), "unsupported backends should not be selectable")
 }
 
