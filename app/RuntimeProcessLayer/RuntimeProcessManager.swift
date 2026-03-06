@@ -546,7 +546,8 @@ public actor RuntimeProcessManager {
             return nil
         }
 
-        let classification = classifyTermination(process: process, timedOut: false)
+        let rawClassification = classifyTermination(process: process, timedOut: false)
+        let classification = normalizeRequestedTermination(rawClassification, action: action)
         closeLogHandles(stdoutHandle: managed.stdoutHandle, stderrHandle: managed.stderrHandle)
         managedProcesses.removeValue(forKey: processIdentifier)
         return RuntimeProcessControlOutcome(

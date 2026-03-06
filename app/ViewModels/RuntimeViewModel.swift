@@ -243,16 +243,17 @@ public final class RuntimeViewModel {
             }
             await finalizeStopBounded()
         } catch let serviceError as AppServiceError {
+            let recoveryActions = stopFailureRecoveryActions(for: serviceError)
+            if !recoveryActions.contains(.retryStop) {
+                activeLiveProcessID = nil
+            }
             _ = transitionToFailure(
                 serviceError,
                 allowedFrom: [.stopping],
                 action: "stopCurrentRun",
                 invalidUserMessage: "Runtime state changed unexpectedly while handling stop failure.",
                 invalidRemediation: "Refresh runtime state and retry control action.",
-                recoveryActions: interruptionRecoveryActions(
-                    for: serviceError,
-                    fallback: [.retryStop, .openSessionArtifacts]
-                )
+                recoveryActions: recoveryActions
             )
         } catch {
             _ = transitionToFailure(
@@ -366,16 +367,17 @@ public final class RuntimeViewModel {
             }
             await finalizeStopBounded()
         } catch let serviceError as AppServiceError {
+            let recoveryActions = stopFailureRecoveryActions(for: serviceError)
+            if !recoveryActions.contains(.retryStop) {
+                activeLiveProcessID = nil
+            }
             _ = transitionToFailure(
                 serviceError,
                 allowedFrom: [.stopping],
                 action: "retryStopAfterFailure",
                 invalidUserMessage: "Runtime state changed unexpectedly while retrying Stop.",
                 invalidRemediation: "Refresh runtime state and retry the control action again.",
-                recoveryActions: interruptionRecoveryActions(
-                    for: serviceError,
-                    fallback: [.retryStop, .openSessionArtifacts]
-                )
+                recoveryActions: recoveryActions
             )
         } catch {
             _ = transitionToFailure(
@@ -715,6 +717,17 @@ public final class RuntimeViewModel {
         case .unknown:
             return [.startNewSession]
         }
+    }
+
+    private func stopFailureRecoveryActions(for error: AppServiceError) -> [RecoveryAction] {
+        let fallback: [RecoveryAction]
+        switch error.code {
+        case .timeout:
+            fallback = [.openSessionArtifacts]
+        default:
+            fallback = [.retryStop, .openSessionArtifacts]
+        }
+        return interruptionRecoveryActions(for: error, fallback: fallback)
     }
 
     private func interruptionRecoveryActions(

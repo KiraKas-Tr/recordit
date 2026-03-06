@@ -456,6 +456,79 @@ class E2EEvidenceContractValidatorTests(unittest.TestCase):
         self.assertFalse(payload["ok"])
         self.assertIn("skipped phases must include notes", payload["error"])
 
+    def test_skip_requested_exit_classification_requires_skipped_status(self) -> None:
+        root = self.make_evidence_root(
+            scenario_id="skip-requested-not-skipped",
+            overall_status="warn",
+            phases=[
+                {
+                    "phase_id": "optional_gate",
+                    "title": "Optional gate",
+                    "required": False,
+                    "status": "warn",
+                    "exit_classification": "skip_requested",
+                    "started_at_utc": "2026-03-06T12:00:00Z",
+                    "ended_at_utc": "2026-03-06T12:00:00Z",
+                    "command_display": "optional gate",
+                    "command_argv": ["gate"],
+                    "log_relpath": "logs/optional_gate.log",
+                    "stdout_relpath": "logs/optional_gate.stdout",
+                    "stderr_relpath": "logs/optional_gate.stderr",
+                    "primary_artifact_relpath": "",
+                    "notes": "caller requested skip but status was left as warn",
+                }
+            ],
+        )
+        result = self.run_validator(root)
+        self.assertEqual(result.returncode, 1)
+        payload = json.loads(result.stdout)
+        self.assertFalse(payload["ok"])
+        self.assertIn("exit_classification=skip_requested requires status=skipped", payload["error"])
+
+    def test_flake_retried_exit_classification_requires_notes(self) -> None:
+        root = self.make_evidence_root(
+            scenario_id="flake-retried-missing-notes",
+            overall_status="warn",
+            phases=[
+                {
+                    "phase_id": "retrying_probe",
+                    "title": "Retrying probe",
+                    "required": False,
+                    "status": "warn",
+                    "exit_classification": "flake_retried",
+                    "started_at_utc": "2026-03-06T12:00:00Z",
+                    "ended_at_utc": "2026-03-06T12:00:00Z",
+                    "command_display": "retrying probe",
+                    "command_argv": ["probe"],
+                    "log_relpath": "logs/retrying_probe.log",
+                    "stdout_relpath": "logs/retrying_probe.stdout",
+                    "stderr_relpath": "logs/retrying_probe.stderr",
+                    "primary_artifact_relpath": "",
+                }
+            ],
+        )
+        result = self.run_validator(root)
+        self.assertEqual(result.returncode, 1)
+        payload = json.loads(result.stdout)
+        self.assertFalse(payload["ok"])
+        self.assertIn("exit_classification=flake_retried requires notes", payload["error"])
+
+    def test_symlinked_log_path_cannot_escape_evidence_root(self) -> None:
+        root = self.make_evidence_root(scenario_id="symlink-log-escape")
+        external_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(external_dir.cleanup)
+        external_log = Path(external_dir.name) / "external.log"
+        external_log.write_text("outside evidence root\n", encoding="utf-8")
+        log_path = root / "logs" / "launch_app.log"
+        log_path.unlink()
+        log_path.symlink_to(external_log)
+
+        result = self.run_validator(root)
+        self.assertEqual(result.returncode, 1)
+        payload = json.loads(result.stdout)
+        self.assertFalse(payload["ok"])
+        self.assertIn("must stay within the evidence root", payload["error"])
+
 
 if __name__ == "__main__":
     unittest.main()

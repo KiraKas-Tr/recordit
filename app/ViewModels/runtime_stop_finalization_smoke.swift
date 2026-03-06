@@ -46,6 +46,24 @@ private actor CrashOnStopRuntimeService: RuntimeService {
     }
 }
 
+private actor TimeoutStopRuntimeService: RuntimeService {
+    func startSession(request: RuntimeStartRequest) async throws -> RuntimeLaunchResult {
+        RuntimeLaunchResult(
+            processIdentifier: 6200,
+            sessionRoot: request.outputRoot,
+            startedAt: Date()
+        )
+    }
+
+    func controlSession(processIdentifier _: Int32, action _: RuntimeControlAction) async throws -> RuntimeControlResult {
+        throw AppServiceError(
+            code: .timeout,
+            userMessage: "Runtime did not stop in time.",
+            remediation: "Retry stop, then use Cancel if needed."
+        )
+    }
+}
+
 private actor FlakyStopRuntimeService: RuntimeService {
     private(set) var stopAttempts = 0
 
@@ -250,6 +268,32 @@ private func runSmoke() async {
     retryFinalizeManifestService.setManifest(makeManifest(status: "ok"))
     retryFinalizeRecovery.retryFinalizeAfterFailure()
     check(retryFinalizeRecovery.state == .completed, "retry finalize should reload the manifest and complete")
+
+    let timeoutStopRuntime = TimeoutStopRuntimeService()
+    let timeoutStopRecovery = RuntimeViewModel(
+        runtimeService: timeoutStopRuntime,
+        manifestService: FailedManifestService(manifest: makeManifest(status: "ok")),
+        modelService: model,
+        finalizationTimeoutSeconds: 1,
+        finalizationPollIntervalNanoseconds: 10_000_000
+    )
+    let timeoutStopRoot = tempRoot.appendingPathComponent("timeout-stop", isDirectory: true)
+    try? FileManager.default.createDirectory(at: timeoutStopRoot, withIntermediateDirectories: true)
+    try? "partial transcript".write(to: timeoutStopRoot.appendingPathComponent("session.jsonl"), atomically: true, encoding: .utf8)
+    await timeoutStopRecovery.startLive(outputRoot: timeoutStopRoot, explicitModelPath: nil)
+    await timeoutStopRecovery.stopCurrentRun()
+    guard case let .failed(timeoutStopError) = timeoutStopRecovery.state else {
+        check(false, "timed-out stop should enter failed state")
+        return
+    }
+    check(timeoutStopError.code == .timeout, "timed-out stop should preserve timeout error code")
+    check(!timeoutStopRecovery.suggestedRecoveryActions.contains(.retryStop), "timed-out stop should not advertise retry stop after the process is gone")
+    await timeoutStopRecovery.retryStopAfterFailure()
+    guard let rejectedRetryStop = timeoutStopRecovery.lastRejectedActionError else {
+        check(false, "retry stop should reject when no active process remains after timeout")
+        return
+    }
+    check(rejectedRetryStop.code == .invalidInput, "retry stop rejection should surface invalidInput once process is cleared")
 
     let retryStopManifestService = MutableManifestService()
     let retryStopRuntime = FlakyStopRuntimeService()

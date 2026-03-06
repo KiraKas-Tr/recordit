@@ -156,10 +156,15 @@ def require_relpath(
     ensure(is_relative_safe(relpath), f"{field} must be a safe relative path: {relpath}")
     resolved = root / relpath
     ensure(resolved.exists(), f"{field} path does not exist: {relpath}")
+    try:
+        canonical = resolved.resolve(strict=True)
+    except OSError as exc:
+        raise ValidationError(f"unable to resolve {field} path {relpath}: {exc}") from exc
+    ensure(canonical.is_relative_to(root), f"{field} must stay within the evidence root: {relpath}")
     if path_kind == "file":
-        ensure(resolved.is_file(), f"{field} must resolve to a file: {relpath}")
+        ensure(canonical.is_file(), f"{field} must resolve to a file: {relpath}")
     elif path_kind == "dir":
-        ensure(resolved.is_dir(), f"{field} must resolve to a directory: {relpath}")
+        ensure(canonical.is_dir(), f"{field} must resolve to a directory: {relpath}")
     return resolved
 
 
@@ -247,6 +252,11 @@ def validate_manifest(root: Path, manifest: dict[str, Any], expect_lane_type: st
         if phase["status"] == "skipped":
             ensure(phase["exit_classification"] == "skip_requested", f"phase[{idx}] skipped phases must use exit_classification=skip_requested")
             ensure(isinstance(notes, str) and notes, f"phase[{idx}] skipped phases must include notes")
+        if phase["exit_classification"] == "skip_requested":
+            ensure(phase["status"] == "skipped", f"phase[{idx}] exit_classification=skip_requested requires status=skipped")
+        if phase["exit_classification"] == "flake_retried":
+            ensure(phase["status"] != "skipped", f"phase[{idx}] exit_classification=flake_retried is invalid for skipped phases")
+            ensure(isinstance(notes, str) and notes, f"phase[{idx}] exit_classification=flake_retried requires notes")
         if phase["required"] and phase["status"] == "fail":
             fail_required = True
 

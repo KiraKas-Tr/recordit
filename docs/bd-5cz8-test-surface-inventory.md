@@ -14,6 +14,7 @@ This catalog is intentionally broader than `docs/bd-39i6-critical-surface-covera
 - scanned Python verification tests under `tests/**/test_*.py`
 - scanned primary shell/Python verification harnesses under `scripts/`
 - classified realism conservatively from explicit markers such as `Mock*`, `Stub*`, `fixture`, `RECORDIT_UI_TEST_MODE`, `RECORDIT_FAKE_CAPTURE_FIXTURE`, temp-directory setup, and packaged-app/signing operations
+- when a harness was obviously seam-bound by category/role even without an inline marker token, emitted a conservative fallback seam reason so downstream census work would not undercount it
 ## Snapshot
 - total inventoried surfaces: **86**
 - primary surfaces: **85**

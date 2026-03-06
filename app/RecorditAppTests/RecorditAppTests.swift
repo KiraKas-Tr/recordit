@@ -150,7 +150,10 @@ final class RecorditAppTests: XCTestCase {
     }
 
     @MainActor
-    private func makePreflightViewModel(payload: Data) -> PreflightViewModel {
+    private func makePreflightViewModel(
+        payload: Data,
+        nativePermissionStatus: ((RemediablePermission) -> Bool)? = nil
+    ) -> PreflightViewModel {
         PreflightViewModel(
             runner: RecorditPreflightRunner(
                 executable: "/usr/bin/env",
@@ -158,7 +161,8 @@ final class RecorditAppTests: XCTestCase {
                 parser: PreflightEnvelopeParser(),
                 environment: [:]
             ),
-            gatingPolicy: PreflightGatingPolicy()
+            gatingPolicy: PreflightGatingPolicy(),
+            nativePermissionStatus: nativePermissionStatus
         )
     }
 
@@ -456,6 +460,37 @@ final class RecorditAppTests: XCTestCase {
             failedMetrics: report.violations.map { $0.metric.rawValue }.joined(separator: ",")
         )
         try persistResponsivenessGateSnapshotIfRequested(snapshot)
+    }
+
+    @MainActor
+    func testPreflightUITestNormalizationDoesNotHideActiveDisplayFailures() {
+        setenv("RECORDIT_UI_TEST_MODE", "1", 1)
+        defer { unsetenv("RECORDIT_UI_TEST_MODE") }
+
+        let payload = preflightPayloadData(checks: [
+            ["id": ReadinessContractID.modelPath.rawValue, "status": "PASS", "detail": "model ready", "remediation": ""],
+            ["id": ReadinessContractID.outWav.rawValue, "status": "PASS", "detail": "wav ready", "remediation": ""],
+            ["id": ReadinessContractID.outJsonl.rawValue, "status": "PASS", "detail": "jsonl ready", "remediation": ""],
+            ["id": ReadinessContractID.outManifest.rawValue, "status": "PASS", "detail": "manifest ready", "remediation": ""],
+            ["id": ReadinessContractID.screenCaptureAccess.rawValue, "status": "PASS", "detail": "screen permission granted", "remediation": ""],
+            ["id": ReadinessContractID.displayAvailability.rawValue, "status": "FAIL", "detail": "no active display available", "remediation": "Wake a display and retry."],
+            ["id": ReadinessContractID.microphoneAccess.rawValue, "status": "PASS", "detail": "microphone granted", "remediation": ""],
+        ])
+        let viewModel = makePreflightViewModel(
+            payload: payload,
+            nativePermissionStatus: { _ in true }
+        )
+
+        viewModel.runLivePreflight()
+
+        guard case let .completed(envelope) = viewModel.state else {
+            XCTFail("Expected preflight to complete")
+            return
+        }
+        let displayCheck = envelope.checks.first(where: { $0.id == ReadinessContractID.displayAvailability.rawValue })
+        XCTAssertEqual(displayCheck?.status, .fail)
+        XCTAssertEqual(viewModel.primaryBlockingDomain, .tccCapture)
+        XCTAssertFalse(viewModel.canProceedToLiveTranscribe)
     }
 
     @MainActor

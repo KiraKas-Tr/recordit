@@ -8,16 +8,16 @@ Turn the raw test-surface inventory into two things downstream work can actually
 1. a **seam census** showing where mocks, fixtures, fake capture, UI-test-mode, preview DI, temp filesystems, and packaged-only checks currently appear
 2. an **allowed-use policy** that says what those seams can legitimately support, and what they cannot be used to justify in coverage claims
 ## Census Snapshot
-- inventoried surfaces with at least one explicit seam marker: **63**
-- total seam annotations across those surfaces: **106**
+- inventoried surfaces with at least one explicit seam marker: **72**
+- total seam annotations across those surfaces: **115**
 - `mock` rows: **7** across **7** surfaces
 - `stub` rows: **13** across **13** surfaces
-- `fixture` rows: **48** across **48** surfaces
+- `fixture` rows: **52** across **52** surfaces
 - `fake_capture` rows: **8** across **8** surfaces
 - `ui_test_mode` rows: **2** across **2** surfaces
 - `scripted_runtime` rows: **1** across **1** surfaces
 - `preview_di` rows: **2** across **2** surfaces
-- `temp_filesystem` rows: **17** across **17** surfaces
+- `temp_filesystem` rows: **22** across **22** surfaces
 - `runtime_override` rows: **3** across **3** surfaces
 - `packaged_checks` rows: **5** across **5** surfaces
 ## Allowed-Use Policy

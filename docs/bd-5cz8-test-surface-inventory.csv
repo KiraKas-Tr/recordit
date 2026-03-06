@@ -40,7 +40,7 @@ tests/runtime_mode_matrix_contract.rs,primary,rust-tests,integration,tests,sessi
 tests/transcribe_live_failed_status_contract.rs,primary,rust-tests,integration,tests,rust-transcribe-live,fixture,2,fixture/replay/sample-driven inputs,failed-status emission contract for transcribe_live
 tests/transcribe_live_legacy_entrypoints_compat.rs,primary,rust-tests,integration,tests,rust-transcribe-live,fixture,4,fixture/replay/sample-driven inputs,legacy transcribe_live entrypoint compatibility
 tests/transcribe_live_migration_message.rs,primary,rust-tests,integration,tests,rust-transcribe-live,live-real,1,none detected,migration message/legacy guidance contract
-app/Accessibility/accessibility_smoke.swift,primary,swift-smoke,smoke,app/Accessibility,swiftui-app,temp-filesystem,1,none detected,accessibility
+app/Accessibility/accessibility_smoke.swift,primary,swift-smoke,smoke,app/Accessibility,swiftui-app,temp-filesystem,1,temp filesystem/process setup,accessibility
 app/AppShell/app_environment_smoke.swift,primary,swift-smoke,smoke,app/AppShell,swiftui-app,mock,1,stub/static injected dependencies; fixture/replay/sample-driven inputs; preview dependency injection; temp filesystem/process setup,app environment
 app/AppShell/onboarding_completion_smoke.swift,primary,swift-smoke,smoke,app/AppShell,swiftui-app,mock,1,stub/static injected dependencies; fixture/replay/sample-driven inputs,onboarding completion
 app/AppShell/permission_remediation_smoke.swift,primary,swift-smoke,smoke,app/AppShell,swiftui-app,fixture,1,fixture/replay/sample-driven inputs,permission remediation
@@ -48,13 +48,13 @@ app/Exports/export_smoke.swift,primary,swift-smoke,smoke,app/Exports,swiftui-app
 app/Exports/session_export_view_model_smoke.swift,primary,swift-smoke,smoke,app/Exports,swiftui-app,fixture,1,fixture/replay/sample-driven inputs,session export view model
 app/Integration/process_lifecycle_integration_smoke.swift,primary,swift-smoke,smoke,app/Integration,runtime-process-lifecycle,mock,1,stub/static injected dependencies; temp filesystem/process setup,process lifecycle
 app/Integration/process_lifecycle_soak_smoke.swift,primary,swift-smoke,smoke,app/Integration,runtime-process-lifecycle,mock,1,stub/static injected dependencies; temp filesystem/process setup,process lifecycle soak
-app/Navigation/navigation_smoke.swift,primary,swift-smoke,smoke,app/Navigation,swiftui-app,temp-filesystem,1,none detected,navigation
-app/Performance/responsiveness_budget_smoke.swift,primary,swift-smoke,smoke,app/Performance,swiftui-app,temp-filesystem,1,none detected,responsiveness budget
+app/Navigation/navigation_smoke.swift,primary,swift-smoke,smoke,app/Navigation,swiftui-app,temp-filesystem,1,temp filesystem/process setup,navigation
+app/Performance/responsiveness_budget_smoke.swift,primary,swift-smoke,smoke,app/Performance,swiftui-app,temp-filesystem,1,temp filesystem/process setup,responsiveness budget
 app/Preflight/preflight_gating_smoke.swift,primary,swift-smoke,smoke,app/Preflight,live-preflight,mock,1,stub/static injected dependencies; fixture/replay/sample-driven inputs,preflight gating
 app/Preflight/preflight_smoke.swift,primary,swift-smoke,smoke,app/Preflight,live-preflight,mock,1,stub/static injected dependencies; fixture/replay/sample-driven inputs,preflight
 app/RuntimeProcessLayer/process_lifecycle_integration_smoke.swift,primary,swift-smoke,smoke,app/RuntimeProcessLayer,runtime-process-lifecycle,mock,1,stub/static injected dependencies; temp filesystem/process setup,process lifecycle
 app/RuntimeProcessLayer/runtime_binary_readiness_smoke.swift,primary,swift-smoke,smoke,app/RuntimeProcessLayer,runtime-process-lifecycle,mock,1,stub/static injected dependencies; fixture/replay/sample-driven inputs; temp filesystem/process setup,runtime binary readiness
-app/Services/jsonl_event_surface_smoke.swift,primary,swift-smoke,smoke,app/Services,session-services,temp-filesystem,1,none detected,jsonl event surface
+app/Services/jsonl_event_surface_smoke.swift,primary,swift-smoke,smoke,app/Services,session-services,temp-filesystem,1,temp filesystem/process setup,jsonl event surface
 app/Services/jsonl_tailer_smoke.swift,primary,swift-smoke,smoke,app/Services,session-services,fixture,1,fixture/replay/sample-driven inputs; temp filesystem/process setup,jsonl tailer
 app/Services/legacy_flat_migration_smoke.swift,primary,swift-smoke,smoke,app/Services,session-services,temp-filesystem,1,temp filesystem/process setup,legacy flat migration
 app/Services/model_resolution_smoke.swift,primary,swift-smoke,smoke,app/Services,session-services,fixture,1,fixture/replay/sample-driven inputs; temp filesystem/process setup,model resolution
@@ -63,7 +63,7 @@ app/Services/pending_transcribe_action_smoke.swift,primary,swift-smoke,smoke,app
 app/Services/pending_transition_smoke.swift,primary,swift-smoke,smoke,app/Services,session-services,temp-filesystem,1,temp filesystem/process setup,pending transition
 app/Services/session_search_index_smoke.swift,primary,swift-smoke,smoke,app/Services,session-services,temp-filesystem,1,temp filesystem/process setup,session search index
 app/Services/startup_migration_repair_smoke.swift,primary,swift-smoke,smoke,app/Services,session-services,mock,1,explicit Mock* service doubles; temp filesystem/process setup,startup migration repair
-app/Services/transcript_timeline_smoke.swift,primary,swift-smoke,smoke,app/Services,session-services,temp-filesystem,1,none detected,transcript timeline
+app/Services/transcript_timeline_smoke.swift,primary,swift-smoke,smoke,app/Services,session-services,temp-filesystem,1,temp filesystem/process setup,transcript timeline
 app/UIAutomation/ui_automation_smoke.swift,primary,swift-smoke,smoke,app/UIAutomation,swiftui-app-ui,mock,1,explicit Mock* service doubles; stub/static injected dependencies; fixture/replay/sample-driven inputs; scripted runtime/preflight behavior,ui automation
 app/ViewModels/runtime_state_machine_smoke.swift,primary,swift-smoke,smoke,app/ViewModels,swiftui-app,mock,1,stub/static injected dependencies; fixture/replay/sample-driven inputs,runtime state machine
 app/ViewModels/runtime_status_mapping_smoke.swift,primary,swift-smoke,smoke,app/ViewModels,swiftui-app,mock,1,explicit Mock* service doubles; stub/static injected dependencies; fixture/replay/sample-driven inputs,runtime status mapping
@@ -72,9 +72,9 @@ app/ViewModels/session_list_smoke.swift,primary,swift-smoke,smoke,app/ViewModels
 app/RecorditAppTests/RecorditAppTests.swift,primary,xctest,xctest,app/RecorditAppTests,swiftui-app,mock,18,RECORDIT_UI_TEST_MODE/UI-test-mode overrides; stub/static injected dependencies; fixture/replay/sample-driven inputs; preview dependency injection; temp filesystem/process setup,SwiftUI app/view-model XCTest coverage with injected services
 app/RecorditAppUITests/RecorditAppUITests.swift,primary,xcuitest,xcuitest,app/RecorditAppUITests,swiftui-app-ui,fixture,6,RECORDIT_UI_TEST_MODE/UI-test-mode overrides; runtime-path overrides or /usr/bin/true shims,XCUITest app journeys under RECORDIT_UI_TEST_MODE
 tests/e2e_evidence_contract/test_validator.py,primary,python-test,contract-test,tests/e2e_evidence_contract,evidence-contract,fixture,15,fixture/replay/sample-driven inputs; temp filesystem/process setup,e2e evidence contract validator behavior
-tests/test_gate_backlog_pressure_summary.py,primary,python-test,contract-test,tests,runtime-gate-harness,fixture,3,none detected,backlog-pressure summary parsing and thresholds
-tests/test_manifest_signal_extract.py,primary,python-test,contract-test,tests,session-services,fixture,7,none detected,manifest signal extraction summary behavior
-scripts/ci_contracts.sh,primary,shell-harness,scripted-e2e,scripts,session-services,fixture,1,none detected,Rust contract/schema suite runner
+tests/test_gate_backlog_pressure_summary.py,primary,python-test,contract-test,tests,runtime-gate-harness,fixture,3,fixture/replay/sample-driven inputs,backlog-pressure summary parsing and thresholds
+tests/test_manifest_signal_extract.py,primary,python-test,contract-test,tests,session-services,fixture,7,fixture/replay/sample-driven inputs,manifest signal extraction summary behavior
+scripts/ci_contracts.sh,primary,shell-harness,scripted-e2e,scripts,session-services,fixture,1,fixture/replay/sample-driven inputs,Rust contract/schema suite runner
 scripts/ci_recordit_xctest_evidence.sh,primary,shell-harness,release-script,scripts,xcodebuild-xctest-xcuitest,packaged-app,1,runtime-path overrides or /usr/bin/true shims; codesign/spctl/notary/hdiutil packaged-artifact checks,retained XCTest/XCUITest evidence capture harness
 scripts/gate_backlog_pressure.sh,primary,shell-harness,scripted-e2e,scripts,runtime-gate-harness,fixture,1,fixture/replay/sample-driven inputs; deterministic fake-capture env seam,deterministic backlog-pressure gate with retained logs
 scripts/gate_d_soak.sh,primary,shell-harness,scripted-e2e,scripts,runtime-gate-harness,fixture,1,fixture/replay/sample-driven inputs; deterministic fake-capture env seam,deterministic gate-D soak scenario with fixture-driven inputs
@@ -84,4 +84,4 @@ scripts/gate_v1_acceptance.sh,primary,shell-harness,release-script,scripts,packa
 scripts/verify_recordit_release_context.sh,primary,shell-harness,release-script,scripts,packaged-release-artifact,packaged-app,1,codesign/spctl/notary/hdiutil packaged-artifact checks,"release-context signing, payload, and parity verification"
 scripts/mixed_rate_regression.sh,primary,shell-harness,scripted-e2e,scripts,runtime-gate-harness,live-real,1,none detected,mixed-rate capture regression with telemetry artifacts
 scripts/create_recordit_dmg.sh,supporting-harness,shell-harness,release-script,scripts,packaged-release-artifact,packaged-app,1,codesign/spctl/notary/hdiutil packaged-artifact checks,DMG packaging artifact creation (release-support surface)
-scripts/validate_e2e_evidence_contract.py,primary,python-harness,contract-harness,scripts,evidence-contract,fixture,0,none detected,canonical e2e evidence-root validation harness
+scripts/validate_e2e_evidence_contract.py,primary,python-harness,contract-harness,scripts,evidence-contract,fixture,0,fixture/replay/sample-driven inputs,canonical e2e evidence-root validation harness

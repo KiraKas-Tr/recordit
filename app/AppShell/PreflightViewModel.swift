@@ -146,7 +146,7 @@ public final class PreflightViewModel {
         normalizedChecks.reserveCapacity(envelope.checks.count)
 
         for check in envelope.checks {
-            if ReadinessContract.screenPermissionIDs.contains(check.id),
+            if check.id == ReadinessContractID.screenCaptureAccess.rawValue,
                check.status == .fail,
                nativeScreenGranted {
                 normalizedChecks.append(

@@ -194,6 +194,25 @@ private func runSmoke() async throws {
         """
     )
 
+    let cancelPollNormalizationScript = binDir.appendingPathComponent("recordit-cancel-poll-normalization.sh")
+    try makeExecutableScript(
+        at: cancelPollNormalizationScript,
+        body: """
+        #!/bin/sh
+        out_root=""
+        while [ "$#" -gt 0 ]; do
+          case "$1" in
+            --output-root) out_root="$2"; shift 2 ;;
+            *) shift ;;
+          esac
+        done
+        [ -n "$out_root" ] && mkdir -p "$out_root"
+        : > "$out_root/cancel-poll.ready"
+        trap 'printf INT > "$out_root/stop-signal.txt"; exit 0' INT
+        while :; do :; done
+        """
+    )
+
     let interruptFallbackScript = binDir.appendingPathComponent("recordit-interrupt-fallback.sh")
     try makeExecutableScript(
         at: interruptFallbackScript,
@@ -317,6 +336,26 @@ private func runSmoke() async throws {
             action: .cancel
         )
         check(control.accepted, "record-only cancel should be accepted")
+    }
+
+    // Poll path should normalize already-terminated cancel sessions the same way as direct control.
+    do {
+        let service = makeRuntimeService(recorditPath: cancelPollNormalizationScript, sequoiaPath: captureScript, stopTimeoutSeconds: 0.4)
+        let outputRoot = tempRoot.appendingPathComponent("cancel-poll-normalization", isDirectory: true)
+        try FileManager.default.createDirectory(at: outputRoot, withIntermediateDirectories: true)
+        let launch = try await service.startSession(
+            request: RuntimeStartRequest(mode: .live, outputRoot: outputRoot)
+        )
+        let readyPath = outputRoot.appendingPathComponent("cancel-poll.ready")
+        await waitForFile(at: readyPath, timeoutSeconds: 2, message: "cancel normalization helper should signal readiness before external TERM")
+        check(kill(launch.processIdentifier, SIGTERM) == 0, "external TERM should be delivered to cancel normalization helper")
+        let deadline = Date().addingTimeInterval(2)
+        while kill(launch.processIdentifier, 0) == 0 && Date() < deadline {
+            try? await Task.sleep(nanoseconds: 50_000_000)
+        }
+        check(kill(launch.processIdentifier, 0) != 0, "cancel normalization helper should exit after external TERM")
+        let control = try await service.controlSession(processIdentifier: launch.processIdentifier, action: .cancel)
+        check(control.accepted, "cancel should accept an already-terminated SIGTERM session via the poll path")
     }
 
     // Launch should clear stale graceful-stop markers before runtime starts.

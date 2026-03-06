@@ -145,8 +145,10 @@ Each `phases[]` entry in `evidence_contract.json` must include:
 
 - `status=warn` means the phase produced usable evidence but did not fully satisfy the target expectation.
 - `status=skipped` requires `exit_classification=skip_requested` and a non-empty `notes` field.
+- `exit_classification=skip_requested` is valid only when `status=skipped`.
 - `required=true` with `status=fail` means the lane-level `overall_status` must be `fail`.
-- `flake_retried` is allowed only when a retained log explains the retry and the final `status` is not `skipped`.
+- `flake_retried` is allowed only when a retained log explains the retry, `notes` summarize the retry context, and the final `status` is not `skipped`.
+- All retained relative paths must resolve inside the evidence root; symlink escapes outside the root are invalid.
 - `primary_artifact_relpath` may be empty only for pure gating/check phases with no output artifact beyond logs. Directory-style bundles belong in `result_bundle_relpath` instead.
 
 ## Minimal status model

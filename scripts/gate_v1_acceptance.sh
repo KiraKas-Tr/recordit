@@ -7,10 +7,19 @@ source "$ROOT/scripts/e2e_evidence_lib.sh"
 MODEL="${MODEL:-$ROOT/artifacts/bench/models/whispercpp/ggml-tiny.en.bin}"
 FIXTURE="${FIXTURE:-$ROOT/artifacts/bench/corpus/gate_c/tts_phrase_stereo.wav}"
 OUT_DIR="${OUT_DIR:-}"
+RECORDIT_BUNDLE_CONFIGURATION="${RECORDIT_XCODE_CONFIGURATION:-Release}"
 DURATION_SEC="${DURATION_SEC:-3}"
 CHUNK_WINDOW_MS="${CHUNK_WINDOW_MS:-2000}"
 CHUNK_STRIDE_MS="${CHUNK_STRIDE_MS:-500}"
 CHUNK_QUEUE_CAP="${CHUNK_QUEUE_CAP:-4}"
+
+bool_text() {
+  if [[ "$1" -eq 1 ]]; then
+    printf 'true\n'
+  else
+    printf 'false\n'
+  fi
+}
 
 usage() {
   cat <<USAGE
@@ -102,8 +111,173 @@ METADATA_JSON="$OUT_DIR/metadata.json"
 BUILD_LOG="$LOG_DIR/build_transcribe_live.log"
 BACKLOG_STDOUT_LOG="$LOG_DIR/backlog_pressure.stdout.log"
 BACKLOG_STDERR_LOG="$LOG_DIR/backlog_pressure.stderr.log"
+PREBUILT_RUNTIME_INPUT_DIR="$OUT_DIR/prebuilt_runtime_inputs"
+COPY_ONLY_EMBED_ROOT="$OUT_DIR/copy_only_embed_probe"
+COPY_ONLY_RUNTIME_ROOT="$COPY_ONLY_EMBED_ROOT/Contents/Resources/runtime"
+PREBUILT_RUNTIME_PREPARE_LOG="$LOG_DIR/prebuilt_runtime_prepare.log"
+PREBUILT_RUNTIME_HANDOFF_ENV="$PREBUILT_RUNTIME_INPUT_DIR/runtime_handoff.env"
+PREBUILT_RUNTIME_MANIFEST="$PREBUILT_RUNTIME_INPUT_DIR/runtime/artifact-manifest.json"
+COPY_ONLY_EMBED_LOG="$LOG_DIR/copy_only_embed.log"
+COPY_ONLY_EMBED_COMPARE_LOG="$LOG_DIR/copy_only_embed_compare.log"
+COPY_ONLY_EMBED_PARITY_LOG="$LOG_DIR/copy_only_embed_parity.log"
 
-mkdir -p "$OUT_DIR/cold" "$OUT_DIR/warm" "$LOG_DIR"
+mkdir -p "$OUT_DIR/cold" "$OUT_DIR/warm" "$LOG_DIR" "$PREBUILT_RUNTIME_INPUT_DIR"
+
+PREBUILT_RUNTIME_PREPARE_OK=0
+PREBUILT_RUNTIME_MANIFEST_PRESENT=0
+PREBUILT_RUNTIME_HANDOFF_ENV_PRESENT=0
+COPY_ONLY_EMBED_OK=0
+COPY_ONLY_EMBED_MANIFEST_MATCH=0
+COPY_ONLY_EMBED_RECORDIT_MATCH=0
+COPY_ONLY_EMBED_CAPTURE_MATCH=0
+COPY_ONLY_EMBED_MODEL_MATCH=0
+COPY_ONLY_EMBED_PARITY_OK=0
+HANDOFF_INTEGRATION_OK=0
+
+set +e
+(
+  cd "$ROOT"
+  env \
+    RECORDIT_RUNTIME_CONFIGURATION="$RECORDIT_BUNDLE_CONFIGURATION" \
+    RECORDIT_RUNTIME_INPUT_DIR="$PREBUILT_RUNTIME_INPUT_DIR" \
+    RECORDIT_DEFAULT_WHISPERCPP_MODEL="$MODEL" \
+    "$ROOT/scripts/prepare_recordit_runtime_inputs.sh"
+) >"$PREBUILT_RUNTIME_PREPARE_LOG" 2>&1
+PREBUILT_RUNTIME_PREPARE_EXIT_CODE=$?
+set -e
+if [[ "$PREBUILT_RUNTIME_PREPARE_EXIT_CODE" -eq 0 ]]; then
+  PREBUILT_RUNTIME_PREPARE_OK=1
+fi
+if [[ -f "$PREBUILT_RUNTIME_MANIFEST" ]]; then
+  PREBUILT_RUNTIME_MANIFEST_PRESENT=1
+fi
+if [[ -f "$PREBUILT_RUNTIME_HANDOFF_ENV" ]]; then
+  PREBUILT_RUNTIME_HANDOFF_ENV_PRESENT=1
+fi
+
+rm -rf "$COPY_ONLY_EMBED_ROOT"
+mkdir -p "$COPY_ONLY_EMBED_ROOT"
+set +e
+(
+  cd "$ROOT"
+  env \
+    RECORDIT_RUNTIME_INPUT_DIR="$PREBUILT_RUNTIME_INPUT_DIR" \
+    TARGET_BUILD_DIR="$COPY_ONLY_EMBED_ROOT" \
+    UNLOCALIZED_RESOURCES_FOLDER_PATH="Contents/Resources" \
+    CONFIGURATION="$RECORDIT_BUNDLE_CONFIGURATION" \
+    CARGO_BIN=/__bd_3jd2_copy_only_probe_should_not_use_cargo__ \
+    "$ROOT/scripts/embed_recordit_runtime_binaries.sh"
+) >"$COPY_ONLY_EMBED_LOG" 2>&1
+COPY_ONLY_EMBED_EXIT_CODE=$?
+set -e
+if [[ "$COPY_ONLY_EMBED_EXIT_CODE" -eq 0 ]]; then
+  COPY_ONLY_EMBED_OK=1
+fi
+
+: >"$COPY_ONLY_EMBED_COMPARE_LOG"
+: >"$COPY_ONLY_EMBED_PARITY_LOG"
+if [[ "$COPY_ONLY_EMBED_OK" -eq 1 ]]; then
+  if [[ -f "$PREBUILT_RUNTIME_MANIFEST" && -f "$COPY_ONLY_RUNTIME_ROOT/artifact-manifest.json" ]] && cmp -s "$PREBUILT_RUNTIME_MANIFEST" "$COPY_ONLY_RUNTIME_ROOT/artifact-manifest.json"; then
+    COPY_ONLY_EMBED_MANIFEST_MATCH=1
+    echo "manifest_copy_match=true" >>"$COPY_ONLY_EMBED_COMPARE_LOG"
+  else
+    echo "manifest_copy_match=false" >>"$COPY_ONLY_EMBED_COMPARE_LOG"
+  fi
+
+  if [[ -f "$PREBUILT_RUNTIME_INPUT_DIR/runtime/bin/recordit" && -f "$COPY_ONLY_RUNTIME_ROOT/bin/recordit" ]] && cmp -s "$PREBUILT_RUNTIME_INPUT_DIR/runtime/bin/recordit" "$COPY_ONLY_RUNTIME_ROOT/bin/recordit"; then
+    COPY_ONLY_EMBED_RECORDIT_MATCH=1
+    echo "recordit_copy_match=true" >>"$COPY_ONLY_EMBED_COMPARE_LOG"
+  else
+    echo "recordit_copy_match=false" >>"$COPY_ONLY_EMBED_COMPARE_LOG"
+  fi
+
+  if [[ -f "$PREBUILT_RUNTIME_INPUT_DIR/runtime/bin/sequoia_capture" && -f "$COPY_ONLY_RUNTIME_ROOT/bin/sequoia_capture" ]] && cmp -s "$PREBUILT_RUNTIME_INPUT_DIR/runtime/bin/sequoia_capture" "$COPY_ONLY_RUNTIME_ROOT/bin/sequoia_capture"; then
+    COPY_ONLY_EMBED_CAPTURE_MATCH=1
+    echo "capture_copy_match=true" >>"$COPY_ONLY_EMBED_COMPARE_LOG"
+  else
+    echo "capture_copy_match=false" >>"$COPY_ONLY_EMBED_COMPARE_LOG"
+  fi
+
+  if [[ -f "$PREBUILT_RUNTIME_INPUT_DIR/runtime/models/whispercpp/ggml-tiny.en.bin" && -f "$COPY_ONLY_RUNTIME_ROOT/models/whispercpp/ggml-tiny.en.bin" ]] && cmp -s "$PREBUILT_RUNTIME_INPUT_DIR/runtime/models/whispercpp/ggml-tiny.en.bin" "$COPY_ONLY_RUNTIME_ROOT/models/whispercpp/ggml-tiny.en.bin"; then
+    COPY_ONLY_EMBED_MODEL_MATCH=1
+    echo "model_copy_match=true" >>"$COPY_ONLY_EMBED_COMPARE_LOG"
+  else
+    echo "model_copy_match=false" >>"$COPY_ONLY_EMBED_COMPARE_LOG"
+  fi
+
+  set +e
+  python3 - "$COPY_ONLY_RUNTIME_ROOT/artifact-manifest.json" "$COPY_ONLY_RUNTIME_ROOT/bin/recordit" "$COPY_ONLY_RUNTIME_ROOT/bin/sequoia_capture" "$COPY_ONLY_RUNTIME_ROOT/models/whispercpp/ggml-tiny.en.bin" <<'PY_PARITY' >"$COPY_ONLY_EMBED_PARITY_LOG" 2>&1
+from __future__ import annotations
+
+import hashlib
+import json
+import sys
+from pathlib import Path
+
+manifest_path = Path(sys.argv[1])
+actual_paths = {
+    'recordit': Path(sys.argv[2]),
+    'sequoia_capture': Path(sys.argv[3]),
+    'whispercpp_default_model': Path(sys.argv[4]),
+}
+
+with manifest_path.open(encoding='utf-8') as handle:
+    manifest = json.load(handle)
+
+entries = manifest.get('entries')
+if not isinstance(entries, list) or not entries:
+    raise SystemExit(f'invalid or empty runtime artifact manifest: {manifest_path}')
+
+expected = {}
+for row in entries:
+    if not isinstance(row, dict):
+        raise SystemExit('runtime artifact manifest row must be an object')
+    logical_name = str(row.get('logical_name', '')).strip()
+    relative_path = str(row.get('path', '')).strip()
+    sha256 = str(row.get('sha256', '')).strip()
+    if not logical_name or not relative_path or not sha256:
+        raise SystemExit(f'incomplete runtime artifact manifest row: {row!r}')
+    if logical_name in expected:
+        raise SystemExit(f'duplicate runtime artifact manifest row for {logical_name}')
+    expected[logical_name] = (relative_path, sha256)
+
+missing = sorted(set(actual_paths) - set(expected))
+if missing:
+    raise SystemExit(f'manifest missing expected artifact rows: {missing}')
+
+unexpected = sorted(set(expected) - set(actual_paths))
+if unexpected:
+    raise SystemExit(f'manifest contains unexpected artifact rows: {unexpected}')
+
+for logical_name, actual_path in actual_paths.items():
+    relative_path, expected_sha = expected[logical_name]
+    if Path(relative_path).as_posix() != actual_path.relative_to(manifest_path.parent).as_posix():
+        raise SystemExit(
+            f'manifest path mismatch for {logical_name}: '
+            f'{relative_path!r} != {actual_path.relative_to(manifest_path.parent).as_posix()!r}'
+        )
+    if not actual_path.is_file():
+        raise SystemExit(f'missing copied artifact for {logical_name}: {actual_path}')
+    actual_sha = hashlib.sha256(actual_path.read_bytes()).hexdigest()
+    if actual_sha != expected_sha:
+        raise SystemExit(
+            f'sha256 mismatch for {logical_name}: expected {expected_sha}, got {actual_sha}'
+        )
+
+print('copy_only_manifest_parity_ok=true')
+PY_PARITY
+  COPY_ONLY_EMBED_PARITY_EXIT_CODE=$?
+  set -e
+  if [[ "$COPY_ONLY_EMBED_PARITY_EXIT_CODE" -eq 0 ]]; then
+    COPY_ONLY_EMBED_PARITY_OK=1
+  fi
+else
+  echo "copy_only_manifest_parity_ok=false" >"$COPY_ONLY_EMBED_PARITY_LOG"
+fi
+
+if [[ "$PREBUILT_RUNTIME_PREPARE_OK" -eq 1 && "$PREBUILT_RUNTIME_MANIFEST_PRESENT" -eq 1 && "$PREBUILT_RUNTIME_HANDOFF_ENV_PRESENT" -eq 1 && "$COPY_ONLY_EMBED_OK" -eq 1 && "$COPY_ONLY_EMBED_MANIFEST_MATCH" -eq 1 && "$COPY_ONLY_EMBED_RECORDIT_MATCH" -eq 1 && "$COPY_ONLY_EMBED_CAPTURE_MATCH" -eq 1 && "$COPY_ONLY_EMBED_MODEL_MATCH" -eq 1 && "$COPY_ONLY_EMBED_PARITY_OK" -eq 1 ]]; then
+  HANDOFF_INTEGRATION_OK=1
+fi
 
 (
   cd "$ROOT"
@@ -190,14 +364,57 @@ python3 "$ROOT/scripts/gate_v1_acceptance_summary.py" \
   --backlog-summary "$BACKLOG_DIR/summary.csv" \
   --summary-csv "$SUMMARY_CSV" >/dev/null
 
-GATE_PASS="$(awk -F, '$1=="gate_pass"{print $2}' "$SUMMARY_CSV" | tail -n 1 | tr -d '\r')"
-if [[ "$GATE_PASS" == "true" ]]; then
+BASE_GATE_PASS="$(awk -F, '$1=="gate_pass"{print $2}' "$SUMMARY_CSV" | tail -n 1 | tr -d '\r')"
+python3 - "$SUMMARY_CSV" <<'PY_REWRITE_GATE_PASS'
+import csv
+import sys
+from pathlib import Path
+
+summary_path = Path(sys.argv[1])
+rows = []
+renamed = False
+with summary_path.open(newline='', encoding='utf-8') as handle:
+    reader = csv.reader(handle)
+    rows = list(reader)
+
+for row in rows:
+    if row and row[0] == 'gate_pass':
+        row[0] = 'base_gate_pass'
+        renamed = True
+        break
+
+if not renamed:
+    raise SystemExit(f'expected gate_pass row in {summary_path}')
+
+with summary_path.open('w', newline='', encoding='utf-8') as handle:
+    writer = csv.writer(handle)
+    writer.writerows(rows)
+PY_REWRITE_GATE_PASS
+{
+  printf 'prebuilt_runtime_prepare_exit_code,%s\n' "$PREBUILT_RUNTIME_PREPARE_EXIT_CODE"
+  printf 'prebuilt_runtime_prepare_ok,%s\n' "$(bool_text "$PREBUILT_RUNTIME_PREPARE_OK")"
+  printf 'prebuilt_runtime_manifest_present,%s\n' "$(bool_text "$PREBUILT_RUNTIME_MANIFEST_PRESENT")"
+  printf 'prebuilt_runtime_handoff_env_present,%s\n' "$(bool_text "$PREBUILT_RUNTIME_HANDOFF_ENV_PRESENT")"
+  printf 'copy_only_embed_exit_code,%s\n' "$COPY_ONLY_EMBED_EXIT_CODE"
+  printf 'copy_only_embed_ok,%s\n' "$(bool_text "$COPY_ONLY_EMBED_OK")"
+  printf 'copy_only_embed_manifest_match,%s\n' "$(bool_text "$COPY_ONLY_EMBED_MANIFEST_MATCH")"
+  printf 'copy_only_embed_recordit_match,%s\n' "$(bool_text "$COPY_ONLY_EMBED_RECORDIT_MATCH")"
+  printf 'copy_only_embed_capture_match,%s\n' "$(bool_text "$COPY_ONLY_EMBED_CAPTURE_MATCH")"
+  printf 'copy_only_embed_model_match,%s\n' "$(bool_text "$COPY_ONLY_EMBED_MODEL_MATCH")"
+  printf 'copy_only_embed_manifest_parity_ok,%s\n' "$(bool_text "$COPY_ONLY_EMBED_PARITY_OK")"
+  printf 'handoff_integration_ok,%s\n' "$(bool_text "$HANDOFF_INTEGRATION_OK")"
+} >>"$SUMMARY_CSV"
+
+if [[ "$BASE_GATE_PASS" == "true" && "$HANDOFF_INTEGRATION_OK" -eq 1 ]]; then
+  GATE_PASS="true"
   status="pass"
-  detail="v1_acceptance_thresholds_satisfied"
+  detail="v1_acceptance_and_handoff_thresholds_satisfied"
 else
+  GATE_PASS="false"
   status="failed"
-  detail="v1_acceptance_thresholds_failed"
+  detail="v1_acceptance_or_handoff_thresholds_failed"
 fi
+printf 'gate_pass,%s\n' "$GATE_PASS" >>"$SUMMARY_CSV"
 
 evidence_csv_kv_to_json "$SUMMARY_CSV" "$SUMMARY_JSON"
 
@@ -215,6 +432,16 @@ warm_dir=$OUT_DIR/warm
 backlog_dir=$BACKLOG_DIR
 backlog_stdout_log=$BACKLOG_STDOUT_LOG
 backlog_stderr_log=$BACKLOG_STDERR_LOG
+recordit_bundle_configuration=$RECORDIT_BUNDLE_CONFIGURATION
+recordit_default_whisper_model=$MODEL
+prebuilt_runtime_input_dir=$PREBUILT_RUNTIME_INPUT_DIR
+prebuilt_runtime_prepare_log=$PREBUILT_RUNTIME_PREPARE_LOG
+prebuilt_runtime_handoff_env=$PREBUILT_RUNTIME_HANDOFF_ENV
+prebuilt_runtime_manifest=$PREBUILT_RUNTIME_MANIFEST
+copy_only_embed_root=$COPY_ONLY_EMBED_ROOT
+copy_only_embed_log=$COPY_ONLY_EMBED_LOG
+copy_only_embed_compare_log=$COPY_ONLY_EMBED_COMPARE_LOG
+copy_only_embed_parity_log=$COPY_ONLY_EMBED_PARITY_LOG
 generated_at_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 STATUS
 
