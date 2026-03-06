@@ -3,6 +3,7 @@ set -euo pipefail
 
 ROOT_DEFAULT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ROOT="${ROOT:-$ROOT_DEFAULT}"
+source "$ROOT/scripts/e2e_evidence_lib.sh"
 MODEL="${MODEL:-$ROOT/artifacts/bench/models/whispercpp/ggml-tiny.en.bin}"
 FIXTURE="${FIXTURE:-$ROOT/artifacts/bench/corpus/gate_c/tts_phrase_stereo.wav}"
 OUT_DIR="${OUT_DIR:-}"
@@ -94,11 +95,23 @@ if [[ ! -f "$FIXTURE" ]]; then
   exit 2
 fi
 
-mkdir -p "$OUT_DIR/cold" "$OUT_DIR/warm"
+LOG_DIR="$OUT_DIR/logs"
+SUMMARY_JSON="$OUT_DIR/summary.json"
+STATUS_JSON="$OUT_DIR/status.json"
+METADATA_JSON="$OUT_DIR/metadata.json"
+BUILD_LOG="$LOG_DIR/build_transcribe_live.log"
+BACKLOG_STDOUT_LOG="$LOG_DIR/backlog_pressure.stdout.log"
+BACKLOG_STDERR_LOG="$LOG_DIR/backlog_pressure.stderr.log"
+
+mkdir -p "$OUT_DIR/cold" "$OUT_DIR/warm" "$LOG_DIR"
 
 (
   cd "$ROOT"
-  DYLD_LIBRARY_PATH=/usr/lib/swift cargo build --quiet --bin transcribe-live
+  {
+    echo "[gate-v1-acceptance] generated_at_utc=$(evidence_timestamp)"
+    echo "[gate-v1-acceptance] cmd=DYLD_LIBRARY_PATH=/usr/lib/swift cargo build --quiet --bin transcribe-live"
+    DYLD_LIBRARY_PATH=/usr/lib/swift cargo build --quiet --bin transcribe-live
+  } >"$BUILD_LOG" 2>&1
 )
 
 BIN="$ROOT/target/debug/transcribe-live"
@@ -114,6 +127,8 @@ run_live_case() {
   local out_wav="$case_dir/session.wav"
   local out_jsonl="$case_dir/runtime.jsonl"
   local out_manifest="$case_dir/runtime.manifest.json"
+  local stdout_log="$LOG_DIR/${case_name}.runtime.stdout.log"
+  local time_log="$LOG_DIR/${case_name}.runtime.time.txt"
 
   mkdir -p "$case_dir"
 
@@ -134,13 +149,13 @@ run_live_case() {
       --chunk-window-ms "$CHUNK_WINDOW_MS" \
       --chunk-stride-ms "$CHUNK_STRIDE_MS" \
       --chunk-queue-cap "$CHUNK_QUEUE_CAP"
-  ) >"$case_dir/runtime.stdout.log" 2>"$case_dir/runtime.time.txt"
+  ) >"$stdout_log" 2>"$time_log"
   local exit_code=$?
   set -e
 
   if [[ "$exit_code" -ne 0 ]]; then
     echo "error: $case_name live run failed with exit code $exit_code" >&2
-    echo "see: $case_dir/runtime.stdout.log and $case_dir/runtime.time.txt" >&2
+    echo "see: $stdout_log and $time_log" >&2
     exit "$exit_code"
   fi
 }
@@ -149,13 +164,22 @@ run_live_case cold
 run_live_case warm
 
 BACKLOG_DIR="$OUT_DIR/backlog_pressure"
+set +e
 "$ROOT/scripts/gate_backlog_pressure.sh" \
   --out-dir "$BACKLOG_DIR" \
   --model "$MODEL" \
-  --fixture "$FIXTURE"
+  --fixture "$FIXTURE" >"$BACKLOG_STDOUT_LOG" 2>"$BACKLOG_STDERR_LOG"
+BACKLOG_EXIT_CODE=$?
+set -e
+if [[ "$BACKLOG_EXIT_CODE" -ne 0 ]]; then
+  echo "error: backlog pressure gate failed with exit code $BACKLOG_EXIT_CODE" >&2
+  echo "see: $BACKLOG_STDOUT_LOG and $BACKLOG_STDERR_LOG" >&2
+  exit "$BACKLOG_EXIT_CODE"
+fi
 
 SUMMARY_CSV="$OUT_DIR/summary.csv"
 STATUS_TXT="$OUT_DIR/status.txt"
+evidence_write_metadata_json "$METADATA_JSON" "gate_v1_acceptance" "gate_v1_acceptance" "$OUT_DIR" "$LOG_DIR" "$OUT_DIR" "$SUMMARY_CSV" "$STATUS_TXT" "$0" "$SUMMARY_JSON" "$STATUS_JSON"
 
 python3 "$ROOT/scripts/gate_v1_acceptance_summary.py" \
   --cold-manifest "$OUT_DIR/cold/runtime.manifest.json" \
@@ -175,17 +199,30 @@ else
   detail="v1_acceptance_thresholds_failed"
 fi
 
+evidence_csv_kv_to_json "$SUMMARY_CSV" "$SUMMARY_JSON"
+
 cat >"$STATUS_TXT" <<STATUS
 status=$status
 detail=$detail
 summary_path=$SUMMARY_CSV
+summary_json=$SUMMARY_JSON
+status_json=$STATUS_JSON
+metadata_json=$METADATA_JSON
+logs_dir=$LOG_DIR
+build_log=$BUILD_LOG
 cold_dir=$OUT_DIR/cold
 warm_dir=$OUT_DIR/warm
 backlog_dir=$BACKLOG_DIR
+backlog_stdout_log=$BACKLOG_STDOUT_LOG
+backlog_stderr_log=$BACKLOG_STDERR_LOG
 generated_at_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 STATUS
 
+evidence_kv_text_to_json "$STATUS_TXT" "$STATUS_JSON"
+
 echo "GATE_V1_ACCEPTANCE_OUT=$OUT_DIR"
+echo "GATE_V1_ACCEPTANCE_SUMMARY_JSON=$SUMMARY_JSON"
+echo "GATE_V1_ACCEPTANCE_STATUS_JSON=$STATUS_JSON"
 if [[ "$GATE_PASS" != "true" ]]; then
   exit 1
 fi

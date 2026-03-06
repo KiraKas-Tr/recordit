@@ -143,7 +143,9 @@ verify-recordit-app:
 	codesign -d --entitlements :- --verbose=2 "$(RECORDIT_APP_DIR)"
 	@test -x "$(RECORDIT_APP_DIR)/Contents/Resources/runtime/bin/recordit" || (echo "error: missing executable runtime binary: $(RECORDIT_APP_DIR)/Contents/Resources/runtime/bin/recordit" >&2; exit 1)
 	@test -x "$(RECORDIT_APP_DIR)/Contents/Resources/runtime/bin/sequoia_capture" || (echo "error: missing executable runtime binary: $(RECORDIT_APP_DIR)/Contents/Resources/runtime/bin/sequoia_capture" >&2; exit 1)
+	@test -f "$(RECORDIT_APP_DIR)/Contents/Resources/runtime/artifact-manifest.json" || (echo "error: missing runtime artifact manifest: $(RECORDIT_APP_DIR)/Contents/Resources/runtime/artifact-manifest.json" >&2; exit 1)
 	@echo "[verify-recordit-app] runtime binaries present and executable under Contents/Resources/runtime/bin"
+	@echo "[verify-recordit-app] runtime artifact manifest present under Contents/Resources/runtime"
 
 run-recordit-app: sign-recordit-app
 	open -W "$(RECORDIT_APP_DIR)"

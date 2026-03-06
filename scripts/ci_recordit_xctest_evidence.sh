@@ -2,6 +2,12 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+source "$ROOT/scripts/e2e_evidence_lib.sh"
+
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "error: python3 is required" >&2
+  exit 2
+fi
 STAMP="${XCTEST_EVIDENCE_STAMP:-$(date -u +%Y%m%dT%H%M%SZ)}"
 OUT_DIR="${XCTEST_EVIDENCE_OUT_DIR:-$ROOT/artifacts/ci/xctest_evidence/$STAMP}"
 DERIVED_DATA_PATH="${XCTEST_DERIVED_DATA_PATH:-$OUT_DIR/derived_data}"
@@ -15,9 +21,14 @@ LOG_DIR="$OUT_DIR/logs"
 RESULT_DIR="$OUT_DIR/xcresult"
 STATUS_CSV="$OUT_DIR/status.csv"
 SUMMARY_CSV="$OUT_DIR/summary.csv"
+STATUS_JSON="$OUT_DIR/status.json"
+SUMMARY_JSON="$OUT_DIR/summary.json"
 RESPONSIVENESS_SUMMARY_CSV="${XCTEST_RESPONSIVENESS_SUMMARY_PATH:-$OUT_DIR/responsiveness_budget_summary.csv}"
+RESPONSIVENESS_SUMMARY_JSON="$OUT_DIR/responsiveness_budget_summary.json"
+METADATA_JSON="$OUT_DIR/metadata.json"
 
 mkdir -p "$LOG_DIR" "$RESULT_DIR"
+evidence_write_metadata_json "$METADATA_JSON" "ci_recordit_xctest_evidence" "ci_xctest_evidence" "$OUT_DIR" "$LOG_DIR" "$RESULT_DIR" "$SUMMARY_CSV" "$STATUS_CSV" "$0" "$SUMMARY_JSON" "$STATUS_JSON"
 
 cat >"$STATUS_CSV" <<'CSV'
 step,required,exit_code,result,log_path,result_bundle_path
@@ -300,8 +311,14 @@ first_stable_transcript_observed_ms,$first_stable_transcript_observed_ms
 stop_to_summary_observed_ms,$stop_to_summary_observed_ms
 CSV
 
+evidence_csv_rows_to_json "$STATUS_CSV" "$STATUS_JSON"
+evidence_csv_kv_to_json "$SUMMARY_CSV" "$SUMMARY_JSON"
+evidence_csv_kv_to_json "$RESPONSIVENESS_SUMMARY_CSV" "$RESPONSIVENESS_SUMMARY_JSON"
+
 echo "[ci-xctest] status_csv=$STATUS_CSV"
+echo "[ci-xctest] status_json=$STATUS_JSON"
 echo "[ci-xctest] summary_csv=$SUMMARY_CSV"
+echo "[ci-xctest] summary_json=$SUMMARY_JSON"
 
 if [[ "$overall_failure" -ne 0 ]]; then
   echo "[ci-xctest] required steps failed"

@@ -3,6 +3,7 @@ set -euo pipefail
 
 ROOT_DEFAULT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ROOT="${ROOT:-$ROOT_DEFAULT}"
+source "$ROOT/scripts/e2e_evidence_lib.sh"
 RECORDIT_APP_BUNDLE="${RECORDIT_APP_BUNDLE:-$ROOT/dist/Recordit.app}"
 SIGN_IDENTITY="${SIGN_IDENTITY:--}"
 OUT_DIR="${OUT_DIR:-}"
@@ -64,6 +65,11 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "error: python3 is required" >&2
+  exit 2
+fi
+
 if [[ -z "$OUT_DIR" ]]; then
   STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
   OUT_DIR="$ROOT/artifacts/ops/release-context/$STAMP"
@@ -74,11 +80,15 @@ LOG_DIR="$OUT_DIR/logs"
 ARTIFACT_DIR="$OUT_DIR/artifacts"
 mkdir -p "$LOG_DIR" "$ARTIFACT_DIR"
 SUMMARY_CSV="$OUT_DIR/summary.csv"
+SUMMARY_JSON="$OUT_DIR/summary.json"
+SUMMARY_ROWS_JSON="$OUT_DIR/checks.json"
 STATUS_TXT="$OUT_DIR/status.txt"
 PATHS_ENV="$OUT_DIR/paths.env"
+METADATA_JSON="$OUT_DIR/metadata.json"
 OVERALL_STATUS="pass"
 
 printf 'check,status,detail,artifact\n' > "$SUMMARY_CSV"
+evidence_write_metadata_json "$METADATA_JSON" "verify_recordit_release_context" "release_context_verification" "$OUT_DIR" "$LOG_DIR" "$ARTIFACT_DIR" "$SUMMARY_CSV" "$STATUS_TXT" "$0" "$SUMMARY_JSON" ""
 
 timestamp() {
   date -u +%Y-%m-%dT%H:%M:%SZ
@@ -149,6 +159,7 @@ RUNTIME_ROOT="$RECORDIT_APP_BUNDLE/Contents/Resources/runtime"
 RECORDIT_BIN="$RUNTIME_ROOT/bin/recordit"
 CAPTURE_BIN="$RUNTIME_ROOT/bin/sequoia_capture"
 MODEL_PATH="$RUNTIME_ROOT/models/whispercpp/ggml-tiny.en.bin"
+RUNTIME_ARTIFACT_MANIFEST="$RUNTIME_ROOT/artifact-manifest.json"
 PREFLIGHT_OUT_DIR="$ARTIFACT_DIR/preflight-live"
 
 {
@@ -160,6 +171,7 @@ PREFLIGHT_OUT_DIR="$ARTIFACT_DIR/preflight-live"
   printf 'RECORDIT_BIN=%q\n' "$RECORDIT_BIN"
   printf 'CAPTURE_BIN=%q\n' "$CAPTURE_BIN"
   printf 'MODEL_PATH=%q\n' "$MODEL_PATH"
+  printf 'RUNTIME_ARTIFACT_MANIFEST=%q\n' "$RUNTIME_ARTIFACT_MANIFEST"
   printf 'PREFLIGHT_OUT_DIR=%q\n' "$PREFLIGHT_OUT_DIR"
 } > "$PATHS_ENV"
 
@@ -211,11 +223,94 @@ fi
 if [[ "$payload_ready" -eq 1 ]]; then
   append_summary "runtime_payload" "pass" "runtime executables and default model present" "$PATHS_ENV"
 
+  if [[ -f "$RUNTIME_ARTIFACT_MANIFEST" ]]; then
+    append_summary "runtime_artifact_manifest" "pass" "runtime artifact manifest present" "$RUNTIME_ARTIFACT_MANIFEST"
+  else
+    append_summary "runtime_artifact_manifest" "fail" "runtime artifact manifest missing" "$RUNTIME_ARTIFACT_MANIFEST"
+    write_note_log runtime_artifact_manifest_parity "runtime artifact manifest missing; parity step skipped"
+    append_summary "runtime_artifact_manifest_parity" "skipped" "runtime artifact manifest missing; parity step skipped" "$LOG_DIR/runtime_artifact_manifest_parity.log"
+    mark_fail
+  fi
+
   if run_optional_step payload_checksums shasum -a 256 "$APP_EXECUTABLE" "$RECORDIT_BIN" "$CAPTURE_BIN" "$MODEL_PATH"; then
     append_summary "payload_checksums" "pass" "captured checksums for app/runtime/model payloads" "$LOG_DIR/payload_checksums.log"
   else
     append_summary "payload_checksums" "fail" "failed to capture payload checksums" "$LOG_DIR/payload_checksums.log"
     mark_fail
+  fi
+
+  if [[ -f "$RUNTIME_ARTIFACT_MANIFEST" ]]; then
+    if run_optional_step runtime_artifact_manifest_parity python3 - "$RUNTIME_ARTIFACT_MANIFEST" "$RECORDIT_BIN" "$CAPTURE_BIN" "$MODEL_PATH" <<'PY_PARITY'
+from __future__ import annotations
+
+import hashlib
+import json
+import sys
+from pathlib import Path
+
+manifest_path = Path(sys.argv[1])
+actual_paths = {
+    'recordit': Path(sys.argv[2]),
+    'sequoia_capture': Path(sys.argv[3]),
+    'whispercpp_default_model': Path(sys.argv[4]),
+}
+
+with manifest_path.open(encoding='utf-8') as handle:
+    manifest = json.load(handle)
+
+entries = manifest.get('entries')
+if not isinstance(entries, list) or not entries:
+    raise SystemExit(f'invalid or empty runtime artifact manifest: {manifest_path}')
+
+expected = {}
+for row in entries:
+    if not isinstance(row, dict):
+        raise SystemExit('runtime artifact manifest row must be an object')
+    logical_name = str(row.get('logical_name', '')).strip()
+    relative_path = str(row.get('path', '')).strip()
+    sha256 = str(row.get('sha256', '')).strip()
+    if not logical_name or not relative_path or not sha256:
+        raise SystemExit(f'incomplete runtime artifact manifest row: {row!r}')
+    if logical_name in expected:
+        raise SystemExit(f'duplicate runtime artifact manifest row for {logical_name}')
+    expected[logical_name] = (relative_path, sha256)
+
+missing = sorted(set(actual_paths) - set(expected))
+if missing:
+    raise SystemExit(f'manifest missing expected artifact rows: {missing}')
+
+unexpected = sorted(set(expected) - set(actual_paths))
+if unexpected:
+    raise SystemExit(f'manifest contains unexpected artifact rows: {unexpected}')
+
+bundle_root = manifest_path.parent
+for logical_name, actual_path in actual_paths.items():
+    if not actual_path.is_file():
+        raise SystemExit(f'missing actual artifact for {logical_name}: {actual_path}')
+    relative_path, expected_sha = expected[logical_name]
+    resolved = (bundle_root / relative_path).resolve()
+    if resolved != actual_path.resolve():
+        raise SystemExit(
+            f'manifest path mismatch for {logical_name}: expected {resolved}, actual {actual_path.resolve()}'
+        )
+    sha = hashlib.sha256()
+    with actual_path.open('rb') as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b''):
+            sha.update(chunk)
+    actual_sha = sha.hexdigest()
+    if actual_sha != expected_sha:
+        raise SystemExit(
+            f'sha256 mismatch for {logical_name}: manifest={expected_sha} actual={actual_sha}'
+        )
+
+print(f'validated {len(actual_paths)} runtime artifacts against {manifest_path}')
+PY_PARITY
+    then
+      append_summary "runtime_artifact_manifest_parity" "pass" "runtime artifact manifest matches bundled payload checksums" "$LOG_DIR/runtime_artifact_manifest_parity.log"
+    else
+      append_summary "runtime_artifact_manifest_parity" "fail" "runtime artifact manifest mismatch" "$LOG_DIR/runtime_artifact_manifest_parity.log"
+      mark_fail
+    fi
   fi
 
   mkdir -p "$PREFLIGHT_OUT_DIR"
@@ -228,14 +323,31 @@ if [[ "$payload_ready" -eq 1 ]]; then
     mark_fail
   fi
 else
+  write_note_log runtime_artifact_manifest "runtime payload incomplete; manifest availability check skipped"
+  write_note_log runtime_artifact_manifest_parity "runtime payload incomplete; manifest parity skipped"
   write_note_log payload_checksums "runtime payload incomplete; checksum step skipped"
   write_note_log packaged_preflight "runtime payload incomplete; packaged preflight skipped"
+  append_summary "runtime_artifact_manifest" "skipped" "runtime payload incomplete; manifest availability check skipped" "$LOG_DIR/runtime_artifact_manifest.log"
+  append_summary "runtime_artifact_manifest_parity" "skipped" "runtime payload incomplete; manifest parity skipped" "$LOG_DIR/runtime_artifact_manifest_parity.log"
   append_summary "payload_checksums" "skipped" "runtime payload incomplete; checksum step skipped" "$LOG_DIR/payload_checksums.log"
   append_summary "packaged_preflight" "skipped" "runtime payload incomplete; packaged preflight skipped" "$LOG_DIR/packaged_preflight.log"
 fi
 
 append_summary "paths_manifest" "pass" "captured resolved path manifest" "$PATHS_ENV"
 echo "$OVERALL_STATUS" > "$STATUS_TXT"
+cat >"$SUMMARY_JSON" <<JSON
+{
+  "artifact_track": "release_context_verification",
+  "scenario_id": "verify_recordit_release_context",
+  "overall_status": "$OVERALL_STATUS",
+  "summary_csv": "$SUMMARY_CSV",
+  "checks_json": "$SUMMARY_ROWS_JSON",
+  "paths_env": "$PATHS_ENV",
+  "recordit_app_bundle": "$RECORDIT_APP_BUNDLE",
+  "runtime_artifact_manifest": "$RUNTIME_ARTIFACT_MANIFEST"
+}
+JSON
+evidence_csv_rows_to_json "$SUMMARY_CSV" "$SUMMARY_ROWS_JSON"
 printf 'verification complete: %s (%s)\n' "$OUT_DIR" "$OVERALL_STATUS"
 if [[ "$OVERALL_STATUS" != "pass" ]]; then
   exit 1

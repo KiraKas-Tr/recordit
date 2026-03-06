@@ -1,0 +1,30 @@
+{
+  "contract_name": "recordit-e2e-evidence",
+  "contract_version": "1",
+  "scenario_id": "packaged-live-pass",
+  "lane_type": "packaged-e2e",
+  "generated_at_utc": "2026-03-06T12:00:06Z",
+  "artifact_root_relpath": "artifacts",
+  "overall_status": "pass",
+  "paths_env_relpath": "paths.env",
+  "status_txt_relpath": "status.txt",
+  "summary_csv_relpath": "summary.csv",
+  "summary_json_relpath": "summary.json",
+  "phases": [
+    {
+      "phase_id": "launch_app",
+      "title": "Launch packaged app",
+      "required": true,
+      "status": "pass",
+      "exit_classification": "success",
+      "started_at_utc": "2026-03-06T12:00:00Z",
+      "ended_at_utc": "2026-03-06T12:00:05Z",
+      "command_display": "open dist/Recordit.app",
+      "command_argv": ["open", "dist/Recordit.app"],
+      "log_relpath": "logs/launch_app.log",
+      "stdout_relpath": "logs/launch_app.stdout",
+      "stderr_relpath": "logs/launch_app.stderr",
+      "primary_artifact_relpath": "artifacts/launch.txt"
+    }
+  ]
+}
