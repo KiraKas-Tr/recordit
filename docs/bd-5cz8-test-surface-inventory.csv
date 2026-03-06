@@ -1,0 +1,87 @@
+path,surface_role,category,layer,owner_area,target_context,realism_class,case_count,simulation_seams,primary_claim
+src/bin/transcribe_live.rs,primary,rust-inline-tests,unit,src/bin,rust-transcribe-live,live-real,4,none detected,transcribe live
+src/bin/transcribe_live/app.rs,primary,rust-inline-tests,unit,src/bin/transcribe_live,rust-transcribe-live,mock,123,explicit Mock* service doubles; fixture/replay/sample-driven inputs; deterministic fake-capture env seam,app
+src/bin/transcribe_live/artifacts.rs,primary,rust-inline-tests,unit,src/bin/transcribe_live,rust-transcribe-live,fixture,5,fixture/replay/sample-driven inputs,artifacts
+src/bin/transcribe_live/asr_backend.rs,primary,rust-inline-tests,unit,src/bin/transcribe_live,rust-transcribe-live,live-real,8,none detected,asr backend
+src/bin/transcribe_live/contracts_models.rs,primary,rust-inline-tests,unit,src/bin/transcribe_live,rust-transcribe-live,fixture,5,fixture/replay/sample-driven inputs,contracts models
+src/bin/transcribe_live/preflight.rs,primary,rust-inline-tests,unit,src/bin/transcribe_live,rust-transcribe-live,live-real,2,none detected,preflight
+src/bin/transcribe_live/runtime_live_stream.rs,primary,rust-inline-tests,unit,src/bin/transcribe_live,rust-transcribe-live,live-real,7,none detected,runtime live stream
+src/bin/transcribe_live/runtime_manifest_models.rs,primary,rust-inline-tests,unit,src/bin/transcribe_live,rust-transcribe-live,fixture,3,fixture/replay/sample-driven inputs,runtime manifest models
+src/capture_api.rs,primary,rust-inline-tests,unit,src/capture_api.rs,rust-core,live-real,6,none detected,capture api
+src/live_asr_pool.rs,primary,rust-inline-tests,unit,src/live_asr_pool.rs,rust-core,mock,18,explicit Mock* service doubles,live asr pool
+src/live_capture.rs,primary,rust-inline-tests,unit,src/live_capture.rs,rust-core,fixture,26,fixture/replay/sample-driven inputs; deterministic fake-capture env seam,live capture
+src/live_stream_runtime.rs,primary,rust-inline-tests,unit,src/live_stream_runtime.rs,rust-core,live-real,24,none detected,live stream runtime
+src/recordit_cli.rs,primary,rust-inline-tests,unit,src/recordit_cli.rs,rust-cli,fixture,12,fixture/replay/sample-driven inputs,recordit cli
+src/rt_transport.rs,primary,rust-inline-tests,unit,src/rt_transport.rs,rust-core,live-real,2,none detected,rt transport
+src/storage_roots.rs,primary,rust-inline-tests,unit,src/storage_roots.rs,rust-core,live-real,4,none detected,storage roots
+tests/bd_1n5v_contract_regression.rs,primary,rust-tests,integration,tests,session-services,fixture,2,fixture/replay/sample-driven inputs; deterministic fake-capture env seam,runtime diagnostics contract regression for bd-1n5v
+tests/bd_26pm_refactor_stability.rs,primary,rust-tests,integration,tests,session-services,fixture,2,fixture/replay/sample-driven inputs,refactor stability regression for bd-26pm
+tests/contract_baseline_matrix.rs,primary,rust-tests,integration,tests,session-services,fixture,2,fixture/replay/sample-driven inputs,baseline contract matrix coverage
+tests/contract_ci_enforcement.rs,primary,rust-tests,integration,tests,session-services,live-real,3,none detected,contract CI enforcement expectations
+tests/historical_replay_compat_regression.rs,primary,rust-tests,integration,tests,session-services,fixture,2,fixture/replay/sample-driven inputs,historical replay compatibility regression
+tests/live_asr_fault_injection_e2e.rs,primary,rust-tests,scripted-e2e,tests,session-services,fixture,3,fixture/replay/sample-driven inputs,live ASR fault-injection end-to-end failure behavior
+tests/live_asr_request_path_parity.rs,primary,rust-tests,integration,tests,session-services,fixture,2,fixture/replay/sample-driven inputs,live ASR request path parity
+tests/live_stream_true_live_integration.rs,primary,rust-tests,scripted-e2e,tests,session-services,fixture,1,fixture/replay/sample-driven inputs; deterministic fake-capture env seam,live stream capture/runtime integration with host prerequisites
+tests/modular_stability_contract.rs,primary,rust-tests,integration,tests,session-services,fixture,4,fixture/replay/sample-driven inputs,module boundary stability contract
+tests/modular_stability_suite.rs,primary,rust-tests,integration,tests,session-services,fixture,3,fixture/replay/sample-driven inputs,multi-module stability regression suite
+tests/pressure_channel_fairness.rs,primary,rust-tests,integration,tests,session-services,live-real,3,none detected,pressure/queue fairness under load
+tests/recordit_cli_contract.rs,primary,rust-tests,integration,tests,rust-cli,fixture,5,fixture/replay/sample-driven inputs,recordit CLI contract and argument behavior
+tests/recordit_cli_dispatch.rs,primary,rust-tests,integration,tests,rust-cli,fixture,4,fixture/replay/sample-driven inputs,recordit CLI subcommand dispatch behavior
+tests/recordit_exit_behavior_matrix.rs,primary,rust-tests,integration,tests,rust-cli,fixture,4,fixture/replay/sample-driven inputs,recordit exit-behavior matrix across outcomes
+tests/recordit_exit_contract.rs,primary,rust-tests,integration,tests,rust-cli,fixture,4,fixture/replay/sample-driven inputs,recordit exit contract semantics
+tests/recordit_operator_output_contract.rs,primary,rust-tests,integration,tests,session-services,live-real,2,none detected,recordit operator output
+tests/representative_offline_request_regression.rs,primary,rust-tests,integration,tests,session-services,fixture,2,fixture/replay/sample-driven inputs,representative offline request regression against frozen fixtures
+tests/runtime_jsonl_contract.rs,primary,rust-tests,integration,tests,session-services,fixture,3,fixture/replay/sample-driven inputs,runtime JSONL event contract
+tests/runtime_jsonl_schema_contract.rs,primary,rust-tests,integration,tests,session-services,fixture,2,fixture/replay/sample-driven inputs,runtime JSONL schema validation
+tests/runtime_live_stream_observability.rs,primary,rust-tests,scripted-e2e,tests,session-services,live-real,2,none detected,runtime live-stream observability payloads and counters
+tests/runtime_manifest_contract.rs,primary,rust-tests,integration,tests,session-services,fixture,3,fixture/replay/sample-driven inputs,runtime manifest contract compatibility
+tests/runtime_manifest_schema_contract.rs,primary,rust-tests,integration,tests,session-services,fixture,2,fixture/replay/sample-driven inputs,runtime manifest schema validation
+tests/runtime_mode_matrix_contract.rs,primary,rust-tests,integration,tests,session-services,fixture,2,fixture/replay/sample-driven inputs,runtime mode matrix contract
+tests/transcribe_live_failed_status_contract.rs,primary,rust-tests,integration,tests,rust-transcribe-live,fixture,2,fixture/replay/sample-driven inputs,failed-status emission contract for transcribe_live
+tests/transcribe_live_legacy_entrypoints_compat.rs,primary,rust-tests,integration,tests,rust-transcribe-live,fixture,4,fixture/replay/sample-driven inputs,legacy transcribe_live entrypoint compatibility
+tests/transcribe_live_migration_message.rs,primary,rust-tests,integration,tests,rust-transcribe-live,live-real,1,none detected,migration message/legacy guidance contract
+app/Accessibility/accessibility_smoke.swift,primary,swift-smoke,smoke,app/Accessibility,swiftui-app,temp-filesystem,1,none detected,accessibility
+app/AppShell/app_environment_smoke.swift,primary,swift-smoke,smoke,app/AppShell,swiftui-app,mock,1,stub/static injected dependencies; fixture/replay/sample-driven inputs; preview dependency injection; temp filesystem/process setup,app environment
+app/AppShell/onboarding_completion_smoke.swift,primary,swift-smoke,smoke,app/AppShell,swiftui-app,mock,1,stub/static injected dependencies; fixture/replay/sample-driven inputs,onboarding completion
+app/AppShell/permission_remediation_smoke.swift,primary,swift-smoke,smoke,app/AppShell,swiftui-app,fixture,1,fixture/replay/sample-driven inputs,permission remediation
+app/Exports/export_smoke.swift,primary,swift-smoke,smoke,app/Exports,swiftui-app,fixture,1,fixture/replay/sample-driven inputs; temp filesystem/process setup,export
+app/Exports/session_export_view_model_smoke.swift,primary,swift-smoke,smoke,app/Exports,swiftui-app,fixture,1,fixture/replay/sample-driven inputs,session export view model
+app/Integration/process_lifecycle_integration_smoke.swift,primary,swift-smoke,smoke,app/Integration,runtime-process-lifecycle,mock,1,stub/static injected dependencies; temp filesystem/process setup,process lifecycle
+app/Integration/process_lifecycle_soak_smoke.swift,primary,swift-smoke,smoke,app/Integration,runtime-process-lifecycle,mock,1,stub/static injected dependencies; temp filesystem/process setup,process lifecycle soak
+app/Navigation/navigation_smoke.swift,primary,swift-smoke,smoke,app/Navigation,swiftui-app,temp-filesystem,1,none detected,navigation
+app/Performance/responsiveness_budget_smoke.swift,primary,swift-smoke,smoke,app/Performance,swiftui-app,temp-filesystem,1,none detected,responsiveness budget
+app/Preflight/preflight_gating_smoke.swift,primary,swift-smoke,smoke,app/Preflight,live-preflight,mock,1,stub/static injected dependencies; fixture/replay/sample-driven inputs,preflight gating
+app/Preflight/preflight_smoke.swift,primary,swift-smoke,smoke,app/Preflight,live-preflight,mock,1,stub/static injected dependencies; fixture/replay/sample-driven inputs,preflight
+app/RuntimeProcessLayer/process_lifecycle_integration_smoke.swift,primary,swift-smoke,smoke,app/RuntimeProcessLayer,runtime-process-lifecycle,mock,1,stub/static injected dependencies; temp filesystem/process setup,process lifecycle
+app/RuntimeProcessLayer/runtime_binary_readiness_smoke.swift,primary,swift-smoke,smoke,app/RuntimeProcessLayer,runtime-process-lifecycle,mock,1,stub/static injected dependencies; fixture/replay/sample-driven inputs; temp filesystem/process setup,runtime binary readiness
+app/Services/jsonl_event_surface_smoke.swift,primary,swift-smoke,smoke,app/Services,session-services,temp-filesystem,1,none detected,jsonl event surface
+app/Services/jsonl_tailer_smoke.swift,primary,swift-smoke,smoke,app/Services,session-services,fixture,1,fixture/replay/sample-driven inputs; temp filesystem/process setup,jsonl tailer
+app/Services/legacy_flat_migration_smoke.swift,primary,swift-smoke,smoke,app/Services,session-services,temp-filesystem,1,temp filesystem/process setup,legacy flat migration
+app/Services/model_resolution_smoke.swift,primary,swift-smoke,smoke,app/Services,session-services,fixture,1,fixture/replay/sample-driven inputs; temp filesystem/process setup,model resolution
+app/Services/pending_queue_integration_smoke.swift,primary,swift-smoke,smoke,app/Services,session-services,temp-filesystem,1,temp filesystem/process setup,pending queue
+app/Services/pending_transcribe_action_smoke.swift,primary,swift-smoke,smoke,app/Services,session-services,mock,1,explicit Mock* service doubles; fixture/replay/sample-driven inputs; temp filesystem/process setup,pending transcribe action
+app/Services/pending_transition_smoke.swift,primary,swift-smoke,smoke,app/Services,session-services,temp-filesystem,1,temp filesystem/process setup,pending transition
+app/Services/session_search_index_smoke.swift,primary,swift-smoke,smoke,app/Services,session-services,temp-filesystem,1,temp filesystem/process setup,session search index
+app/Services/startup_migration_repair_smoke.swift,primary,swift-smoke,smoke,app/Services,session-services,mock,1,explicit Mock* service doubles; temp filesystem/process setup,startup migration repair
+app/Services/transcript_timeline_smoke.swift,primary,swift-smoke,smoke,app/Services,session-services,temp-filesystem,1,none detected,transcript timeline
+app/UIAutomation/ui_automation_smoke.swift,primary,swift-smoke,smoke,app/UIAutomation,swiftui-app-ui,mock,1,explicit Mock* service doubles; stub/static injected dependencies; fixture/replay/sample-driven inputs; scripted runtime/preflight behavior,ui automation
+app/ViewModels/runtime_state_machine_smoke.swift,primary,swift-smoke,smoke,app/ViewModels,swiftui-app,mock,1,stub/static injected dependencies; fixture/replay/sample-driven inputs,runtime state machine
+app/ViewModels/runtime_status_mapping_smoke.swift,primary,swift-smoke,smoke,app/ViewModels,swiftui-app,mock,1,explicit Mock* service doubles; stub/static injected dependencies; fixture/replay/sample-driven inputs,runtime status mapping
+app/ViewModels/runtime_stop_finalization_smoke.swift,primary,swift-smoke,smoke,app/ViewModels,swiftui-app,mock,1,stub/static injected dependencies; temp filesystem/process setup,runtime stop finalization
+app/ViewModels/session_list_smoke.swift,primary,swift-smoke,smoke,app/ViewModels,swiftui-app,mock,1,explicit Mock* service doubles,session list
+app/RecorditAppTests/RecorditAppTests.swift,primary,xctest,xctest,app/RecorditAppTests,swiftui-app,mock,18,RECORDIT_UI_TEST_MODE/UI-test-mode overrides; stub/static injected dependencies; fixture/replay/sample-driven inputs; preview dependency injection; temp filesystem/process setup,SwiftUI app/view-model XCTest coverage with injected services
+app/RecorditAppUITests/RecorditAppUITests.swift,primary,xcuitest,xcuitest,app/RecorditAppUITests,swiftui-app-ui,fixture,6,RECORDIT_UI_TEST_MODE/UI-test-mode overrides; runtime-path overrides or /usr/bin/true shims,XCUITest app journeys under RECORDIT_UI_TEST_MODE
+tests/e2e_evidence_contract/test_validator.py,primary,python-test,contract-test,tests/e2e_evidence_contract,evidence-contract,fixture,15,fixture/replay/sample-driven inputs; temp filesystem/process setup,e2e evidence contract validator behavior
+tests/test_gate_backlog_pressure_summary.py,primary,python-test,contract-test,tests,runtime-gate-harness,fixture,3,none detected,backlog-pressure summary parsing and thresholds
+tests/test_manifest_signal_extract.py,primary,python-test,contract-test,tests,session-services,fixture,7,none detected,manifest signal extraction summary behavior
+scripts/ci_contracts.sh,primary,shell-harness,scripted-e2e,scripts,session-services,fixture,1,none detected,Rust contract/schema suite runner
+scripts/ci_recordit_xctest_evidence.sh,primary,shell-harness,release-script,scripts,xcodebuild-xctest-xcuitest,packaged-app,1,runtime-path overrides or /usr/bin/true shims; codesign/spctl/notary/hdiutil packaged-artifact checks,retained XCTest/XCUITest evidence capture harness
+scripts/gate_backlog_pressure.sh,primary,shell-harness,scripted-e2e,scripts,runtime-gate-harness,fixture,1,fixture/replay/sample-driven inputs; deterministic fake-capture env seam,deterministic backlog-pressure gate with retained logs
+scripts/gate_d_soak.sh,primary,shell-harness,scripted-e2e,scripts,runtime-gate-harness,fixture,1,fixture/replay/sample-driven inputs; deterministic fake-capture env seam,deterministic gate-D soak scenario with fixture-driven inputs
+scripts/gate_packaged_live_smoke.sh,primary,shell-harness,release-script,scripts,packaged-release-artifact,packaged-app,1,fixture/replay/sample-driven inputs; deterministic fake-capture env seam; runtime-path overrides or /usr/bin/true shims; codesign/spctl/notary/hdiutil packaged-artifact checks,packaged Recordit.app live smoke and evidence capture
+scripts/gate_transcript_completeness.sh,primary,shell-harness,scripted-e2e,scripts,runtime-gate-harness,fixture,1,fixture/replay/sample-driven inputs,transcript completeness gate with evidence output
+scripts/gate_v1_acceptance.sh,primary,shell-harness,release-script,scripts,packaged-release-artifact,packaged-app,1,fixture/replay/sample-driven inputs; deterministic fake-capture env seam; codesign/spctl/notary/hdiutil packaged-artifact checks,v1 acceptance harness spanning release/runtime evidence
+scripts/verify_recordit_release_context.sh,primary,shell-harness,release-script,scripts,packaged-release-artifact,packaged-app,1,codesign/spctl/notary/hdiutil packaged-artifact checks,"release-context signing, payload, and parity verification"
+scripts/mixed_rate_regression.sh,primary,shell-harness,scripted-e2e,scripts,runtime-gate-harness,live-real,1,none detected,mixed-rate capture regression with telemetry artifacts
+scripts/create_recordit_dmg.sh,supporting-harness,shell-harness,release-script,scripts,packaged-release-artifact,packaged-app,1,codesign/spctl/notary/hdiutil packaged-artifact checks,DMG packaging artifact creation (release-support surface)
+scripts/validate_e2e_evidence_contract.py,primary,python-harness,contract-harness,scripts,evidence-contract,fixture,0,none detected,canonical e2e evidence-root validation harness
