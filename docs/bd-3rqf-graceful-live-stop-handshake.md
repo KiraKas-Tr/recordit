@@ -13,11 +13,11 @@ Primary exercised coverage:
 
 ## Purpose
 
-Document the current graceful-stop contract for live sessions: the app asks the runtime to drain and finalize first, then falls back to interrupt-style termination only when the bounded grace window expires or the runtime remains unresponsive.
+Document the current graceful-stop contract for live sessions: the app asks the runtime to drain and finalize first, then escalates through interrupt and terminate fallback only when bounded stages expire.
 
 ## Canonical handshake
 
-The current stop path is intentionally two-stage.
+The current stop path is intentionally three-stage and emits explicit stop diagnostics.
 
 ### Stage 1: request graceful stop
 
@@ -32,16 +32,35 @@ The bounded grace interval is controlled by:
 - `boundedGracefulStopTimeout()`
 
 Current rule:
-- the graceful window is clamped to a small bounded fraction of the full stop timeout
-- the remaining stop budget is reserved for forced fallback if graceful stop does not settle
+- total stop control is bounded by `stopTimeoutSeconds`
+- graceful wait is clamped via `boundedGracefulStopTimeout()`
+- remaining time is split across interrupt and terminate fallback windows
 
-### Stage 2: forced fallback only if needed
+### Stage 2: interrupt fallback
 
-If the graceful request does not produce a settled stop outcome in time, the service falls back to the existing process-control stop path with the remaining timeout budget.
+If the graceful request does not settle in time (or the request marker cannot be written), control falls back to interrupt (`SIGINT`) with a bounded interrupt wait.
 
-The timeout diagnostics surface both budgets explicitly in stop-timeout failures:
-- `graceful_stop_timeout_seconds=...`
-- `forced_stop_timeout_seconds=...`
+### Stage 3: terminate fallback
+
+If interrupt fallback still does not settle, control escalates to terminate (`SIGTERM`) with a bounded terminate wait and final timeout cleanup.
+
+## Stop diagnostics contract
+
+Stop control now emits stage/timing metadata so downstream triage can identify where stop failed or succeeded:
+
+- `stop_strategy` (`graceful_handshake`, `interrupt_fallback`, `terminate_fallback`, `terminate_timeout`)
+- `graceful_request_written`
+- `graceful_wait_ms`
+- `interrupt_wait_ms`
+- `terminate_wait_ms`
+- `stop_timeout_seconds`
+- `graceful_timeout_seconds`
+- `interrupt_timeout_seconds`
+- `terminate_timeout_seconds`
+- `escalation_reason`
+
+For successful stop control, metadata is attached to `RuntimeControlResult.detail`.
+For timeout/error outcomes, metadata is attached to `AppServiceError.debugDetail`.
 
 ## Runtime-side contract
 
@@ -67,6 +86,8 @@ The current codebase already asserts these invariants.
 - the request marker is removed after control settles
 - marker-driven graceful stop can drive `RuntimeViewModel` finalization to `.completed`
 - if graceful stop does not complete, stop falls back to interrupt behavior
+- if interrupt fallback does not settle, stop escalates to terminate behavior
+- stop detail/debug metadata records strategy + escalation reason + per-stage timing
 
 ### View-model bounded finalization invariants
 
@@ -90,7 +111,7 @@ This bead establishes the graceful-stop handshake contract itself.
 
 It does **not** by itself prove every downstream stop/finalization guarantee. In particular, downstream work still exists for:
 - broader stop/finalization stress coverage
-- richer classification and artifact evidence around stop failures
+- richer artifact evidence around stop failures beyond process-control metadata
 - additional unit/e2e protection over bounded wait policy and manifest outcomes
 
 That is why `bd-p77p`, `bd-2fic`, and `bd-1qjo` remain separate downstream beads.
@@ -99,10 +120,11 @@ That is why `bd-p77p`, `bd-2fic`, and `bd-1qjo` remain separate downstream beads
 
 The truthful current stop contract is now:
 - stop prefers a session-root handshake (`session.stop.request`) before forced fallback
-- the graceful wait is bounded, not unbounded
+- graceful/interrupt/terminate waits are bounded, not unbounded
 - stale stop markers are cleaned up at launch and after settled control
 - graceful stop can finalize into a completed session when the runtime cooperates
-- interrupt-style fallback still exists for unresponsive runtimes
+- interrupt and terminate fallback remain available for unresponsive runtimes
+- diagnostics identify whether stop settled in graceful handshake, interrupt fallback, terminate fallback, or timed out
 
 ## Decision
 

@@ -261,6 +261,26 @@ private func runSmoke() async throws {
         """
     )
 
+    let terminateFallbackScript = binDir.appendingPathComponent("recordit-terminate-fallback.sh")
+    try makeExecutableScript(
+        at: terminateFallbackScript,
+        body: """
+        #!/bin/sh
+        out_root=""
+        while [ "$#" -gt 0 ]; do
+          case "$1" in
+            --output-root) out_root="$2"; shift 2 ;;
+            *) shift ;;
+          esac
+        done
+        [ -n "$out_root" ] && mkdir -p "$out_root"
+        : > "$out_root/terminate.ready"
+        trap '' INT
+        trap 'printf TERM > "$out_root/stop-signal.txt"; exit 0' TERM
+        while :; do :; done
+        """
+    )
+
     let captureScript = binDir.appendingPathComponent("sequoia-capture.sh")
     try makeExecutableScript(
         at: captureScript,
@@ -334,7 +354,7 @@ private func runSmoke() async throws {
         }
         check(error.code == .processExitedUnexpectedly, "failed manifest status should classify as processExitedUnexpectedly")
         check(viewModel.suggestedRecoveryActions == [.openSessionArtifacts, .startNewSession], "finalized failed manifest should not advertise interruption recovery")
-        check(viewModel.interruptionRecoveryContext?.classification == .finalizedFailure, "failed manifest should classify as finalized failure")
+        check(viewModel.interruptionRecoveryContext?.outcomeClassification == .finalizedFailure, "failed manifest should classify as finalized failure")
         _ = try? await processService.controlSession(processIdentifier: processID, action: .cancel)
     }
 
@@ -436,6 +456,8 @@ private func runSmoke() async throws {
         await waitForFile(at: readyPath, timeoutSeconds: 2, message: "graceful stop helper should signal readiness before stop")
         let control = try await service.controlSession(processIdentifier: launch.processIdentifier, action: .stop)
         check(control.accepted, "graceful stop should be accepted")
+        check(control.detail.contains("stop_strategy=graceful_handshake"), "graceful stop should report graceful handshake strategy metadata")
+        check(control.detail.contains("graceful_request_written=true"), "graceful stop diagnostics should report graceful request marker write")
         let signalPath = outputRoot.appendingPathComponent("stop-signal.txt")
         await waitForFile(at: signalPath, timeoutSeconds: 1, message: "graceful stop helper should write stop signal")
         let signal = try readTrimmedUTF8File(signalPath, message: "graceful stop helper should write readable stop signal")
@@ -493,10 +515,32 @@ private func runSmoke() async throws {
         await waitForFile(at: readyPath, timeoutSeconds: 2, message: "interrupt fallback helper should signal readiness before stop")
         let control = try await service.controlSession(processIdentifier: launch.processIdentifier, action: .stop)
         check(control.accepted, "interrupt fallback stop should be accepted")
+        check(control.detail.contains("stop_strategy=interrupt_fallback"), "interrupt fallback should emit explicit strategy diagnostics")
+        check(control.detail.contains("escalation_reason=graceful_handshake_timeout"), "interrupt fallback should record graceful-timeout escalation reason")
         let signalPath = outputRoot.appendingPathComponent("stop-signal.txt")
         await waitForFile(at: signalPath, timeoutSeconds: 1, message: "interrupt fallback helper should write stop signal")
         let signal = try readTrimmedUTF8File(signalPath, message: "interrupt fallback helper should write readable stop signal")
         check(signal == "INT", "stop should fall back to INT when graceful TERM handshake stalls")
+    }
+
+    // Stop should escalate to terminate when interrupt fallback does not complete.
+    do {
+        let service = makeRuntimeService(recorditPath: terminateFallbackScript, sequoiaPath: captureScript, stopTimeoutSeconds: 0.4)
+        let outputRoot = tempRoot.appendingPathComponent("live-terminate-fallback", isDirectory: true)
+        try FileManager.default.createDirectory(at: outputRoot, withIntermediateDirectories: true)
+        let launch = try await service.startSession(
+            request: RuntimeStartRequest(mode: .live, outputRoot: outputRoot)
+        )
+        let readyPath = outputRoot.appendingPathComponent("terminate.ready")
+        await waitForFile(at: readyPath, timeoutSeconds: 2, message: "terminate fallback helper should signal readiness before stop")
+        let control = try await service.controlSession(processIdentifier: launch.processIdentifier, action: .stop)
+        check(control.accepted, "terminate fallback stop should be accepted")
+        check(control.detail.contains("stop_strategy=terminate_fallback"), "terminate fallback should emit explicit strategy diagnostics")
+        check(control.detail.contains("escalation_reason=interrupt_timeout"), "terminate fallback should report interrupt-timeout escalation reason")
+        let signalPath = outputRoot.appendingPathComponent("stop-signal.txt")
+        await waitForFile(at: signalPath, timeoutSeconds: 1, message: "terminate fallback helper should write stop signal")
+        let signal = try readTrimmedUTF8File(signalPath, message: "terminate fallback helper should write readable stop signal")
+        check(signal == "TERM", "terminate fallback should deliver TERM after interrupt fallback stalls")
     }
 
     // Crash branch should map to processExitedUnexpectedly.
@@ -541,6 +585,9 @@ private func runSmoke() async throws {
             check(false, "timeout branch should throw timeout")
         } catch let serviceError as AppServiceError {
             check(serviceError.code == .timeout, "timeout branch should classify as timeout")
+            let debugDetail = serviceError.debugDetail ?? ""
+            check(debugDetail.contains("stop_strategy=terminate_timeout"), "timeout diagnostics should report terminate-timeout stop strategy")
+            check(debugDetail.contains("escalation_reason=interrupt_timeout"), "timeout diagnostics should report interrupt-timeout escalation reason")
         }
     }
 }
