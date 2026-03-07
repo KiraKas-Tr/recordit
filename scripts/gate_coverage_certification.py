@@ -40,6 +40,13 @@ class MatrixGap:
     follow_on_beads: str
 
 
+@dataclass(frozen=True)
+class EvidenceRootCheck:
+    lane_id: str
+    root: str
+    errors: tuple[str, ...]
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -77,6 +84,17 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional JSON object mapping bead IDs to statuses; if omitted, uses `br show`",
     )
+    parser.add_argument(
+        "--required-evidence-root",
+        action="append",
+        default=[],
+        help="Required e2e evidence root (lane_id=path or path). May be repeated.",
+    )
+    parser.add_argument(
+        "--required-evidence-files",
+        default="evidence_contract.json,status.txt,summary.csv,summary.json,paths.env",
+        help="Comma-separated files that must exist under each required evidence root",
+    )
     parser.add_argument("--summary-csv", type=Path, required=True)
     parser.add_argument("--status-json", type=Path, required=True)
     parser.add_argument("--status-txt", type=Path, required=True)
@@ -104,6 +122,82 @@ def split_csv_list(raw: str) -> list[str]:
         if token:
             values.append(token)
     return values
+
+
+def parse_required_evidence_root(spec: str) -> tuple[str, Path]:
+    raw = spec.strip()
+    if not raw:
+        raise SystemExit("required evidence root spec cannot be empty")
+    if "=" in raw:
+        lane_id, path_raw = raw.split("=", 1)
+        lane_id = lane_id.strip() or "unnamed"
+    else:
+        path_raw = raw
+        lane_id = Path(path_raw).name or "unnamed"
+    root = Path(path_raw.strip()).expanduser().resolve(strict=False)
+    return lane_id, root
+
+
+def validate_required_evidence_root(lane_id: str, root: Path, required_files: list[str]) -> EvidenceRootCheck:
+    errors: list[str] = []
+    if not root.exists() or not root.is_dir():
+        errors.append("root_missing")
+        return EvidenceRootCheck(lane_id=lane_id, root=str(root), errors=tuple(errors))
+
+    for rel in required_files:
+        target = root / rel
+        if not target.exists():
+            errors.append(f"missing:{rel}")
+
+    logs_dir = root / "logs"
+    if not logs_dir.is_dir():
+        errors.append("missing:logs/")
+    else:
+        has_log_file = any(path.is_file() for path in logs_dir.rglob("*"))
+        if not has_log_file:
+            errors.append("logs_empty")
+
+    contract_path = root / "evidence_contract.json"
+    if contract_path.exists():
+        try:
+            contract = json.loads(contract_path.read_text(encoding="utf-8"))
+            phases = contract.get("phases", [])
+            if not isinstance(phases, list) or not phases:
+                errors.append("malformed:evidence_contract.phases")
+        except Exception:
+            errors.append("malformed:evidence_contract.json")
+
+    status_path = root / "status.txt"
+    if status_path.exists():
+        try:
+            lines = status_path.read_text(encoding="utf-8").splitlines()
+            status_map = {}
+            for raw_line in lines:
+                line = raw_line.strip()
+                if not line or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                status_map[key.strip()] = value.strip()
+            if not status_map.get("status"):
+                errors.append("malformed:status.txt")
+        except Exception:
+            errors.append("malformed:status.txt")
+
+    summary_path = root / "summary.csv"
+    if summary_path.exists():
+        try:
+            with summary_path.open(encoding="utf-8", newline="") as handle:
+                reader = csv.DictReader(handle)
+                fieldnames = reader.fieldnames or []
+                rows = list(reader)
+            if "phase_id" not in fieldnames or "status" not in fieldnames:
+                errors.append("malformed:summary.csv.header")
+            if not rows:
+                errors.append("malformed:summary.csv.empty")
+        except Exception:
+            errors.append("malformed:summary.csv")
+
+    return EvidenceRootCheck(lane_id=lane_id, root=str(root), errors=tuple(errors))
 
 
 def normalize_status(raw: str) -> str:
@@ -231,6 +325,15 @@ def main() -> None:
     bead_statuses = load_bead_statuses(required_beads, args.bead_status_json)
     open_required_beads = [b for b in bead_statuses if b.status != "closed"]
 
+    required_evidence_files = split_csv_list(args.required_evidence_files)
+    required_evidence_checks: list[EvidenceRootCheck] = []
+    for spec in args.required_evidence_root:
+        lane_id, root = parse_required_evidence_root(spec)
+        required_evidence_checks.append(
+            validate_required_evidence_root(lane_id=lane_id, root=root, required_files=required_evidence_files)
+        )
+    invalid_required_evidence = [check for check in required_evidence_checks if check.errors]
+
     hard_blockers: list[str] = []
     if not anti_bypass_pass:
         hard_blockers.append("anti_bypass_certifying_claim_failed")
@@ -240,6 +343,8 @@ def main() -> None:
         hard_blockers.append("downstream_matrix_has_uncovered_surfaces")
     if open_required_beads:
         hard_blockers.append("required_domain_beads_not_closed")
+    if invalid_required_evidence:
+        hard_blockers.append("required_evidence_missing_or_malformed")
 
     soft_blockers: list[str] = []
     if soft_gaps:
@@ -275,6 +380,8 @@ def main() -> None:
         ("soft_blocker_count", str(len(soft_blockers))),
         ("hard_blockers", "|".join(hard_blockers)),
         ("soft_blockers", "|".join(soft_blockers)),
+        ("required_evidence_root_count", str(len(required_evidence_checks))),
+        ("required_evidence_invalid_count", str(len(invalid_required_evidence))),
     ]
 
     write_summary_csv(args.summary_csv, summary_rows)
@@ -291,6 +398,8 @@ def main() -> None:
             "anti_bypass_status_json": str(args.anti_bypass_status_json),
             "anti_bypass_exit_code": args.anti_bypass_exit_code,
             "required_beads": required_beads,
+            "required_evidence_root_specs": args.required_evidence_root,
+            "required_evidence_files": required_evidence_files,
         },
         "hard_blockers": hard_blockers,
         "soft_blockers": soft_blockers,
@@ -333,6 +442,15 @@ def main() -> None:
             "violations": anti_bypass.get("violations", []),
             "missing_status_json": anti_bypass.get("missing_status_json", False),
         },
+        "required_evidence": [
+            {
+                "lane_id": check.lane_id,
+                "root": check.root,
+                "valid": not check.errors,
+                "errors": list(check.errors),
+            }
+            for check in required_evidence_checks
+        ],
     }
     args.status_json.parent.mkdir(parents=True, exist_ok=True)
     args.status_json.write_text(json.dumps(status_payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")

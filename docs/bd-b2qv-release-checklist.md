@@ -120,6 +120,25 @@ Pass criteria:
 3. `xctest-evidence-strict.status.csv` reports `required_failed=0`
 4. `xctest-evidence-strict.xcuitest-summary.json` reports `overall_status=pass`
 
+## Step D3 - Comprehensive Real-Environment Suite Policy Gate (RC Required)
+
+Run the canonical comprehensive suite in strict non-gated mode and evaluate it
+using the policy in `docs/bd-1k50-nightly-rc-gating-policy.md`.
+
+```bash
+RC_SUITE_OUT="${EVIDENCE_ROOT}/gates/comprehensive-real-env"
+scripts/gate_comprehensive_real_environment_suite.sh \
+  --out-dir "${RC_SUITE_OUT}" \
+  | tee "${EVIDENCE_ROOT}/logs/gate-comprehensive-real-env.log"
+```
+
+Pass criteria:
+1. `${RC_SUITE_OUT}/status.txt` reports `status=pass`
+2. `${RC_SUITE_OUT}/artifacts/suite_checks.json` has empty `required_failures`
+3. `${RC_SUITE_OUT}/artifacts/suite_checks.json` has empty `required_skipped`
+4. run is **not** capability-gated and **not** dry-run
+5. RC summary language classifies this run as `real-environment-passed`, not `simulation-passed`
+
 ## Step E - Soak Gate Dependency Closure (`bd-2n4m`)
 
 This beta lane cannot be marked release-ready until the 10-session no-restart soak dependency is closed.

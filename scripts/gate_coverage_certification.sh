@@ -10,6 +10,8 @@ DOWNSTREAM_MATRIX_CSV="${DOWNSTREAM_MATRIX_CSV:-$ROOT/docs/bd-39i6-canonical-dow
 CRITICAL_MATRIX_CSV="${CRITICAL_MATRIX_CSV:-$ROOT/docs/bd-39i6-critical-surface-coverage-matrix.csv}"
 REQUIRED_BEADS="${REQUIRED_BEADS:-bd-tr8z,bd-diqp,bd-p77p,bd-39i6,bd-11vg,bd-2j49}"
 BEAD_STATUS_JSON="${BEAD_STATUS_JSON:-}"
+REQUIRED_EVIDENCE_FILES="${REQUIRED_EVIDENCE_FILES:-evidence_contract.json,status.txt,summary.csv,summary.json,paths.env}"
+REQUIRED_EVIDENCE_ROOTS=()
 
 usage() {
   cat <<USAGE
@@ -27,6 +29,10 @@ Options:
   --critical-matrix-csv PATH   Critical-surface matrix CSV
   --required-beads IDS         Comma-separated required bead IDs
   --bead-status-json PATH      Optional JSON bead status override map
+  --required-evidence-root SPEC
+                               Required e2e evidence root spec (lane_id=path or path). Repeatable.
+  --required-evidence-files CSV
+                               Comma-separated file contract required under each evidence root
   -h, --help                   Show this help text
 USAGE
 }
@@ -55,6 +61,14 @@ while [[ $# -gt 0 ]]; do
       ;;
     --bead-status-json)
       BEAD_STATUS_JSON="$2"
+      shift 2
+      ;;
+    --required-evidence-root)
+      REQUIRED_EVIDENCE_ROOTS+=("$2")
+      shift 2
+      ;;
+    --required-evidence-files)
+      REQUIRED_EVIDENCE_FILES="$2"
       shift 2
       ;;
     -h|--help)
@@ -98,10 +112,15 @@ PY_ARGS=(
   --anti-bypass-status-json "$ANTI_BYPASS_OUT/status.json"
   --anti-bypass-exit-code "$ANTI_BYPASS_EXIT"
   --required-beads "$REQUIRED_BEADS"
+  --required-evidence-files "$REQUIRED_EVIDENCE_FILES"
   --summary-csv "$SUMMARY_CSV"
   --status-json "$STATUS_JSON"
   --status-txt "$STATUS_TXT"
 )
+
+for required_root in "${REQUIRED_EVIDENCE_ROOTS[@]}"; do
+  PY_ARGS+=(--required-evidence-root "$required_root")
+done
 
 if [[ -n "$BEAD_STATUS_JSON" ]]; then
   PY_ARGS+=(--bead-status-json "$BEAD_STATUS_JSON")
