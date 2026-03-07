@@ -431,7 +431,7 @@ record_skipped_phase() {
   : > "$OUT_DIR/$stderr_relpath"
   {
     printf 'phase_id=%s\n' "$phase_id"
-    printf 'status=skipped\n'
+    printf 'status=fail\n'
     printf 'required=%s\n' "$required"
     printf 'notes=%s\n' "$notes"
   } > "$OUT_DIR/$primary_relpath"
@@ -440,8 +440,8 @@ record_skipped_phase() {
     "$phase_id" \
     "$title" \
     "$required" \
-    "skipped" \
-    "skip_requested" \
+    "fail" \
+    "contract_failure" \
     "$now" \
     "$now" \
     "$command_display" \
