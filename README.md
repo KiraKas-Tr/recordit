@@ -39,6 +39,7 @@ Sequoia Capture is a macOS 15+ Rust project that records:
 - `docs/bd-1gx5-recordit-makefile-packaging.md`: Makefile packaging cutover evidence for Recordit-first build/bundle/sign/verify targets
 - `docs/bd-1msp-packaged-gate-retarget.md`: packaged gate retarget evidence for Recordit-default launch semantics + runtime compatibility checks
 - `docs/bd-yu7n-recordit-signing-notary-paths.md`: signing/notarization/gatekeeper path retarget evidence for `Recordit.app`
+- `docs/bd-1vo3-gatekeeper-notarization-expectations.md`: canonical local ad-hoc vs notarized release validation expectations and exact Gatekeeper/notary checks
 - `docs/bd-14y4-sequoiatranscribe-fallback-policy.md`: strict non-default fallback policy for legacy `SequoiaTranscribe` usage
 - `docs/bd-k993-coverage-claim-policy.md`: canonical terminology policy for truthful coverage/readiness claims
 - `docs/bd-2gw4-release-posture-and-build-context-parity.md`: canonical guide to which dev, packaged, and release contexts are authoritative for which claims
