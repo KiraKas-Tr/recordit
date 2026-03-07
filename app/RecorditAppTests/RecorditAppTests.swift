@@ -42,6 +42,10 @@ final class RecorditAppTests: XCTestCase {
         static let pathEnv = "RECORDIT_RESPONSIVENESS_ARTIFACT_PATH"
     }
 
+    private enum ReadinessScenarioArtifact {
+        static let pathEnv = "RECORDIT_READINESS_SCENARIO_ARTIFACT_PATH"
+    }
+
     private struct ResponsivenessGateSnapshot {
         let firstStableTranscriptMilliseconds: UInt64
         let stopToSummaryMilliseconds: UInt64
@@ -51,6 +55,22 @@ final class RecorditAppTests: XCTestCase {
         let stopToSummaryBudgetPass: Bool
         let gatePass: Bool
         let failedMetrics: String
+    }
+
+    private struct ReadinessScenarioSnapshot {
+        let scenarioID: String
+        let preflightKind: String
+        let preflightOverallStatus: String
+        let preflightCheckIDs: [String]
+        let mappedCheckIDs: [String]
+        let failingCheckIDs: [String]
+        let mappedBlockingDomain: String
+        let preflightCanProceedLive: Bool
+        let preflightCanOfferRecordOnlyFallback: Bool
+        let rootPreflightCanProceed: Bool
+        let rootPreflightCanOfferRecordOnlyFallback: Bool
+        let rootPreflightRequiresWarningAck: Bool
+        let rootPreflightSummary: String
     }
 
     private struct StaticManifestService: ManifestService {
@@ -666,6 +686,120 @@ final class RecorditAppTests: XCTestCase {
         XCTAssertEqual(displayCheck?.status, .fail)
         XCTAssertEqual(viewModel.primaryBlockingDomain, .tccCapture)
         XCTAssertFalse(viewModel.canProceedToLiveTranscribe)
+    }
+
+    @MainActor
+    func testReadinessObservabilityScenariosCaptureStructuredGateDecisions() throws {
+        struct ScenarioExpectation {
+            let id: String
+            let checks: [[String: Any]]
+            let expectedBlockingDomain: String
+            let expectedCanProceedLive: Bool
+            let expectedRecordOnlyFallback: Bool
+            let expectedWarningAck: Bool
+        }
+
+        let scenarios: [ScenarioExpectation] = [
+            ScenarioExpectation(
+                id: "live_ready",
+                checks: [
+                    ["id": ReadinessContractID.modelPath.rawValue, "status": "PASS", "detail": "model ready", "remediation": ""],
+                    ["id": ReadinessContractID.outWav.rawValue, "status": "PASS", "detail": "wav ready", "remediation": ""],
+                    ["id": ReadinessContractID.outJsonl.rawValue, "status": "PASS", "detail": "jsonl ready", "remediation": ""],
+                    ["id": ReadinessContractID.outManifest.rawValue, "status": "PASS", "detail": "manifest ready", "remediation": ""],
+                    ["id": ReadinessContractID.screenCaptureAccess.rawValue, "status": "PASS", "detail": "screen access granted", "remediation": ""],
+                    ["id": ReadinessContractID.displayAvailability.rawValue, "status": "PASS", "detail": "display ready", "remediation": ""],
+                    ["id": ReadinessContractID.microphoneAccess.rawValue, "status": "PASS", "detail": "microphone ready", "remediation": ""],
+                ],
+                expectedBlockingDomain: "none",
+                expectedCanProceedLive: true,
+                expectedRecordOnlyFallback: false,
+                expectedWarningAck: false
+            ),
+            ScenarioExpectation(
+                id: "live_blocked_model",
+                checks: [
+                    ["id": ReadinessContractID.modelPath.rawValue, "status": "FAIL", "detail": "model path missing", "remediation": "Provide a compatible model."],
+                    ["id": ReadinessContractID.screenCaptureAccess.rawValue, "status": "PASS", "detail": "screen access granted", "remediation": ""],
+                    ["id": ReadinessContractID.displayAvailability.rawValue, "status": "PASS", "detail": "display ready", "remediation": ""],
+                    ["id": ReadinessContractID.microphoneAccess.rawValue, "status": "PASS", "detail": "microphone ready", "remediation": ""],
+                ],
+                expectedBlockingDomain: ReadinessDomain.backendModel.rawValue,
+                expectedCanProceedLive: false,
+                expectedRecordOnlyFallback: true,
+                expectedWarningAck: false
+            ),
+            ScenarioExpectation(
+                id: "live_blocked_capture",
+                checks: [
+                    ["id": ReadinessContractID.modelPath.rawValue, "status": "PASS", "detail": "model ready", "remediation": ""],
+                    ["id": ReadinessContractID.screenCaptureAccess.rawValue, "status": "FAIL", "detail": "screen denied", "remediation": "Grant Screen Recording in System Settings."],
+                    ["id": ReadinessContractID.displayAvailability.rawValue, "status": "PASS", "detail": "display ready", "remediation": ""],
+                    ["id": ReadinessContractID.microphoneAccess.rawValue, "status": "PASS", "detail": "microphone ready", "remediation": ""],
+                ],
+                expectedBlockingDomain: ReadinessDomain.tccCapture.rawValue,
+                expectedCanProceedLive: false,
+                expectedRecordOnlyFallback: false,
+                expectedWarningAck: false
+            ),
+            ScenarioExpectation(
+                id: "live_blocked_runtime_preflight",
+                checks: [
+                    ["id": ReadinessContractID.modelPath.rawValue, "status": "PASS", "detail": "model ready", "remediation": ""],
+                    ["id": ReadinessContractID.outManifest.rawValue, "status": "FAIL", "detail": "manifest path unavailable", "remediation": "Fix manifest output path."],
+                    ["id": ReadinessContractID.screenCaptureAccess.rawValue, "status": "PASS", "detail": "screen access granted", "remediation": ""],
+                    ["id": ReadinessContractID.displayAvailability.rawValue, "status": "PASS", "detail": "display ready", "remediation": ""],
+                    ["id": ReadinessContractID.microphoneAccess.rawValue, "status": "PASS", "detail": "microphone ready", "remediation": ""],
+                ],
+                expectedBlockingDomain: ReadinessDomain.runtimePreflight.rawValue,
+                expectedCanProceedLive: false,
+                expectedRecordOnlyFallback: false,
+                expectedWarningAck: false
+            ),
+            ScenarioExpectation(
+                id: "live_warn_ack_required",
+                checks: [
+                    ["id": ReadinessContractID.modelPath.rawValue, "status": "PASS", "detail": "model ready", "remediation": ""],
+                    ["id": ReadinessContractID.outWav.rawValue, "status": "PASS", "detail": "wav ready", "remediation": ""],
+                    ["id": ReadinessContractID.outJsonl.rawValue, "status": "PASS", "detail": "jsonl ready", "remediation": ""],
+                    ["id": ReadinessContractID.outManifest.rawValue, "status": "PASS", "detail": "manifest ready", "remediation": ""],
+                    ["id": ReadinessContractID.screenCaptureAccess.rawValue, "status": "PASS", "detail": "screen access granted", "remediation": ""],
+                    ["id": ReadinessContractID.displayAvailability.rawValue, "status": "PASS", "detail": "display ready", "remediation": ""],
+                    ["id": ReadinessContractID.microphoneAccess.rawValue, "status": "PASS", "detail": "microphone ready", "remediation": ""],
+                    ["id": ReadinessContractID.sampleRate.rawValue, "status": "WARN", "detail": "non-default sample rate", "remediation": "Acknowledge warning to continue."],
+                ],
+                expectedBlockingDomain: "none",
+                expectedCanProceedLive: false,
+                expectedRecordOnlyFallback: false,
+                expectedWarningAck: true
+            ),
+        ]
+
+        var snapshots = [ReadinessScenarioSnapshot]()
+        snapshots.reserveCapacity(scenarios.count)
+        for scenario in scenarios {
+            let snapshot = try buildReadinessScenarioSnapshot(
+                scenarioID: scenario.id,
+                checks: scenario.checks
+            )
+            snapshots.append(snapshot)
+
+            XCTAssertEqual(snapshot.preflightKind, "transcribe-live-preflight")
+            XCTAssertEqual(snapshot.mappedBlockingDomain, scenario.expectedBlockingDomain)
+            XCTAssertEqual(snapshot.preflightCanProceedLive, scenario.expectedCanProceedLive)
+            XCTAssertEqual(snapshot.preflightCanOfferRecordOnlyFallback, scenario.expectedRecordOnlyFallback)
+            XCTAssertEqual(snapshot.rootPreflightCanProceed, scenario.expectedCanProceedLive)
+            XCTAssertEqual(snapshot.rootPreflightCanOfferRecordOnlyFallback, scenario.expectedRecordOnlyFallback)
+            XCTAssertEqual(snapshot.rootPreflightRequiresWarningAck, scenario.expectedWarningAck)
+            XCTAssertTrue(snapshot.preflightCheckIDs.contains(ReadinessContractID.modelPath.rawValue))
+            XCTAssertEqual(snapshot.preflightCheckIDs.sorted(), snapshot.mappedCheckIDs.sorted())
+        }
+
+        XCTAssertEqual(snapshots.count, scenarios.count)
+        XCTAssertTrue(snapshots.contains(where: { $0.preflightCanOfferRecordOnlyFallback }))
+        XCTAssertTrue(snapshots.contains(where: { $0.rootPreflightRequiresWarningAck }))
+
+        try persistReadinessScenarioSnapshotsIfRequested(snapshots)
     }
 
     @MainActor
@@ -1576,6 +1710,120 @@ final class RecorditAppTests: XCTestCase {
     private func makeExecutableStubBinary(at url: URL) throws {
         try Data("#!/usr/bin/env bash\nexit 0\n".utf8).write(to: url, options: .atomic)
         try FileManager.default.setAttributes([.posixPermissions: NSNumber(value: 0o755)], ofItemAtPath: url.path)
+    }
+
+    @MainActor
+    private func buildReadinessScenarioSnapshot(
+        scenarioID: String,
+        checks: [[String: Any]],
+        overallStatus: String? = nil
+    ) throws -> ReadinessScenarioSnapshot {
+        let payload = preflightPayloadData(
+            checks: checks,
+            overallStatus: resolvedOverallStatus(for: checks, explicit: overallStatus)
+        )
+
+        let preflight = makePreflightViewModel(payload: payload)
+        preflight.runLivePreflight()
+        guard case let .completed(envelope) = preflight.state else {
+            throw NSError(
+                domain: "RecorditAppTests",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "Preflight scenario \(scenarioID) did not complete"]
+            )
+        }
+        guard let evaluation = preflight.gatingEvaluation else {
+            throw NSError(
+                domain: "RecorditAppTests",
+                code: 2,
+                userInfo: [NSLocalizedDescriptionKey: "Preflight scenario \(scenarioID) missing gating evaluation"]
+            )
+        }
+
+        let root = RootCompositionController(
+            environment: AppEnvironment.preview().replacing(
+                preflightRunner: makePreflightRunner(payload: payload)
+            ),
+            firstRun: true
+        )
+        root.runPreflight()
+
+        let failingCheckIDs = envelope.checks
+            .filter { $0.status == .fail }
+            .map(\.id)
+            .sorted()
+        let preflightCheckIDs = envelope.checks.map(\.id).sorted()
+        let mappedCheckIDs = evaluation.mappedChecks.map { $0.check.id }.sorted()
+
+        return ReadinessScenarioSnapshot(
+            scenarioID: scenarioID,
+            preflightKind: envelope.kind,
+            preflightOverallStatus: envelope.overallStatus.rawValue,
+            preflightCheckIDs: preflightCheckIDs,
+            mappedCheckIDs: mappedCheckIDs,
+            failingCheckIDs: failingCheckIDs,
+            mappedBlockingDomain: preflight.primaryBlockingDomain?.rawValue ?? "none",
+            preflightCanProceedLive: preflight.canProceedToLiveTranscribe,
+            preflightCanOfferRecordOnlyFallback: preflight.canOfferRecordOnlyFallback,
+            rootPreflightCanProceed: root.snapshot.preflightCanProceed,
+            rootPreflightCanOfferRecordOnlyFallback: root.snapshot.preflightCanOfferRecordOnlyFallback,
+            rootPreflightRequiresWarningAck: root.snapshot.preflightRequiresWarningAck,
+            rootPreflightSummary: root.snapshot.preflightSummary
+        )
+    }
+
+    private func resolvedOverallStatus(for checks: [[String: Any]], explicit: String?) -> String {
+        if let explicit {
+            return explicit
+        }
+        if checks.contains(where: { (($0["status"] as? String) ?? "").uppercased() == "FAIL" }) {
+            return "FAIL"
+        }
+        if checks.contains(where: { (($0["status"] as? String) ?? "").uppercased() == "WARN" }) {
+            return "WARN"
+        }
+        return "PASS"
+    }
+
+    private func csvField(_ value: String) -> String {
+        let escaped = value.replacingOccurrences(of: "\"", with: "\"\"")
+        return "\"\(escaped)\""
+    }
+
+    private func persistReadinessScenarioSnapshotsIfRequested(_ snapshots: [ReadinessScenarioSnapshot]) throws {
+        guard
+            let artifactPath = ProcessInfo.processInfo.environment[ReadinessScenarioArtifact.pathEnv],
+            !artifactPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        else {
+            return
+        }
+
+        let url = URL(fileURLWithPath: artifactPath)
+        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+
+        var lines = [String]()
+        lines.append(
+            "scenario_id,preflight_kind,preflight_overall_status,preflight_check_ids,mapped_check_ids,failing_check_ids,blocking_domain,preflight_can_proceed_live,preflight_record_only_fallback,root_preflight_can_proceed,root_preflight_record_only_fallback,root_preflight_requires_warning_ack,root_preflight_summary"
+        )
+        for snapshot in snapshots {
+            lines.append([
+                csvField(snapshot.scenarioID),
+                csvField(snapshot.preflightKind),
+                csvField(snapshot.preflightOverallStatus),
+                csvField(snapshot.preflightCheckIDs.joined(separator: "|")),
+                csvField(snapshot.mappedCheckIDs.joined(separator: "|")),
+                csvField(snapshot.failingCheckIDs.joined(separator: "|")),
+                csvField(snapshot.mappedBlockingDomain),
+                snapshot.preflightCanProceedLive ? "true" : "false",
+                snapshot.preflightCanOfferRecordOnlyFallback ? "true" : "false",
+                snapshot.rootPreflightCanProceed ? "true" : "false",
+                snapshot.rootPreflightCanOfferRecordOnlyFallback ? "true" : "false",
+                snapshot.rootPreflightRequiresWarningAck ? "true" : "false",
+                csvField(snapshot.rootPreflightSummary),
+            ].joined(separator: ","))
+        }
+
+        try lines.joined(separator: "\n").appending("\n").write(to: url, atomically: true, encoding: .utf8)
     }
 
     private func persistResponsivenessGateSnapshotIfRequested(_ snapshot: ResponsivenessGateSnapshot) throws {
