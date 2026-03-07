@@ -903,6 +903,7 @@ struct MainWindowView: View {
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .onAppear {
             sessionsController.activate(navigationState: controller.snapshot.navigationState)
         }
@@ -912,66 +913,69 @@ struct MainWindowView: View {
     }
 
     private var sessionsFiltersToolbar: some View {
-        HStack(spacing: 10) {
-            TextField(
-                "Search by session ID or transcript text",
-                text: Binding(
-                    get: { sessionsController.filters.searchText },
-                    set: { sessionsController.setSearchText($0) }
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 10) {
+                TextField(
+                    "Search by session ID or transcript text",
+                    text: Binding(
+                        get: { sessionsController.filters.searchText },
+                        set: { sessionsController.setSearchText($0) }
+                    )
                 )
-            )
-            .textFieldStyle(.roundedBorder)
-            .frame(minWidth: 260)
-            .accessibilityIdentifier("sessions_search")
-            .focused($sessionsFocusTarget, equals: .search)
+                .textFieldStyle(.roundedBorder)
+                .frame(minWidth: 200)
+                .accessibilityIdentifier("sessions_search")
+                .focused($sessionsFocusTarget, equals: .search)
 
-            Picker(
-                "Mode",
-                selection: Binding(
-                    get: { sessionsController.filters.mode },
-                    set: { sessionsController.setModeFilter($0) }
-                )
-            ) {
-                ForEach(SessionListViewModel.ModeFilter.allCases, id: \.self) { mode in
-                    Text(modeLabel(mode)).tag(mode)
+                Picker(
+                    "Mode",
+                    selection: Binding(
+                        get: { sessionsController.filters.mode },
+                        set: { sessionsController.setModeFilter($0) }
+                    )
+                ) {
+                    ForEach(SessionListViewModel.ModeFilter.allCases, id: \.self) { mode in
+                        Text(modeLabel(mode)).tag(mode)
+                    }
                 }
-            }
-            .frame(width: 170)
-            .accessibilityIdentifier("sessions_mode_filter")
+                .frame(minWidth: 120, idealWidth: 150)
+                .accessibilityIdentifier("sessions_mode_filter")
 
-            Picker(
-                "Status",
-                selection: Binding(
-                    get: { sessionsController.filters.status },
-                    set: { sessionsController.setStatusFilter($0) }
-                )
-            ) {
-                ForEach(SessionListViewModel.StatusFilter.allCases, id: \.self) { status in
-                    Text(statusLabel(status)).tag(status)
+                Picker(
+                    "Status",
+                    selection: Binding(
+                        get: { sessionsController.filters.status },
+                        set: { sessionsController.setStatusFilter($0) }
+                    )
+                ) {
+                    ForEach(SessionListViewModel.StatusFilter.allCases, id: \.self) { status in
+                        Text(statusLabel(status)).tag(status)
+                    }
                 }
-            }
-            .frame(width: 170)
-            .accessibilityIdentifier("sessions_status_filter")
+                .frame(minWidth: 120, idealWidth: 150)
+                .accessibilityIdentifier("sessions_status_filter")
 
-            Button("Clear") {
-                sessionsController.clearFilters()
-            }
-            .buttonStyle(.bordered)
-            .keyboardShortcut(.delete, modifiers: [.command, .option])
+                Button("Clear") {
+                    sessionsController.clearFilters()
+                }
+                .buttonStyle(.bordered)
+                .keyboardShortcut(.delete, modifiers: [.command, .option])
 
-            Button("Refresh") {
-                sessionsController.refresh()
-            }
-            .buttonStyle(.borderedProminent)
+                Button("Refresh") {
+                    sessionsController.refresh()
+                }
+                .buttonStyle(.borderedProminent)
 
-            Button("Focus Search (Shortcut)") {
-                sessionsFocusTarget = .search
+                Button("Focus Search (Shortcut)") {
+                    sessionsFocusTarget = .search
+                }
+                .keyboardShortcut("f", modifiers: [.command])
+                .frame(width: 1, height: 1)
+                .opacity(0.001)
+                .accessibilityHidden(true)
             }
-            .keyboardShortcut("f", modifiers: [.command])
-            .frame(width: 1, height: 1)
-            .opacity(0.001)
-            .accessibilityHidden(true)
         }
+        .fixedSize(horizontal: false, vertical: true)
     }
 
     private var sessionsListPane: some View {

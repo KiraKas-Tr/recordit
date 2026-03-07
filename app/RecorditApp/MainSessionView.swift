@@ -393,8 +393,14 @@ final class MainSessionController: ObservableObject {
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         let timestamp = formatter.string(from: Date()).replacingOccurrences(of: ":", with: "-")
-        let root = FileManager.default.temporaryDirectory
-            .appendingPathComponent("recordit-ui-sessions", isDirectory: true)
+        let sessionsRoot: URL
+        do {
+            sessionsRoot = try FileSystemSessionLibraryService.defaultSessionsRoot()
+        } catch {
+            sessionsRoot = FileManager.default.temporaryDirectory
+                .appendingPathComponent("recordit-ui-sessions", isDirectory: true)
+        }
+        let root = sessionsRoot
             .appendingPathComponent("\(timestamp)-\(mode.rawValue)", isDirectory: true)
 
         try? FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
