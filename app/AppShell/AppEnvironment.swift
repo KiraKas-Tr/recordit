@@ -30,13 +30,30 @@ public struct FileSystemManifestService: ManifestService {
         let status = (summary?["session_status"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
         let trust = payload["trust"] as? [String: Any]
         let noticeCount = (trust?["notice_count"] as? NSNumber)?.intValue ?? 0
-        let artifacts = payload["artifacts"] as? [String: Any]
+
+        // The Rust manifest stores artifacts under session_summary.artifacts, not
+        // as a top-level object.  Fall back to the top-level out_wav field when
+        // neither location provides a match (forward compatibility).
+        let topLevelArtifacts = payload["artifacts"] as? [String: Any]
+        let summaryArtifacts = summary?["artifacts"] as? [String: Any]
+        let artifacts = topLevelArtifacts ?? summaryArtifacts
+
+        // session_id may not be present in the Rust manifest; derive it from
+        // the session directory name (e.g. "2026-03-07T09-48-21.219Z-live").
+        let resolvedSessionID: String = {
+            if let explicit = sessionID, !explicit.isEmpty { return explicit }
+            return path.deletingLastPathComponent().lastPathComponent
+        }()
+
+        // out_wav may live at the top level when no artifacts object is present.
+        let outWavRaw = (artifacts?["out_wav"] as? String)
+            ?? (payload["out_wav"] as? String)
 
         guard
-            let resolvedSessionID = sessionID, !resolvedSessionID.isEmpty,
+            !resolvedSessionID.isEmpty,
             let resolvedMode = runtimeMode, !resolvedMode.isEmpty,
             let resolvedStatus = status, !resolvedStatus.isEmpty,
-            let outWav = artifacts?["out_wav"] as? String,
+            let outWav = outWavRaw,
             !outWav.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         else {
             throw AppServiceError(

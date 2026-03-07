@@ -39,10 +39,12 @@ fn ensure_stop_capture_signal_handler() -> Result<()> {
         return Ok(());
     }
 
+    // With the `termination` feature, ctrlc catches both SIGINT and SIGTERM,
+    // allowing graceful shutdown even when the Swift host escalates to SIGTERM.
     ctrlc::set_handler(|| {
         STOP_CAPTURE_REQUESTED.store(true, Ordering::Relaxed);
     })
-    .context("failed to install capture stop signal handler")?;
+    .context("failed to install capture stop signal handler (SIGINT+SIGTERM)")?;
 
     let _ = STOP_CAPTURE_SIGNAL_HANDLER_READY.set(());
     Ok(())
