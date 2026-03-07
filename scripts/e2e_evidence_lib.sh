@@ -178,6 +178,41 @@ with combined_log.open("a", encoding="utf-8") as combined_handle, stdout_log.ope
 PY
 }
 
+evidence_manifest_relpath_from_args() {
+  local manifest_relpath="evidence_contract.json"
+  while [[ $# -gt 0 ]]; do
+    if [[ "$1" == "--manifest-relpath" ]]; then
+      shift
+      if [[ $# -eq 0 ]]; then
+        echo "error: --manifest-relpath requires a value" >&2
+        return 2
+      fi
+      manifest_relpath="$1"
+    fi
+    shift
+  done
+  printf '%s\n' "$manifest_relpath"
+}
+
+evidence_validate_contract() {
+  local evidence_root="$1"
+  local lane_type="$2"
+  local manifest_relpath="$3"
+
+  local lib_dir
+  lib_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+  local manifest_path="$evidence_root/$manifest_relpath"
+  local manifest_dir
+  manifest_dir="$(dirname "$manifest_path")"
+  mkdir -p "$manifest_dir"
+  python3 "$lib_dir/validate_e2e_evidence_contract.py" \
+    --root "$evidence_root" \
+    --manifest "$manifest_path" \
+    --expect-lane-type "$lane_type" \
+    --json >"$manifest_dir/validation.json"
+}
+
 evidence_render_contract() {
   local evidence_root="$1"
   local scenario_id="$2"
@@ -187,6 +222,8 @@ evidence_render_contract() {
 
   local lib_dir
   lib_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  local manifest_relpath
+  manifest_relpath="$(evidence_manifest_relpath_from_args "$@")"
 
   python3 "$lib_dir/render_shell_e2e_evidence_contract.py" \
     --root "$evidence_root" \
@@ -194,6 +231,8 @@ evidence_render_contract() {
     --lane-type "$lane_type" \
     --phase-manifest "$phase_manifest" \
     "$@"
+
+  evidence_validate_contract "$evidence_root" "$lane_type" "$manifest_relpath"
 }
 
 evidence_render_xctest_contract() {
@@ -204,10 +243,14 @@ evidence_render_xctest_contract() {
 
   local lib_dir
   lib_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  local manifest_relpath
+  manifest_relpath="$(evidence_manifest_relpath_from_args "$@")"
 
   python3 "$lib_dir/render_xctest_evidence_contract.py" \
     --root "$evidence_root" \
     --scenario-id "$scenario_id" \
     --lane-type "$lane_type" \
     "$@"
+
+  evidence_validate_contract "$evidence_root" "$lane_type" "$manifest_relpath"
 }
