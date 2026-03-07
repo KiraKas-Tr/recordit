@@ -582,4 +582,241 @@ mod tests {
         assert!(blocking.is_disjoint(&diagnostic));
         assert!(warn_ack.is_disjoint(&diagnostic));
     }
+
+    fn scenario_report(checks: Vec<(&'static str, CheckStatus)>) -> PreflightReport {
+        PreflightReport {
+            generated_at_utc: "2026-03-07T00:00:00Z".to_string(),
+            checks: checks
+                .into_iter()
+                .map(|(id, status)| match status {
+                    CheckStatus::Pass => PreflightCheck::pass(id, format!("{id} check passed")),
+                    CheckStatus::Warn => PreflightCheck::warn(
+                        id,
+                        format!("{id} check warned"),
+                        format!("{id} remediation guidance"),
+                    ),
+                    CheckStatus::Fail => PreflightCheck::fail(
+                        id,
+                        format!("{id} check failed"),
+                        format!("{id} remediation guidance"),
+                    ),
+                })
+                .collect(),
+        }
+    }
+
+    fn all_check_ids_pass() -> Vec<(&'static str, CheckStatus)> {
+        vec![
+            ("model_path", CheckStatus::Pass),
+            ("out_wav", CheckStatus::Pass),
+            ("out_jsonl", CheckStatus::Pass),
+            ("out_manifest", CheckStatus::Pass),
+            ("sample_rate", CheckStatus::Pass),
+            ("screen_capture_access", CheckStatus::Pass),
+            ("display_availability", CheckStatus::Pass),
+            ("microphone_access", CheckStatus::Pass),
+            ("backend_runtime", CheckStatus::Pass),
+        ]
+    }
+
+    fn with_override(
+        mut checks: Vec<(&'static str, CheckStatus)>,
+        id: &'static str,
+        status: CheckStatus,
+    ) -> Vec<(&'static str, CheckStatus)> {
+        for entry in &mut checks {
+            if entry.0 == id {
+                entry.1 = status;
+                return checks;
+            }
+        }
+        checks.push((id, status));
+        checks
+    }
+
+    #[test]
+    fn all_pass_scenario_reports_pass_overall_with_no_remediation() {
+        let report = scenario_report(all_check_ids_pass());
+        assert!(
+            matches!(report.overall_status(), CheckStatus::Pass),
+            "all-pass scenario should report overall Pass"
+        );
+        for check in &report.checks {
+            assert!(
+                matches!(check.status, CheckStatus::Pass),
+                "check {} should be Pass",
+                check.id
+            );
+            assert!(
+                check.remediation.is_none(),
+                "pass check {} should carry no remediation",
+                check.id
+            );
+        }
+    }
+
+    #[test]
+    fn model_path_fail_produces_overall_fail_with_remediation() {
+        let checks = with_override(all_check_ids_pass(), "model_path", CheckStatus::Fail);
+        let report = scenario_report(checks);
+        assert!(
+            matches!(report.overall_status(), CheckStatus::Fail),
+            "model_path failure should produce overall Fail"
+        );
+
+        let model_check = report.checks.iter().find(|c| c.id == "model_path").unwrap();
+        assert!(matches!(model_check.status, CheckStatus::Fail));
+        assert!(
+            model_check.remediation.is_some(),
+            "model_path failure should carry remediation text"
+        );
+
+        assert!(
+            PREFLIGHT_BACKEND_MODEL_CHECK_IDS.contains(&"model_path"),
+            "model_path must belong to the backend_model domain"
+        );
+    }
+
+    #[test]
+    fn screen_capture_fail_blocks_with_tcc_capture_domain() {
+        let checks = with_override(
+            all_check_ids_pass(),
+            "screen_capture_access",
+            CheckStatus::Fail,
+        );
+        let report = scenario_report(checks);
+        assert!(
+            matches!(report.overall_status(), CheckStatus::Fail),
+            "screen_capture_access failure should produce overall Fail"
+        );
+
+        let screen_check = report
+            .checks
+            .iter()
+            .find(|c| c.id == "screen_capture_access")
+            .unwrap();
+        assert!(matches!(screen_check.status, CheckStatus::Fail));
+        assert!(screen_check.remediation.is_some());
+
+        assert!(
+            PREFLIGHT_TCC_CAPTURE_CHECK_IDS.contains(&"screen_capture_access"),
+            "screen_capture_access must belong to the tcc_capture domain"
+        );
+        assert!(
+            PREFLIGHT_BLOCKING_CHECK_IDS.contains(&"screen_capture_access"),
+            "screen_capture_access must be a blocking check"
+        );
+    }
+
+    #[test]
+    fn sample_rate_warn_produces_overall_warn_with_ack_required() {
+        let checks = with_override(all_check_ids_pass(), "sample_rate", CheckStatus::Warn);
+        let report = scenario_report(checks);
+        assert!(
+            matches!(report.overall_status(), CheckStatus::Warn),
+            "sample_rate warning should produce overall Warn, not Fail"
+        );
+
+        let rate_check = report
+            .checks
+            .iter()
+            .find(|c| c.id == "sample_rate")
+            .unwrap();
+        assert!(matches!(rate_check.status, CheckStatus::Warn));
+        assert!(
+            rate_check.remediation.is_some(),
+            "sample_rate warning should carry remediation"
+        );
+
+        assert!(
+            PREFLIGHT_WARN_ACK_CHECK_IDS.contains(&"sample_rate"),
+            "sample_rate must be in the warn_ack class"
+        );
+        assert!(
+            PREFLIGHT_RUNTIME_PREFLIGHT_CHECK_IDS.contains(&"sample_rate"),
+            "sample_rate must belong to the runtime_preflight domain"
+        );
+    }
+
+    #[test]
+    fn backend_runtime_warn_produces_warn_with_remediation() {
+        let checks = with_override(all_check_ids_pass(), "backend_runtime", CheckStatus::Warn);
+        let report = scenario_report(checks);
+        assert!(
+            matches!(report.overall_status(), CheckStatus::Warn),
+            "backend_runtime warning should produce overall Warn"
+        );
+
+        let backend_check = report
+            .checks
+            .iter()
+            .find(|c| c.id == "backend_runtime")
+            .unwrap();
+        assert!(matches!(backend_check.status, CheckStatus::Warn));
+        assert!(backend_check.remediation.is_some());
+
+        assert!(
+            PREFLIGHT_WARN_ACK_CHECK_IDS.contains(&"backend_runtime"),
+            "backend_runtime must be in the warn_ack class"
+        );
+        assert!(
+            PREFLIGHT_BACKEND_RUNTIME_CHECK_IDS.contains(&"backend_runtime"),
+            "backend_runtime must belong to the backend_runtime domain"
+        );
+    }
+
+    #[test]
+    fn mixed_fail_and_warn_produces_overall_fail() {
+        let checks = with_override(
+            with_override(all_check_ids_pass(), "model_path", CheckStatus::Fail),
+            "sample_rate",
+            CheckStatus::Warn,
+        );
+        let report = scenario_report(checks);
+        assert!(
+            matches!(report.overall_status(), CheckStatus::Fail),
+            "Fail + Warn should produce overall Fail (Fail dominates)"
+        );
+
+        let model_check = report.checks.iter().find(|c| c.id == "model_path").unwrap();
+        assert!(model_check.remediation.is_some());
+        let rate_check = report
+            .checks
+            .iter()
+            .find(|c| c.id == "sample_rate")
+            .unwrap();
+        assert!(rate_check.remediation.is_some());
+    }
+
+    #[test]
+    fn each_check_id_has_stable_domain_classification() {
+        let all_domain_ids: Vec<&str> = PREFLIGHT_TCC_CAPTURE_CHECK_IDS
+            .iter()
+            .chain(PREFLIGHT_BACKEND_MODEL_CHECK_IDS.iter())
+            .chain(PREFLIGHT_RUNTIME_PREFLIGHT_CHECK_IDS.iter())
+            .chain(PREFLIGHT_BACKEND_RUNTIME_CHECK_IDS.iter())
+            .copied()
+            .collect();
+
+        let blocking_and_warn: Vec<&str> = PREFLIGHT_BLOCKING_CHECK_IDS
+            .iter()
+            .chain(PREFLIGHT_WARN_ACK_CHECK_IDS.iter())
+            .copied()
+            .collect();
+
+        for id in &blocking_and_warn {
+            let domain_count = all_domain_ids.iter().filter(|d| d == &id).count();
+            assert_eq!(
+                domain_count, 1,
+                "check ID {id} should appear in exactly one domain, found {domain_count}"
+            );
+        }
+
+        let all_gating = as_set(&blocking_and_warn);
+        let all_domains = as_set(&all_domain_ids);
+        assert_eq!(
+            all_gating, all_domains,
+            "gating check ID set must equal the union of all domain ID sets"
+        );
+    }
 }

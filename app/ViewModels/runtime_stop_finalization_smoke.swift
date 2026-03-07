@@ -21,6 +21,21 @@ private actor StubRuntimeService: RuntimeService {
     }
 }
 
+private actor DelayedStopRuntimeService: RuntimeService {
+    func startSession(request: RuntimeStartRequest) async throws -> RuntimeLaunchResult {
+        RuntimeLaunchResult(
+            processIdentifier: 4300,
+            sessionRoot: request.outputRoot,
+            startedAt: Date()
+        )
+    }
+
+    func controlSession(processIdentifier _: Int32, action _: RuntimeControlAction) async throws -> RuntimeControlResult {
+        try? await Task.sleep(nanoseconds: 80_000_000)
+        return RuntimeControlResult(accepted: true, detail: "delayed-stop")
+    }
+}
+
 private actor CrashOnStopRuntimeService: RuntimeService {
     private(set) var startInvocations = 0
 
@@ -225,6 +240,23 @@ private func runSmoke() async {
     await pendingThenSuccess.stopCurrentRun()
     check(pendingThenSuccess.state == .completed, "pending manifest should continue polling until final stop status completes")
     check(Date().timeIntervalSince(pendingStopStartedAt) >= 0.05, "pending manifest should not be treated as a terminal stop-finalization success")
+
+    let delayedStopTransition = RuntimeViewModel(
+        runtimeService: DelayedStopRuntimeService(),
+        manifestService: FailedManifestService(manifest: makeManifest(status: "ok")),
+        modelService: model,
+        finalizationTimeoutSeconds: 1,
+        finalizationPollIntervalNanoseconds: 10_000_000
+    )
+    await delayedStopTransition.startLive(outputRoot: tempRoot.appendingPathComponent("transition-delayed-stop", isDirectory: true), explicitModelPath: nil)
+    let delayedStopTask = Task { await delayedStopTransition.stopCurrentRun() }
+    try? await Task.sleep(nanoseconds: 20_000_000)
+    guard case .stopping = delayedStopTransition.state else {
+        check(false, "stopCurrentRun should expose stopping state while runtime control is in flight")
+        return
+    }
+    await delayedStopTask.value
+    check(delayedStopTransition.state == .completed, "delayed stop transition should complete after in-flight stopping state")
 
     let eventuallySuccess = RuntimeViewModel(
         runtimeService: runtime,

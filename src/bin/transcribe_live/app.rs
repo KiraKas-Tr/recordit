@@ -3829,7 +3829,8 @@ mod tests {
         resolve_backend_program, resolve_model_path, run_cleanup_queue_with, run_live_chunk_queue,
         run_streaming_capture_session, runtime_mode_compatibility_matrix,
         select_runtime_execution_branch, transcript_events_from_runtime_output_events,
-        validate_output_path, write_preflight_manifest, write_runtime_jsonl,
+        validate_model_path_for_backend, validate_output_path, write_preflight_manifest,
+        write_runtime_jsonl,
         write_runtime_manifest, AsrBackend, AsrWorkClass, AsrWorkItem, BenchmarkSummary,
         CaptureChunk, CaptureEvent, CaptureSink, ChannelMode, ChannelVadBoundary, CheckStatus,
         CleanupAttemptOutcome, CleanupQueueTelemetry, CleanupTaskStatus,
@@ -8234,6 +8235,164 @@ mod tests {
 
         let resolved = resolve_backend_program(AsrBackend::WhisperCpp, &model_path);
         assert_eq!(resolved, helper_path.to_string_lossy().to_string());
+
+        restore_optional_env("RECORDIT_WHISPERCPP_CLI_PATH", original_env);
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn validate_model_rejects_directory_for_whispercpp() {
+        let _guard = env_lock().lock().unwrap();
+        let original_cwd = env::current_dir().unwrap();
+        let original_env = env::var("RECORDIT_ASR_MODEL").ok();
+        let temp_dir = write_temp_dir("recordit-validate-model-dir-whispercpp");
+
+        env::set_current_dir(&temp_dir).unwrap();
+        unsafe {
+            env::remove_var("RECORDIT_ASR_MODEL");
+        }
+
+        let mut config = TranscribeConfig::default();
+        config.asr_backend = AsrBackend::WhisperCpp;
+        config.asr_model = temp_dir.clone();
+        let err = validate_model_path_for_backend(&config).unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("expects a model file path"),
+            "expected file-path error, got: {message}"
+        );
+
+        restore_env_state(original_cwd, original_env);
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn validate_model_rejects_file_for_whisperkit() {
+        let _guard = env_lock().lock().unwrap();
+        let original_cwd = env::current_dir().unwrap();
+        let original_env = env::var("RECORDIT_ASR_MODEL").ok();
+        let temp_dir = write_temp_dir("recordit-validate-model-file-whisperkit");
+        let model_file = temp_dir.join("model.bin");
+        File::create(&model_file).unwrap();
+
+        env::set_current_dir(&temp_dir).unwrap();
+        unsafe {
+            env::remove_var("RECORDIT_ASR_MODEL");
+        }
+
+        let mut config = TranscribeConfig::default();
+        config.asr_backend = AsrBackend::WhisperKit;
+        config.asr_model = model_file;
+        let err = validate_model_path_for_backend(&config).unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("expects a model directory path"),
+            "expected directory-path error, got: {message}"
+        );
+
+        restore_env_state(original_cwd, original_env);
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn validate_model_accepts_file_for_whispercpp() {
+        let _guard = env_lock().lock().unwrap();
+        let original_cwd = env::current_dir().unwrap();
+        let original_env = env::var("RECORDIT_ASR_MODEL").ok();
+        let temp_dir = write_temp_dir("recordit-validate-model-file-whispercpp");
+        let model_file = temp_dir.join("ggml-tiny.en.bin");
+        File::create(&model_file).unwrap();
+
+        env::set_current_dir(&temp_dir).unwrap();
+        unsafe {
+            env::remove_var("RECORDIT_ASR_MODEL");
+        }
+
+        let mut config = TranscribeConfig::default();
+        config.asr_backend = AsrBackend::WhisperCpp;
+        config.asr_model = model_file.clone();
+        let resolved = validate_model_path_for_backend(&config).unwrap();
+        assert_eq!(resolved.path, model_file);
+
+        restore_env_state(original_cwd, original_env);
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn validate_model_accepts_directory_for_whisperkit() {
+        let _guard = env_lock().lock().unwrap();
+        let original_cwd = env::current_dir().unwrap();
+        let original_env = env::var("RECORDIT_ASR_MODEL").ok();
+        let temp_dir = write_temp_dir("recordit-validate-model-dir-whisperkit");
+        let model_dir = temp_dir.join("whisperkit-model");
+        fs::create_dir_all(&model_dir).unwrap();
+
+        env::set_current_dir(&temp_dir).unwrap();
+        unsafe {
+            env::remove_var("RECORDIT_ASR_MODEL");
+        }
+
+        let mut config = TranscribeConfig::default();
+        config.asr_backend = AsrBackend::WhisperKit;
+        config.asr_model = model_dir.clone();
+        let resolved = validate_model_path_for_backend(&config).unwrap();
+        assert_eq!(resolved.path, model_dir);
+
+        restore_env_state(original_cwd, original_env);
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn model_resolution_error_lists_checked_candidates() {
+        let _guard = env_lock().lock().unwrap();
+        let original_cwd = env::current_dir().unwrap();
+        let original_env = env::var("RECORDIT_ASR_MODEL").ok();
+        let temp_dir = write_temp_dir("recordit-model-no-candidates");
+
+        env::set_current_dir(&temp_dir).unwrap();
+        unsafe {
+            env::remove_var("RECORDIT_ASR_MODEL");
+        }
+
+        let config = TranscribeConfig::default();
+        let err = resolve_model_path(&config).unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("Precedence"),
+            "error should describe resolution precedence, got: {message}"
+        );
+        assert!(
+            message.contains("Checked"),
+            "error should list checked candidates, got: {message}"
+        );
+        assert!(
+            message.contains("Remediation"),
+            "error should include remediation guidance, got: {message}"
+        );
+
+        restore_env_state(original_cwd, original_env);
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn resolve_backend_program_falls_back_to_bare_helper_name() {
+        let _guard = env_lock().lock().unwrap();
+        let original_env = env::var("RECORDIT_WHISPERCPP_CLI_PATH").ok();
+        unsafe {
+            env::remove_var("RECORDIT_WHISPERCPP_CLI_PATH");
+        }
+
+        let temp_dir = write_temp_dir("recordit-backend-program-bare-fallback");
+        let model_dir = temp_dir.join("empty-models");
+        fs::create_dir_all(&model_dir).unwrap();
+        let model_path = model_dir.join("ggml.bin");
+        File::create(&model_path).unwrap();
+
+        let resolved = resolve_backend_program(AsrBackend::WhisperCpp, &model_path);
+        assert_eq!(
+            resolved, "whisper-cli",
+            "expected bare helper name fallback, got: {resolved}"
+        );
 
         restore_optional_env("RECORDIT_WHISPERCPP_CLI_PATH", original_env);
         let _ = fs::remove_dir_all(temp_dir);

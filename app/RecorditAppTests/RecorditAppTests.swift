@@ -360,6 +360,131 @@ final class RecorditAppTests: XCTestCase {
         XCTAssertEqual(binaries.sequoiaCapture.path, pathCapture.path)
     }
 
+    func testModelResolutionServicePrecedenceExplicitThenEnvironmentThenBundledDefault() throws {
+        let tempRoot = try makeTemporaryDirectory(prefix: "recordit-model-precedence")
+        defer { try? FileManager.default.removeItem(at: tempRoot) }
+
+        let explicitModelPath = tempRoot.appendingPathComponent("explicit-model.bin")
+        let envModelPath = tempRoot.appendingPathComponent("env-model.bin")
+        let bundleResources = tempRoot.appendingPathComponent("RecorditResources", isDirectory: true)
+        let bundledModelPath = bundleResources
+            .appendingPathComponent("runtime/models/whispercpp", isDirectory: true)
+            .appendingPathComponent("ggml-tiny.en.bin")
+
+        try Data("explicit".utf8).write(to: explicitModelPath, options: .atomic)
+        try Data("env".utf8).write(to: envModelPath, options: .atomic)
+        try FileManager.default.createDirectory(
+            at: bundledModelPath.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try Data("bundled".utf8).write(to: bundledModelPath, options: .atomic)
+
+        let explicitResolver = FileSystemModelResolutionService(
+            environment: ["RECORDIT_ASR_MODEL": envModelPath.path],
+            currentDirectoryURL: tempRoot,
+            bundleResourceURL: bundleResources
+        )
+        let explicitResolved = try explicitResolver.resolveModel(
+            ModelResolutionRequest(explicitModelPath: explicitModelPath, backend: "whispercpp")
+        )
+        XCTAssertEqual(explicitResolved.resolvedPath, explicitModelPath)
+        XCTAssertEqual(explicitResolved.source, "ui selected path")
+
+        let envResolved = try explicitResolver.resolveModel(
+            ModelResolutionRequest(explicitModelPath: nil, backend: "whispercpp")
+        )
+        XCTAssertEqual(envResolved.resolvedPath, envModelPath)
+        XCTAssertEqual(envResolved.source, "RECORDIT_ASR_MODEL")
+
+        let bundledResolver = FileSystemModelResolutionService(
+            environment: [:],
+            currentDirectoryURL: tempRoot,
+            bundleResourceURL: bundleResources
+        )
+        let bundledResolved = try bundledResolver.resolveModel(
+            ModelResolutionRequest(explicitModelPath: nil, backend: "whispercpp")
+        )
+        XCTAssertEqual(bundledResolved.resolvedPath, bundledModelPath)
+        XCTAssertEqual(bundledResolved.source, "backend default")
+    }
+
+    func testModelResolutionServiceBundlePathIsDeterministicAndDoesNotFallbackToRepoRelativeWhenBundledContextPresent() throws {
+        let tempRoot = try makeTemporaryDirectory(prefix: "recordit-model-bundle-missing")
+        defer { try? FileManager.default.removeItem(at: tempRoot) }
+
+        let bundleResources = tempRoot.appendingPathComponent("RecorditResources", isDirectory: true)
+        try FileManager.default.createDirectory(at: bundleResources, withIntermediateDirectories: true)
+
+        let repoRelativeModelPath = tempRoot
+            .appendingPathComponent("artifacts/bench/models/whispercpp", isDirectory: true)
+            .appendingPathComponent("ggml-tiny.en.bin")
+        try FileManager.default.createDirectory(
+            at: repoRelativeModelPath.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try Data("repo-relative".utf8).write(to: repoRelativeModelPath, options: .atomic)
+
+        let resolver = FileSystemModelResolutionService(
+            environment: [:],
+            currentDirectoryURL: tempRoot,
+            bundleResourceURL: bundleResources
+        )
+
+        do {
+            _ = try resolver.resolveModel(
+                ModelResolutionRequest(explicitModelPath: nil, backend: "whispercpp")
+            )
+            XCTFail("Expected missing bundled model to fail in app-bundled context")
+        } catch let error as AppServiceError {
+            XCTAssertEqual(error.code, .modelUnavailable)
+            XCTAssertTrue(
+                error.remediation.contains("runtime/models/whispercpp/ggml-tiny.en.bin"),
+                "remediation should name deterministic bundled model path"
+            )
+            XCTAssertNotNil(error.debugDetail)
+            XCTAssertTrue(
+                error.debugDetail?.contains("attempted=") == true,
+                "debug detail should enumerate attempted default paths"
+            )
+            XCTAssertTrue(
+                error.debugDetail?.contains("runtime/models/whispercpp/ggml-tiny.en.bin") == true,
+                "debug detail should include deterministic bundled model lookup path"
+            )
+            XCTAssertFalse(
+                error.debugDetail?.contains(repoRelativeModelPath.path) == true,
+                "bundled context must not silently fallback to repo-relative defaults"
+            )
+        } catch {
+            XCTFail("Unexpected error: \(error)")
+        }
+    }
+
+    @MainActor
+    func testModelSetupDiagnosticsExposeResolvedModelSourceAttribution() throws {
+        let tempRoot = try makeTemporaryDirectory(prefix: "recordit-model-diagnostics")
+        defer { try? FileManager.default.removeItem(at: tempRoot) }
+
+        let envModelPath = tempRoot.appendingPathComponent("env-model.bin")
+        try Data("env".utf8).write(to: envModelPath, options: .atomic)
+
+        let resolver = FileSystemModelResolutionService(
+            environment: ["RECORDIT_ASR_MODEL": envModelPath.path],
+            currentDirectoryURL: tempRoot,
+            bundleResourceURL: nil
+        )
+        let modelSetup = ModelSetupViewModel(modelResolutionService: resolver)
+        modelSetup.chooseBackend("whispercpp")
+        modelSetup.validateCurrentSelection()
+
+        guard case .ready = modelSetup.state else {
+            XCTFail("Expected model setup to resolve from RECORDIT_ASR_MODEL")
+            return
+        }
+        XCTAssertEqual(modelSetup.diagnostics?.asrModel, envModelPath.path)
+        XCTAssertEqual(modelSetup.diagnostics?.asrModelSource, "RECORDIT_ASR_MODEL")
+        XCTAssertEqual(modelSetup.diagnostics?.asrModelChecksumStatus, "available")
+    }
+
     @MainActor
     func testRuntimeViewModelStartStopFinalizationCompletes() async {
         let runtimeService = DelayingRuntimeService()

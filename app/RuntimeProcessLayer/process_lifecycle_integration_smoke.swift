@@ -115,6 +115,33 @@ private func readTrimmedUTF8File(_ url: URL, message: String) throws -> String {
         .trimmingCharacters(in: .whitespacesAndNewlines)
 }
 
+private func detailValue(_ detail: String, for key: String) -> String? {
+    let prefix = "\(key)="
+    for token in detail.split(separator: ",") {
+        let trimmed = token.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.hasPrefix(prefix) {
+            return String(trimmed.dropFirst(prefix.count))
+        }
+    }
+    return nil
+}
+
+private func requiredDetailUInt64(_ detail: String, key: String, message: String) -> UInt64 {
+    guard let raw = detailValue(detail, for: key), let value = UInt64(raw) else {
+        check(false, message)
+        return 0
+    }
+    return value
+}
+
+private func requiredDetailDouble(_ detail: String, key: String, message: String) -> Double {
+    guard let raw = detailValue(detail, for: key), let value = Double(raw) else {
+        check(false, message)
+        return 0
+    }
+    return value
+}
+
 @MainActor
 private func runSmoke() async throws {
     let tempRoot = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
@@ -188,6 +215,35 @@ private func runSmoke() async throws {
         while :; do
           if [ -f "$out_root/session.stop.request" ]; then
             printf REQUEST > "$out_root/stop-signal.txt"
+            exit 0
+          fi
+        done
+        """
+    )
+
+    let warmupFallbackWithManifestScript = binDir.appendingPathComponent("recordit-warmup-fallback-manifest.sh")
+    try makeExecutableScript(
+        at: warmupFallbackWithManifestScript,
+        body: """
+        #!/bin/sh
+        out_root=""
+        while [ "$#" -gt 0 ]; do
+          case "$1" in
+            --output-root) out_root="$2"; shift 2 ;;
+            *) shift ;;
+          esac
+        done
+        [ -n "$out_root" ] && mkdir -p "$out_root"
+        : > "$out_root/warmup.ready"
+        trap '' TERM
+        trap 'printf INT > "$out_root/stop-signal.txt"; printf "{}" > "$out_root/session.manifest.json"; printf "partial transcript\n" > "$out_root/session.jsonl"; : > "$out_root/session.wav"; exit 0' INT
+        sleep 1
+        while :; do
+          if [ -f "$out_root/session.stop.request" ]; then
+            printf REQUEST > "$out_root/stop-signal.txt"
+            printf "{}" > "$out_root/session.manifest.json"
+            printf "partial transcript\n" > "$out_root/session.jsonl"
+            : > "$out_root/session.wav"
             exit 0
           fi
         done
@@ -444,6 +500,50 @@ private func runSmoke() async throws {
         }
     }
 
+    // Immediate stop after launch should settle via graceful-timeout -> interrupt fallback with deterministic telemetry.
+    do {
+        let service = makeRuntimeService(recorditPath: liveScript, sequoiaPath: captureScript, stopTimeoutSeconds: 0.4)
+        let outputRoot = tempRoot.appendingPathComponent("live-immediate-stop", isDirectory: true)
+        try FileManager.default.createDirectory(at: outputRoot, withIntermediateDirectories: true)
+        let launch = try await service.startSession(
+            request: RuntimeStartRequest(mode: .live, outputRoot: outputRoot)
+        )
+        let control = try await service.controlSession(processIdentifier: launch.processIdentifier, action: .stop)
+        check(control.accepted, "immediate stop should be accepted")
+        check(control.detail.contains("stop_strategy=interrupt_fallback"), "immediate stop should escalate to interrupt fallback when graceful handshake cannot complete")
+        check(control.detail.contains("escalation_reason=graceful_handshake_timeout"), "immediate stop should report graceful-timeout escalation reason")
+        let gracefulWaitMs = requiredDetailUInt64(control.detail, key: "graceful_wait_ms", message: "immediate stop should report graceful_wait_ms telemetry")
+        let interruptWaitMs = requiredDetailUInt64(control.detail, key: "interrupt_wait_ms", message: "immediate stop should report interrupt_wait_ms telemetry")
+        let terminateWaitMs = requiredDetailUInt64(control.detail, key: "terminate_wait_ms", message: "immediate stop should report terminate_wait_ms telemetry")
+        check(gracefulWaitMs > 0, "immediate stop should consume some graceful wait budget before fallback")
+        check(interruptWaitMs > 0, "immediate stop should consume interrupt wait budget once fallback starts")
+        check(terminateWaitMs == 0, "immediate stop should not consume terminate budget when interrupt fallback succeeds")
+    }
+
+    // Warmup stop should also follow deterministic fallback timing and signal INT while runtime is not yet active.
+    do {
+        let service = makeRuntimeService(recorditPath: warmupFallbackWithManifestScript, sequoiaPath: captureScript, stopTimeoutSeconds: 0.4)
+        let outputRoot = tempRoot.appendingPathComponent("live-warmup-stop", isDirectory: true)
+        try FileManager.default.createDirectory(at: outputRoot, withIntermediateDirectories: true)
+        let launch = try await service.startSession(
+            request: RuntimeStartRequest(mode: .live, outputRoot: outputRoot)
+        )
+        let readyPath = outputRoot.appendingPathComponent("warmup.ready")
+        await waitForFile(at: readyPath, timeoutSeconds: 2, message: "warmup helper should report readiness marker before stop")
+        let control = try await service.controlSession(processIdentifier: launch.processIdentifier, action: .stop)
+        check(control.accepted, "warmup stop should be accepted")
+        check(control.detail.contains("stop_strategy=interrupt_fallback"), "warmup stop should escalate to interrupt fallback when handshake cannot complete during warmup")
+        check(control.detail.contains("escalation_reason=graceful_handshake_timeout"), "warmup stop should report graceful-timeout escalation reason")
+        let gracefulWaitMs = requiredDetailUInt64(control.detail, key: "graceful_wait_ms", message: "warmup stop should report graceful_wait_ms telemetry")
+        let interruptWaitMs = requiredDetailUInt64(control.detail, key: "interrupt_wait_ms", message: "warmup stop should report interrupt_wait_ms telemetry")
+        check(gracefulWaitMs > 0, "warmup stop should burn graceful wait budget before fallback")
+        check(interruptWaitMs > 0, "warmup stop should burn interrupt wait budget on fallback")
+        let signalPath = outputRoot.appendingPathComponent("stop-signal.txt")
+        await waitForFile(at: signalPath, timeoutSeconds: 1, message: "warmup fallback helper should write stop signal")
+        let signal = try readTrimmedUTF8File(signalPath, message: "warmup fallback helper should write readable stop signal")
+        check(signal == "INT", "warmup fallback should deliver INT while runtime remains in warmup")
+    }
+
     // Graceful stop should prefer the drain/finalization handshake before interrupt fallback.
     do {
         let service = makeRuntimeService(recorditPath: gracefulStopScript, sequoiaPath: captureScript, stopTimeoutSeconds: 0.4)
@@ -458,6 +558,15 @@ private func runSmoke() async throws {
         check(control.accepted, "graceful stop should be accepted")
         check(control.detail.contains("stop_strategy=graceful_handshake"), "graceful stop should report graceful handshake strategy metadata")
         check(control.detail.contains("graceful_request_written=true"), "graceful stop diagnostics should report graceful request marker write")
+        check(control.detail.contains("escalation_reason=none"), "graceful stop should report no escalation reason")
+        let gracefulWaitMs = requiredDetailUInt64(control.detail, key: "graceful_wait_ms", message: "graceful stop should report graceful_wait_ms telemetry")
+        let interruptWaitMs = requiredDetailUInt64(control.detail, key: "interrupt_wait_ms", message: "graceful stop should report interrupt_wait_ms telemetry")
+        let terminateWaitMs = requiredDetailUInt64(control.detail, key: "terminate_wait_ms", message: "graceful stop should report terminate_wait_ms telemetry")
+        let gracefulTimeoutSeconds = requiredDetailDouble(control.detail, key: "graceful_timeout_seconds", message: "graceful stop should report graceful timeout budget")
+        check(gracefulWaitMs > 0, "graceful stop should spend some graceful wait budget before completion")
+        check(interruptWaitMs == 0, "graceful stop should not spend interrupt budget")
+        check(terminateWaitMs == 0, "graceful stop should not spend terminate budget")
+        check(gracefulTimeoutSeconds > 0, "graceful stop should expose a positive graceful timeout budget")
         let signalPath = outputRoot.appendingPathComponent("stop-signal.txt")
         await waitForFile(at: signalPath, timeoutSeconds: 1, message: "graceful stop helper should write stop signal")
         let signal = try readTrimmedUTF8File(signalPath, message: "graceful stop helper should write readable stop signal")
@@ -517,6 +626,12 @@ private func runSmoke() async throws {
         check(control.accepted, "interrupt fallback stop should be accepted")
         check(control.detail.contains("stop_strategy=interrupt_fallback"), "interrupt fallback should emit explicit strategy diagnostics")
         check(control.detail.contains("escalation_reason=graceful_handshake_timeout"), "interrupt fallback should record graceful-timeout escalation reason")
+        let gracefulWaitMs = requiredDetailUInt64(control.detail, key: "graceful_wait_ms", message: "interrupt fallback should report graceful_wait_ms telemetry")
+        let interruptWaitMs = requiredDetailUInt64(control.detail, key: "interrupt_wait_ms", message: "interrupt fallback should report interrupt_wait_ms telemetry")
+        let terminateWaitMs = requiredDetailUInt64(control.detail, key: "terminate_wait_ms", message: "interrupt fallback should report terminate_wait_ms telemetry")
+        check(gracefulWaitMs > 0, "interrupt fallback should spend graceful wait budget before escalation")
+        check(interruptWaitMs > 0, "interrupt fallback should spend interrupt wait budget")
+        check(terminateWaitMs == 0, "interrupt fallback should not spend terminate wait budget when INT succeeds")
         let signalPath = outputRoot.appendingPathComponent("stop-signal.txt")
         await waitForFile(at: signalPath, timeoutSeconds: 1, message: "interrupt fallback helper should write stop signal")
         let signal = try readTrimmedUTF8File(signalPath, message: "interrupt fallback helper should write readable stop signal")
@@ -537,10 +652,47 @@ private func runSmoke() async throws {
         check(control.accepted, "terminate fallback stop should be accepted")
         check(control.detail.contains("stop_strategy=terminate_fallback"), "terminate fallback should emit explicit strategy diagnostics")
         check(control.detail.contains("escalation_reason=interrupt_timeout"), "terminate fallback should report interrupt-timeout escalation reason")
+        let gracefulWaitMs = requiredDetailUInt64(control.detail, key: "graceful_wait_ms", message: "terminate fallback should report graceful_wait_ms telemetry")
+        let interruptWaitMs = requiredDetailUInt64(control.detail, key: "interrupt_wait_ms", message: "terminate fallback should report interrupt_wait_ms telemetry")
+        let terminateWaitMs = requiredDetailUInt64(control.detail, key: "terminate_wait_ms", message: "terminate fallback should report terminate_wait_ms telemetry")
+        check(gracefulWaitMs > 0, "terminate fallback should spend graceful wait budget before escalation")
+        check(interruptWaitMs > 0, "terminate fallback should spend interrupt wait budget before TERM escalation")
+        check(terminateWaitMs > 0, "terminate fallback should spend terminate wait budget before process exits")
         let signalPath = outputRoot.appendingPathComponent("stop-signal.txt")
         await waitForFile(at: signalPath, timeoutSeconds: 1, message: "terminate fallback helper should write stop signal")
         let signal = try readTrimmedUTF8File(signalPath, message: "terminate fallback helper should write readable stop signal")
         check(signal == "TERM", "terminate fallback should deliver TERM after interrupt fallback stalls")
+    }
+
+    // Post-fallback finalization should still classify manifest-driven failures correctly.
+    do {
+        let processService = makeRuntimeService(recorditPath: warmupFallbackWithManifestScript, sequoiaPath: captureScript, stopTimeoutSeconds: 0.4)
+        let outputRoot = tempRoot.appendingPathComponent("live-warmup-fallback-failed-manifest", isDirectory: true)
+        try FileManager.default.createDirectory(at: outputRoot, withIntermediateDirectories: true)
+
+        let viewModel = RuntimeViewModel(
+            runtimeService: processService,
+            manifestService: PresenceCheckedManifestService(status: "failed"),
+            modelService: modelService,
+            finalizationTimeoutSeconds: 1,
+            finalizationPollIntervalNanoseconds: 10_000_000
+        )
+
+        await viewModel.startLive(outputRoot: outputRoot, explicitModelPath: nil)
+        let readyPath = outputRoot.appendingPathComponent("warmup.ready")
+        await waitForFile(at: readyPath, timeoutSeconds: 2, message: "warmup fallback manifest helper should report readiness marker before stop")
+        await viewModel.stopCurrentRun()
+        guard case let .failed(error) = viewModel.state else {
+            check(false, "post-fallback failed manifest should map to failed runtime state")
+            return
+        }
+        check(error.code == .processExitedUnexpectedly, "post-fallback failed manifest should classify as processExitedUnexpectedly")
+        check(viewModel.interruptionRecoveryContext?.outcomeClassification == .finalizedFailure, "post-fallback failed manifest should classify as finalized failure")
+        check(viewModel.suggestedRecoveryActions == [.openSessionArtifacts, .startNewSession], "post-fallback failed manifest should keep finalized-failure recovery actions")
+        let signalPath = outputRoot.appendingPathComponent("stop-signal.txt")
+        await waitForFile(at: signalPath, timeoutSeconds: 1, message: "post-fallback helper should write stop signal")
+        let signal = try readTrimmedUTF8File(signalPath, message: "post-fallback helper should write readable stop signal")
+        check(signal == "INT", "post-fallback manifest classification scenario should still stop via INT fallback during warmup")
     }
 
     // Crash branch should map to processExitedUnexpectedly.
