@@ -1,3 +1,4 @@
+use recordit::storage_roots;
 use std::env;
 use std::fmt::{self, Display};
 use std::fs;
@@ -908,8 +909,16 @@ fn default_session_root(mode: RunMode) -> Result<PathBuf, CliError> {
     let date = stamp
         .get(..8)
         .ok_or_else(|| CliError::new("timestamp generation returned an invalid date prefix"))?;
-    Ok(PathBuf::from("artifacts")
-        .join("sessions")
+    let sessions_root = if storage_roots::app_managed_storage_policy_enabled() {
+        storage_roots::resolve_canonical_storage_roots()
+            .map_err(|err| {
+                CliError::new(format!("failed to resolve canonical storage roots: {err}"))
+            })?
+            .sessions_root
+    } else {
+        PathBuf::from("artifacts").join("sessions")
+    };
+    Ok(sessions_root
         .join(date)
         .join(format!("{stamp}-{}", mode.as_str())))
 }
@@ -957,6 +966,8 @@ fn display_path(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, OnceLock};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn parse_run_live_accepts_shared_operator_flags() {
@@ -1189,6 +1200,31 @@ mod tests {
     }
 
     #[test]
+    fn default_session_root_uses_canonical_sessions_root_when_policy_enabled() {
+        let _guard = env_lock().lock().unwrap();
+        let original_policy = env::var(storage_roots::APP_MANAGED_STORAGE_POLICY_ENV).ok();
+        let original_root = env::var(storage_roots::STORAGE_DATA_ROOT_ENV).ok();
+        let data_root = write_temp_dir("recordit-cli-storage-root");
+
+        unsafe {
+            env::set_var(storage_roots::APP_MANAGED_STORAGE_POLICY_ENV, "1");
+            env::set_var(storage_roots::STORAGE_DATA_ROOT_ENV, &data_root);
+        }
+
+        let session_root = default_session_root(RunMode::Live)
+            .expect("expected app-managed default session root resolution to succeed");
+        assert!(
+            session_root.starts_with(data_root.join("artifacts").join("packaged-beta").join("sessions"))
+        );
+
+        restore_optional_env(
+            storage_roots::APP_MANAGED_STORAGE_POLICY_ENV,
+            original_policy,
+        );
+        restore_optional_env(storage_roots::STORAGE_DATA_ROOT_ENV, original_root);
+    }
+
+    #[test]
     fn inspect_contract_json_schema_reports_schema_payload() {
         let json = contract_json(ContractName::JsonlSchema);
         assert!(json.contains("\"$schema\""));
@@ -1200,5 +1236,27 @@ mod tests {
         let json = contract_json(ContractName::ExitCodes);
         assert!(json.contains("recordit.exit-code-contract"));
         assert!(json.contains("\"degraded_success\""));
+    }
+
+    fn restore_optional_env(name: &str, value: Option<String>) {
+        match value {
+            Some(value) => unsafe { env::set_var(name, value) },
+            None => unsafe { env::remove_var(name) },
+        }
+    }
+
+    fn write_temp_dir(prefix: &str) -> PathBuf {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = env::temp_dir().join(format!("{prefix}-{stamp}"));
+        fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
     }
 }

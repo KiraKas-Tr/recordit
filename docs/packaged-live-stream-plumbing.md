@@ -3,6 +3,15 @@
 Date: 2026-03-01
 Status: design contract for post-v1 packaged live-stream implementation
 
+## Superseded Entrypoint Context (2026-03-05)
+
+Canonical user-facing default is `Recordit.app` per
+`docs/adr-005-recordit-default-entrypoint.md`.
+
+This document is retained as historical packaging-plumbing guidance for legacy
+`SequoiaTranscribe.app` compatibility/fallback lanes and should not be read as the
+current product-default entrypoint policy.
+
 ## Goal
 
 Define deterministic signed-app argument plumbing and container artifact destinations for live-stream mode so downstream packaged tasks (`bd-3ma`, `bd-3dx`) can implement diagnostics and smoke gates without re-deciding naming or path semantics.
@@ -23,7 +32,7 @@ Out of scope for this bead:
 
 ## Baseline (current behavior)
 
-Current packaged default entrypoint is:
+Historical packaged default entrypoint (now non-default) is:
 
 - `make run-transcribe-app`
 
@@ -98,10 +107,11 @@ Canonical root remains:
 
 ## Compatibility guardrails
 
-1. `run-transcribe-app` remains representative packaged default unless operator explicitly selects live-stream wrapper.
-2. Argument plumbing must stay additive; existing environment overrides remain valid.
-3. No representative-mode semantic changes in packaged diagnostics while live-stream parity is pending.
-4. Live-stream wrapper must preserve existing trust/degradation summary print contract.
+1. In legacy compatibility lanes, `run-transcribe-app` remains representative unless operator explicitly selects live-stream wrapper.
+2. In product-default release guidance, `Recordit.app` remains canonical (ADR-005).
+3. Argument plumbing must stay additive; existing environment overrides remain valid.
+4. No representative-mode semantic changes in packaged diagnostics while live-stream parity is pending.
+5. Live-stream wrapper must preserve existing trust/degradation summary print contract.
 
 ## Downstream handoff
 

@@ -26,6 +26,7 @@ It does not try to model every internal helper function. It models the states, g
 - Live ASR worker pool and bounded queue policy: [`src/live_asr_pool.rs`](../src/live_asr_pool.rs)
 - Callback transport contract: [`src/rt_transport.rs`](../src/rt_transport.rs)
 - Real-time contract and recovery matrix: [`docs/realtime-contracts.md`](./realtime-contracts.md)
+- SwiftUI↔Rust ownership boundary contract: [`docs/runtime-boundary-ownership-contract.md`](./runtime-boundary-ownership-contract.md)
 
 ## Global Invariants
 
@@ -106,7 +107,7 @@ Legacy `transcribe-live` guards still apply after mapping and remain the source 
 
 - `--live-stream && --live-chunked`
 - live selectors combined with `--replay-jsonl`
-- live selectors combined with `--preflight`
+- `--model-doctor` combined with `--preflight`
 - chunk tuning flags without a live mode
 - `--llm-cleanup` without endpoint/model
 

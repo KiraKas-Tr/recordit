@@ -1,0 +1,206 @@
+name: recordit-build-release-dmg
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  RECORDIT_XCODE_CONFIGURATION: Release
+  RECORDIT_DMG_VOLNAME: Recordit
+
+jobs:
+  build-release-dmg:
+    runs-on: macos-15
+    timeout-minutes: 60
+    permissions:
+      contents: write   # needed for creating releases + pushing tags
+
+    steps:
+      - name: Checkout (with LFS)
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+          fetch-depth: 0   # full history for version tag discovery
+
+      - name: Determine release version
+        id: version
+        run: |
+          # Find the latest v* tag. If none exists, default to v0.1.0.
+          LATEST_TAG=$(git tag -l 'v*' --sort=-v:refname | head -1)
+          if [ -z "$LATEST_TAG" ]; then
+            LATEST_TAG="v0.1.0"
+            echo "No existing release tags found — starting from $LATEST_TAG"
+          else
+            echo "Latest release tag: $LATEST_TAG"
+          fi
+
+          # Strip 'v' prefix → e.g. "0.1.0"
+          CURRENT="${LATEST_TAG#v}"
+          MAJOR=$(echo "$CURRENT" | cut -d. -f1)
+          MINOR=$(echo "$CURRENT" | cut -d. -f2)
+          PATCH=$(echo "$CURRENT" | cut -d. -f3)
+
+          # Check if the latest tag points at this exact commit
+          LATEST_TAG_COMMIT=$(git rev-list -n1 "$LATEST_TAG" 2>/dev/null || echo "")
+          HEAD_COMMIT=$(git rev-parse HEAD)
+
+          if [ "$LATEST_TAG_COMMIT" = "$HEAD_COMMIT" ]; then
+            # This commit is already tagged — use the version as-is
+            NEW_VERSION="$CURRENT"
+            echo "HEAD is already tagged $LATEST_TAG — re-using version"
+          else
+            # Bump patch version
+            PATCH=$((PATCH + 1))
+            NEW_VERSION="${MAJOR}.${MINOR}.${PATCH}"
+            echo "Bumped version: $CURRENT → $NEW_VERSION"
+          fi
+
+          BUILD_NUMBER=${{ github.run_number }}
+
+          echo "version=$NEW_VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=v$NEW_VERSION" >> "$GITHUB_OUTPUT"
+          echo "build_number=$BUILD_NUMBER" >> "$GITHUB_OUTPUT"
+          echo "Release version: v$NEW_VERSION (build $BUILD_NUMBER)"
+
+      - name: Stamp version into Info.plist
+        run: |
+          PLIST="app/RecorditApp/Info.plist"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString ${{ steps.version.outputs.version }}" "$PLIST"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleVersion ${{ steps.version.outputs.build_number }}" "$PLIST"
+          echo "Stamped $PLIST:"
+          echo "  CFBundleShortVersionString = ${{ steps.version.outputs.version }}"
+          echo "  CFBundleVersion = ${{ steps.version.outputs.build_number }}"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust build cache
+        uses: Swatinem/rust-cache@v2
+
+      # ── Signing certificate (conditional) ──────────────────────────
+      - name: Import signing certificate
+        if: env.APPLE_CERTIFICATE_BASE64 != ''
+        env:
+          APPLE_CERTIFICATE_BASE64: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          CERT_PATH="$RUNNER_TEMP/certificate.p12"
+          KEYCHAIN_PATH="$RUNNER_TEMP/app-signing.keychain-db"
+          KEYCHAIN_PASSWORD="$(openssl rand -hex 24)"
+
+          echo "$APPLE_CERTIFICATE_BASE64" | base64 --decode -o "$CERT_PATH"
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+          security import "$CERT_PATH" \
+            -P "$APPLE_CERTIFICATE_PASSWORD" \
+            -A -t cert -f pkcs12 \
+            -k "$KEYCHAIN_PATH"
+
+          security set-key-partition-list \
+            -S apple-tool:,apple: \
+            -k "$KEYCHAIN_PASSWORD" \
+            "$KEYCHAIN_PATH"
+
+          security list-keychains -d user -s "$KEYCHAIN_PATH" login.keychain-db
+          security default-keychain -s "$KEYCHAIN_PATH"
+
+          echo "SIGN_IDENTITY=${{ secrets.APPLE_SIGNING_IDENTITY }}" >> "$GITHUB_ENV"
+
+      - name: Set ad-hoc signing fallback
+        if: env.APPLE_CERTIFICATE_BASE64 == ''
+        env:
+          APPLE_CERTIFICATE_BASE64: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
+        run: |
+          echo "SIGN_IDENTITY=-" >> "$GITHUB_ENV"
+          echo "::notice::No signing certificate configured — using ad-hoc signing"
+
+      # ── Build pipeline ─────────────────────────────────────────────
+      - name: Build runtime inputs (Rust binaries + model + manifest)
+        run: make prepare-recordit-runtime-inputs
+
+      - name: Build Recordit.app (xcodebuild)
+        run: make build-recordit-app
+
+      - name: Bundle into dist/
+        run: make bundle-recordit-app
+
+      - name: Sign Recordit.app
+        run: |
+          make sign-recordit-app SIGN_IDENTITY="$SIGN_IDENTITY"
+
+      - name: Verify bundled payload
+        run: make verify-recordit-app
+
+      - name: Create DMG
+        run: make create-recordit-dmg
+
+      # ── Notarization (conditional) ─────────────────────────────────
+      - name: Setup notarization credentials
+        if: env.APPLE_API_KEY_BASE64 != ''
+        env:
+          APPLE_API_KEY_BASE64: ${{ secrets.APPLE_API_KEY_BASE64 }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+        run: |
+          mkdir -p ~/private_keys
+          echo "$APPLE_API_KEY_BASE64" | base64 --decode -o ~/private_keys/AuthKey_${APPLE_API_KEY_ID}.p8
+
+          xcrun notarytool store-credentials "NOTARY_PROFILE" \
+            --key ~/private_keys/AuthKey_${APPLE_API_KEY_ID}.p8 \
+            --key-id "$APPLE_API_KEY_ID" \
+            --issuer "$APPLE_API_ISSUER_ID"
+
+          echo "NOTARY_PROFILE=NOTARY_PROFILE" >> "$GITHUB_ENV"
+
+      - name: Notarize and staple DMG
+        if: env.NOTARY_PROFILE != ''
+        run: |
+          make notarize-recordit-dmg \
+            SIGN_IDENTITY="$SIGN_IDENTITY" \
+            NOTARY_PROFILE="$NOTARY_PROFILE" \
+            SKIP_DMG_BUILD=1 \
+            ALLOW_SPCTL_FAILURE=0
+
+      # ── Release ────────────────────────────────────────────────────
+      - name: Rename DMG with version
+        run: |
+          mv dist/Recordit.dmg "dist/Recordit-${{ steps.version.outputs.version }}.dmg"
+
+      - name: Upload DMG artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Recordit-${{ steps.version.outputs.version }}-build${{ steps.version.outputs.build_number }}
+          path: dist/Recordit-*.dmg
+          if-no-files-found: error
+
+      - name: Create GitHub Release
+        if: github.ref == 'refs/heads/main'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: Recordit ${{ steps.version.outputs.version }}
+          body: |
+            ## Recordit ${{ steps.version.outputs.version }}
+
+            **Build:** ${{ steps.version.outputs.build_number }}
+            **Commit:** `${{ github.sha }}`
+            **Signing:** ${{ env.SIGN_IDENTITY == '-' && 'Ad-hoc (not notarized)' || 'Developer ID (notarized)' }}
+          files: dist/Recordit-${{ steps.version.outputs.version }}.dmg
+          draft: false
+          prerelease: ${{ env.SIGN_IDENTITY == '-' }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # ── Cleanup ────────────────────────────────────────────────────
+      - name: Cleanup keychain
+        if: always()
+        run: |
+          KEYCHAIN_PATH="$RUNNER_TEMP/app-signing.keychain-db"
+          if [ -f "$KEYCHAIN_PATH" ]; then
+            security delete-keychain "$KEYCHAIN_PATH" || true
+          fi

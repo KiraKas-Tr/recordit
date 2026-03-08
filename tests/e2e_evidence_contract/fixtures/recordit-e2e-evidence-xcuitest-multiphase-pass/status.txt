@@ -1,0 +1,7 @@
+status=pass
+scenario_id=recorditapp-xcuitest-happy-path
+lane_type=xcuitest-evidence
+generated_at_utc=2026-03-06T12:25:00Z
+summary_csv=summary.csv
+summary_json=summary.json
+manifest=evidence_contract.json

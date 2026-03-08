@@ -6,6 +6,7 @@ This plan improves the 3 weakest areas we discussed, in a phased and low-risk wa
 1. Reduce live-stream overload and queue drops by removing per-job file churn and adding adaptive scheduling under pressure.
 2. Replace manual JSON string building/parsing with typed serde models for safer artifacts and replay.
 3. Split the giant `app.rs` orchestration into clear modules so changes are safer and faster.
+4. Add a desktop-first UX/UI plan so operators can install a DMG and run capture/transcription without terminal interaction.
 
 This plan preserves existing CLI/runtime contracts and keeps all current gate/test surfaces valid.
 
@@ -13,10 +14,14 @@ This plan preserves existing CLI/runtime contracts and keeps all current gate/te
 1. Rollout style: **Phased hardening**.
 2. Compatibility policy: **No contract changes**.
 3. Optimization priority: **Reliability first**.
+4. Desktop UI architecture: **Native macOS SwiftUI app orchestrating existing Rust runtime via managed subprocesses**.
+5. v1 UX scope: **Core onboarding + permissions + model setup + start/stop + live transcript + session summary**.
 
 ## Scope and Non-Goals
 1. In scope: internal architecture and runtime reliability changes in `src/bin/transcribe_live/app.rs`, `src/bin/transcribe_live/runtime_live_stream.rs`, `src/live_asr_pool.rs`, `src/bin/transcribe_live/artifacts.rs`, and related modules.
-2. Out of scope: changing public command grammar, changing manifest/jsonl field names, changing contract version files, replacing whisper backends with entirely new ASR engines.
+2. In scope: desktop UX/UI specification and implementation track for packaged app onboarding and in-app run control.
+3. Out of scope: changing public command grammar, changing manifest/jsonl field names, changing contract version files, replacing whisper backends with entirely new ASR engines.
+4. Out of scope for v1 UI: full session library/search/replay manager, cross-platform desktop support, and power-user flag parity for all expert CLI controls.
 
 ## Phase Plan
 
@@ -128,6 +133,149 @@ This phase fixes the live path where we are currently spending too much time cre
 - `src/bin/transcribe_live/transcript_flow.rs`
 7. Target outcome: `app.rs` reduced to bootstrap, parse/dispatch, and high-level orchestration glue.
 
+## Phase 4: Desktop UX/UI Delivery (No-Terminal Operator Path)
+This phase converts the packaged experience from a terminal-oriented flow into a desktop-first operator journey while reusing current runtime contracts.
+
+### Phase 4 Goal (Plain Terms)
+1. A user installs a DMG and uses the app without opening Terminal.
+2. First-run onboarding handles permissions and model setup inside the app.
+3. Users can manually start/stop sessions and see live transcript output in-app.
+4. Existing JSONL/manifest outputs remain canonical and contract-compatible.
+
+### Phase 4A: App Shell, State Model, and Runtime Orchestration
+1. Add a native SwiftUI macOS app target (`SequoiaTranscribe.app`) as the primary operator surface.
+2. Introduce an app state machine with explicit states:
+- `launch_bootstrap`
+- `onboarding_permissions`
+- `onboarding_model_setup`
+- `ready_idle`
+- `session_starting`
+- `session_active`
+- `session_stopping`
+- `session_completed`
+- `session_failed`
+3. Keep Rust runtime as subprocesses invoked by app-side process manager:
+- live mode: `recordit run --mode live ...`
+- offline/deferred path: `recordit run --mode offline ...`
+- record-only capture path: `sequoia_capture ...`
+4. Add deterministic app-side lifecycle handling:
+- start process
+- stream stdout/stderr for diagnostics
+- tail JSONL incrementally for transcript events
+- resolve final status from manifest on process exit
+
+### Phase 4B: Onboarding UX (Permissions + Model Setup)
+1. Add a guided onboarding wizard with 3 required steps:
+- permissions check/remediation
+- model setup/download
+- ready confirmation
+2. Permissions step:
+- verify Screen Recording access
+- verify Microphone access
+- provide in-app remediation actions to open System Settings
+- re-check status without app restart
+3. Model setup step:
+- default model auto-download with progress, retry, resume, checksum verification
+- show storage location and expected size
+- block live transcription start until model is ready
+4. Offline-first fallback:
+- if model unavailable and network unavailable, allow `record-only` sessions
+- mark transcript as pending until model setup is completed
+
+### Phase 4C: Session UX (Start/Stop, Live Transcript, Summary)
+1. Provide minimal v1 controls only:
+- mode selector (`Live Transcribe` / `Record Only`)
+- language selector
+- quality preset selector
+- primary `Start`/`Stop` button
+2. Manual stop is required:
+- user-initiated stop must trigger graceful drain/finalize path
+- hard kill allowed only after explicit stop timeout budget
+3. Live transcript panel:
+- render partial/final/reconciled/llm events from JSONL stream
+- preserve current stable-line semantics and ordering
+4. Completion summary panel:
+- session status (`ok`, `degraded`, `failed`)
+- trust/degradation summary in plain language
+- actions: open transcript, open artifact folder, start new session
+
+### Phase 4D: Desktop UI Wireframes (ASCII)
+```text
++----------------------------------------------------------------------------------+
+| Sequoia Transcribe                                                     [x] [_]   |
++----------------------------------------------------------------------------------+
+| Status: Ready                                                          v1.0 beta |
+|----------------------------------------------------------------------------------|
+| Mode: (o) Live Transcribe   ( ) Record Only                                      |
+| Language: [ English (en) v ]   Quality: [ Balanced v ]                           |
+|----------------------------------------------------------------------------------|
+|                              [ Start Recording ]                                  |
+|----------------------------------------------------------------------------------|
+| Live Transcript                                                                   |
+| [00:02.120-00:03.540] mic: hello everyone                                         |
+| [00:02.200-00:03.600] system: welcome to the meeting                              |
+| [00:03.620-00:04.100] mic ~ quick partial update...                               |
+|----------------------------------------------------------------------------------|
+| Session: none                                                                     |
+| [ Open Session Folder ] [ View Manifest ] [ Help ]                                |
++----------------------------------------------------------------------------------+
+```
+
+```text
++---------------------------------------------------------------+
+| First Run Setup                                               |
++---------------------------------------------------------------+
+| Step 1/3: Permissions                                         |
+|                                                               |
+| Screen Recording:  [Not Granted]   [ Open Settings ] [Retry] |
+| Microphone:        [Granted]                                   |
+|                                                               |
+| Notes: Required for live capture of system + mic audio.       |
+|                                                               |
+|                               [ Back ] [ Continue ]           |
++---------------------------------------------------------------+
+```
+
+```text
++---------------------------------------------------------------+
+| Model Setup                                                   |
++---------------------------------------------------------------+
+| Download default ASR model (tiny.en)                         |
+|                                                               |
+| Progress: [##################----------] 62%                 |
+| Speed: 3.2 MB/s   ETA: 00:34                                 |
+|                                                               |
+| [ Pause ] [ Retry ]                                           |
+|                                                               |
+| If offline: you can continue in Record Only mode.             |
+|                               [ Continue with Record Only ]   |
++---------------------------------------------------------------+
+```
+
+```text
++---------------------------------------------------------------+
+| Session Complete                                              |
++---------------------------------------------------------------+
+| Status: DEGRADED (trust notices present)                      |
+| Duration: 00:12:44                                            |
+| Transcript events: final=42, reconciled=3                    |
+|                                                               |
+| Top notice: capture interruption recovered; review transcript |
+|                                                               |
+| [ View Transcript ] [ Open Session Folder ] [ Done ]          |
++---------------------------------------------------------------+
+```
+
+### Phase 4E: Required Interface Additions (Additive)
+1. Add optional runtime control channel for graceful app stop:
+- `recordit run ... --control-file <path>` (additive)
+- `sequoia_capture ... --control-file <path>` (additive)
+2. Add optional manifest field:
+- `stop_reason: user_stop | duration_elapsed | error`
+3. Keep existing CLI/runtime contracts stable:
+- no renames/removals for JSONL event types or manifest keys
+- no contract version bump in this phase unless compatibility changes are introduced
+
 ## Important API / Interface / Type Changes
 1. Internal interface change in `src/live_asr_pool.rs`: add `LiveAsrAudioInput` enum and `LiveAsrRequest` struct.
 2. Internal trait change in `src/live_asr_pool.rs`: `LiveAsrExecutor` transcribe method accepts request object; provide adapter helpers so existing backend code compiles incrementally.
@@ -148,11 +296,30 @@ This phase fixes the live path where we are currently spending too much time cre
 1. Extend `tests/live_stream_true_live_integration.rs` to assert no regression in first stable emit timing and in-flight artifact growth.
 2. Add live-stream pressure scenario with constrained queue capacity to confirm reduced `dropped_queue_full` after adaptive scheduler.
 3. Add replay regression scenario to confirm typed parser reproduces current transcript reconstruction behavior.
+4. Add desktop process-orchestration integration test:
+- start/stop live run via control channel
+- verify graceful finalize and artifact truth (`out_wav_materialized`, JSONL append, manifest write)
+5. Add offline record-only integration test:
+- model unavailable + no network path allows capture-only session
+- deferred transcription path completes once model becomes available.
 
 ## Contract and Baseline Tests
 1. Run existing contract suites unchanged in `tests/`.
 2. Verify `tests/runtime_jsonl_schema_contract.rs` and `tests/runtime_manifest_schema_contract.rs` pass without schema edits.
 3. Verify frozen baseline tests pass without regenerating contract files; if any baseline artifact drift occurs, it must be investigated and corrected, not accepted by default.
+
+## Desktop UI Acceptance Tests (New)
+1. First-launch onboarding wizard:
+- permission denied -> remediation -> granted
+- model download success and retry path
+2. Main session flow:
+- idle -> active -> stopping -> completed state transitions
+- live transcript appears during active runtime
+3. Record-only fallback flow:
+- no model/no network allows capture
+- completion UI marks transcript as pending
+4. Trust/degradation presentation:
+- degraded manifest results in non-blocking warning UX, not hard failure UX.
 
 ## Post-Optimization Benchmark Re-Run Protocol
 This section defines exactly how to rerun benchmarks after Phase 1 optimization and compare against the current baseline evidence.
@@ -232,17 +399,23 @@ scripts/gate_backlog_pressure.sh --chunk-window-ms 1400 --chunk-stride-ms 60 --c
 3. First stable emit timing does not regress by more than 10% in existing live-stream integration scenarios.
 4. All existing contract/regression tests pass.
 5. `app.rs` complexity materially reduced through module extraction, with behavior preserved.
+6. Packaged app supports a no-terminal operator path for onboarding, start/stop, and session completion.
+7. Desktop UI flow preserves runtime artifact truth and trust/degradation semantics.
 
 ## Rollout and Delivery Sequence
 1. PR 1: Phase 1A/1B core reliability changes with backpressure mode and ASR input type; no JSON boundary changes yet.
 2. PR 2: Phase 1C pump cadence tuning and live integration test updates.
 3. PR 3: Phase 2 typed JSON event/manifest serialization and replay parser migration.
 4. PR 4: Phase 3 module decomposition and cleanup.
-5. PR 5: post-optimization benchmark rerun using the protocol above and publish benchmark delta note.
-6. After each PR: run contract tests, runtime smoke paths, and backlog-pressure gate to prevent cumulative drift.
+5. PR 5: Phase 4A app shell and subprocess orchestration.
+6. PR 6: Phase 4B onboarding wizard (permissions + model setup).
+7. PR 7: Phase 4C session UX, transcript panel, completion summary.
+8. PR 8: post-optimization benchmark rerun using the protocol above and publish benchmark delta note.
+9. After each PR: run contract tests, runtime smoke paths, backlog-pressure gate, and packaged smoke validation to prevent cumulative drift.
 
 ## Assumptions and Defaults
 1. Keep whispercpp/whisperkit helper-process model for now; do not introduce new external backend dependency in this cycle.
 2. Keep current trust/degradation semantics and code values.
 3. Keep current artifact path semantics (`input_wav`, `out_wav`, `jsonl`, `manifest`) exactly as documented.
 4. Keep fake capture behavior compatible with current tests; internal cleanup is allowed if observable behavior remains equivalent.
+5. Desktop UI target is macOS 15+ only in this cycle, with SwiftUI as the primary UI framework.

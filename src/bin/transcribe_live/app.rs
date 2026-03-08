@@ -17,6 +17,7 @@ use recordit::live_stream_runtime::{
     LiveStreamCoordinator, RuntimeFinalizer, RuntimeOutputEvent, RuntimeOutputSink,
     StreamingSchedulerConfig, StreamingVadConfig, StreamingVadScheduler,
 };
+use recordit::storage_roots::{self, ManagedStorageDomain};
 use screencapturekit::prelude::*;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
@@ -336,7 +337,7 @@ const REPRESENTATIVE_CHUNKED_COMPATIBILITY: RuntimeModeCompatibility = RuntimeMo
     selector: "--live-chunked",
     status: "implemented",
     replay_jsonl_compat: "incompatible",
-    preflight_compat: "incompatible",
+    preflight_compat: "compatible",
     chunk_tuning_compat: "compatible",
 };
 
@@ -346,7 +347,7 @@ const LIVE_STREAM_COMPATIBILITY: RuntimeModeCompatibility = RuntimeModeCompatibi
     selector: "--live-stream",
     status: "implemented",
     replay_jsonl_compat: "incompatible",
-    preflight_compat: "incompatible",
+    preflight_compat: "compatible",
     chunk_tuning_compat: "compatible",
 };
 
@@ -2273,6 +2274,7 @@ fn write_benchmark_artifact(
     backend_id: &str,
     artifact_track: &str,
     wall_ms_runs: &[f64],
+    fallback_root: Option<&Path>,
 ) -> Result<(PathBuf, PathBuf, BenchmarkSummary), CliError> {
     if wall_ms_runs.is_empty() {
         return Err(CliError::new(
@@ -2280,7 +2282,60 @@ fn write_benchmark_artifact(
         ));
     }
 
-    let run_dir = PathBuf::from("artifacts")
+    let mut candidate_roots = Vec::<PathBuf>::new();
+    if let Ok(current_dir) = env::current_dir() {
+        candidate_roots.push(current_dir);
+    } else {
+        candidate_roots.push(PathBuf::from("."));
+    }
+    if let Some(root) = fallback_root {
+        let fallback = root.to_path_buf();
+        if !candidate_roots
+            .iter()
+            .any(|candidate| candidate == &fallback)
+        {
+            candidate_roots.push(fallback);
+        }
+    }
+
+    let mut failures = Vec::<String>::new();
+    for candidate_root in &candidate_roots {
+        match write_benchmark_artifact_in_root(
+            candidate_root,
+            stamp,
+            backend_id,
+            artifact_track,
+            wall_ms_runs,
+        ) {
+            Ok(written) => {
+                if !failures.is_empty() {
+                    eprintln!(
+                        "warning: benchmark artifacts fell back to {} after write failure(s): {}",
+                        candidate_root.display(),
+                        failures.join(" | ")
+                    );
+                }
+                return Ok(written);
+            }
+            Err(err) => failures.push(err.to_string()),
+        }
+    }
+
+    Err(CliError::new(format!(
+        "failed to write benchmark artifacts in all candidate roots: {}",
+        failures.join(" | ")
+    )))
+}
+
+fn write_benchmark_artifact_in_root(
+    root: &Path,
+    stamp: &str,
+    backend_id: &str,
+    artifact_track: &str,
+    wall_ms_runs: &[f64],
+) -> Result<(PathBuf, PathBuf, BenchmarkSummary), CliError> {
+    let run_dir = root
+        .join("artifacts")
         .join("bench")
         .join(artifact_track)
         .join(stamp);
@@ -2492,6 +2547,7 @@ fn run_live_capture_session(config: &TranscribeConfig) -> Result<(), CliError> {
         target_rate_hz: config.sample_rate_hz,
         mismatch_policy: LiveCaptureSampleRateMismatchPolicy::AdaptStreamRate,
         callback_contract_mode: LiveCaptureCallbackMode::Warn,
+        stop_request_path: None,
     };
     run_capture_session(&live_capture_config)
         .map_err(|err| CliError::new(format!("live capture session failed: {err}")))?;
@@ -3461,7 +3517,9 @@ fn parse_replay_transcript_event(
             replay_line_error(line_no, replay_parse_reason_category(&err_text), err_text)
         })?;
     let (event_name, payload) = match parsed {
-        contracts_models::runtime_jsonl::RuntimeJsonlEvent::Partial(payload) => ("partial", payload),
+        contracts_models::runtime_jsonl::RuntimeJsonlEvent::Partial(payload) => {
+            ("partial", payload)
+        }
         contracts_models::runtime_jsonl::RuntimeJsonlEvent::Final(payload) => ("final", payload),
         contracts_models::runtime_jsonl::RuntimeJsonlEvent::LlmFinal(payload) => {
             ("llm_final", payload)
@@ -3472,7 +3530,7 @@ fn parse_replay_transcript_event(
         _ => {
             return Err(CliError::new(format!(
                 "invalid replay line {line_no}: event_type `{event_type}` decoded as non-transcript variant"
-            )))
+            )));
         }
     };
     if payload.text.len() > REPLAY_TRANSCRIPT_TEXT_MAX_BYTES {
@@ -3672,6 +3730,22 @@ fn validate_output_path(flag: &str, path: &Path) -> Result<(), CliError> {
         }
     }
 
+    if storage_roots::app_managed_storage_policy_enabled() {
+        let roots = storage_roots::resolve_canonical_storage_roots().map_err(|err| {
+            CliError::new(format!(
+                "failed to resolve canonical app-managed storage roots: {err}"
+            ))
+        })?;
+        if matches!(flag, "--out-wav" | "--out-jsonl" | "--out-manifest") {
+            storage_roots::validate_app_managed_write_path(
+                path,
+                ManagedStorageDomain::Sessions,
+                &roots,
+            )
+            .map_err(|err| CliError::new(format!("`{flag}` violates storage policy: {err}")))?;
+        }
+    }
+
     Ok(())
 }
 
@@ -3755,22 +3829,23 @@ mod tests {
         resolve_backend_program, resolve_model_path, run_cleanup_queue_with, run_live_chunk_queue,
         run_streaming_capture_session, runtime_mode_compatibility_matrix,
         select_runtime_execution_branch, transcript_events_from_runtime_output_events,
-        write_preflight_manifest, write_runtime_jsonl, write_runtime_manifest, AsrBackend,
-        AsrWorkClass, AsrWorkItem, BenchmarkSummary, CaptureChunk, CaptureEvent, CaptureSink,
-        ChannelMode, ChannelVadBoundary, CheckStatus, CleanupAttemptOutcome, CleanupQueueTelemetry,
-        CleanupTaskStatus, CollectingRuntimeOutputSink, FinalBufferingTelemetry,
-        HotPathDiagnostics, IncrementalVadTracker, LiveAsrExecutor, LiveAsrJob, LiveAsrJobClass,
-        LiveAsrPoolConfig, LiveAsrPoolTelemetry, LiveAsrRequest, LiveCaptureCallbackMode,
-        LiveCaptureConfig, LiveCaptureSampleRateMismatchPolicy, LiveChunkQueueTelemetry,
-        LiveLifecyclePhase, LiveLifecycleTelemetry, LiveRunReport, ModeDegradationEvent,
-        ParseOutcome, PreflightCheck, PreflightReport, ReconciliationMatrix, ResolvedModelPath,
-        RuntimeExecutionBranch, RuntimeJsonlStream, RuntimeOutputSink, TempAudioPolicy,
-        TerminalRenderActionKind, TerminalRenderMode, TranscribeConfig, TranscriptEvent,
-        VadBoundary, HELP_TEXT, LIVE_CAPTURE_CALLBACK_CONTRACT_DEGRADED_CODE,
-        LIVE_CAPTURE_CONTINUITY_UNVERIFIED_CODE, LIVE_CAPTURE_INTERRUPTION_RECOVERED_CODE,
-        LIVE_CAPTURE_TRANSPORT_DEGRADED_CODE, LIVE_CHUNK_QUEUE_BACKPRESSURE_SEVERE_CODE,
-        LIVE_CHUNK_QUEUE_DROP_OLDEST_CODE, RECONCILIATION_APPLIED_CODE,
-        REPLAY_JSONL_MAX_LINE_BYTES, REPLAY_TRANSCRIPT_TEXT_MAX_BYTES,
+        validate_model_path_for_backend, validate_output_path, write_preflight_manifest,
+        write_runtime_jsonl,
+        write_runtime_manifest, AsrBackend, AsrWorkClass, AsrWorkItem, BenchmarkSummary,
+        CaptureChunk, CaptureEvent, CaptureSink, ChannelMode, ChannelVadBoundary, CheckStatus,
+        CleanupAttemptOutcome, CleanupQueueTelemetry, CleanupTaskStatus,
+        CollectingRuntimeOutputSink, FinalBufferingTelemetry, HotPathDiagnostics,
+        IncrementalVadTracker, LiveAsrExecutor, LiveAsrJob, LiveAsrJobClass, LiveAsrPoolConfig,
+        LiveAsrPoolTelemetry, LiveAsrRequest, LiveCaptureCallbackMode, LiveCaptureConfig,
+        LiveCaptureSampleRateMismatchPolicy, LiveChunkQueueTelemetry, LiveLifecyclePhase,
+        LiveLifecycleTelemetry, LiveRunReport, ModeDegradationEvent, ParseOutcome, PreflightCheck,
+        PreflightReport, ReconciliationMatrix, ResolvedModelPath, RuntimeExecutionBranch,
+        RuntimeJsonlStream, RuntimeOutputSink, TempAudioPolicy, TerminalRenderActionKind,
+        TerminalRenderMode, TranscribeConfig, TranscriptEvent, VadBoundary, HELP_TEXT,
+        LIVE_CAPTURE_CALLBACK_CONTRACT_DEGRADED_CODE, LIVE_CAPTURE_CONTINUITY_UNVERIFIED_CODE,
+        LIVE_CAPTURE_INTERRUPTION_RECOVERED_CODE, LIVE_CAPTURE_TRANSPORT_DEGRADED_CODE,
+        LIVE_CHUNK_QUEUE_BACKPRESSURE_SEVERE_CODE, LIVE_CHUNK_QUEUE_DROP_OLDEST_CODE,
+        RECONCILIATION_APPLIED_CODE, REPLAY_JSONL_MAX_LINE_BYTES, REPLAY_TRANSCRIPT_TEXT_MAX_BYTES,
     };
     use hound::{SampleFormat, WavSpec, WavWriter};
     use recordit::live_stream_runtime::{
@@ -3779,6 +3854,7 @@ mod tests {
         LiveAsrResult as RuntimeAsrResult, LiveRuntimePhase, LiveRuntimeSummary,
         RuntimeOutputEvent,
     };
+    use recordit::storage_roots;
     use serde_json::Value;
     use std::env;
     use std::fs::{self, File};
@@ -3984,6 +4060,31 @@ mod tests {
                 assert_eq!(config.runtime_mode_selector_label(), "--live-stream");
             }
         }
+    }
+
+    #[test]
+    fn parse_accepts_live_chunked_with_preflight() {
+        let args = vec!["--live-chunked".to_string(), "--preflight".to_string()];
+        match parse_args_from(args.into_iter()).unwrap() {
+            ParseOutcome::Help => panic!("expected config"),
+            ParseOutcome::Config(config) => {
+                assert!(config.preflight);
+                assert!(config.live_chunked);
+                assert_eq!(config.runtime_mode_label(), "live-chunked");
+                assert_eq!(config.runtime_mode_selector_label(), "--live-chunked");
+            }
+        }
+    }
+
+    #[test]
+    fn runtime_mode_compatibility_matrix_marks_live_selectors_preflight_compatible() {
+        let matrix = runtime_mode_compatibility_matrix();
+        assert!(matrix
+            .iter()
+            .any(|row| row.selector == "--live-stream" && row.preflight_compat == "compatible"));
+        assert!(matrix
+            .iter()
+            .any(|row| row.selector == "--live-chunked" && row.preflight_compat == "compatible"));
     }
 
     #[test]
@@ -6562,6 +6663,7 @@ mod tests {
             target_rate_hz: 200,
             mismatch_policy: LiveCaptureSampleRateMismatchPolicy::AdaptStreamRate,
             callback_contract_mode: LiveCaptureCallbackMode::Warn,
+            stop_request_path: None,
         };
 
         let _guard = env_lock().lock().unwrap();
@@ -8163,6 +8265,164 @@ mod tests {
         let _ = fs::remove_dir_all(temp_dir);
     }
 
+    #[test]
+    fn validate_model_rejects_directory_for_whispercpp() {
+        let _guard = env_lock().lock().unwrap();
+        let original_cwd = env::current_dir().unwrap();
+        let original_env = env::var("RECORDIT_ASR_MODEL").ok();
+        let temp_dir = write_temp_dir("recordit-validate-model-dir-whispercpp");
+
+        env::set_current_dir(&temp_dir).unwrap();
+        unsafe {
+            env::remove_var("RECORDIT_ASR_MODEL");
+        }
+
+        let mut config = TranscribeConfig::default();
+        config.asr_backend = AsrBackend::WhisperCpp;
+        config.asr_model = temp_dir.clone();
+        let err = validate_model_path_for_backend(&config).unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("expects a model file path"),
+            "expected file-path error, got: {message}"
+        );
+
+        restore_env_state(original_cwd, original_env);
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn validate_model_rejects_file_for_whisperkit() {
+        let _guard = env_lock().lock().unwrap();
+        let original_cwd = env::current_dir().unwrap();
+        let original_env = env::var("RECORDIT_ASR_MODEL").ok();
+        let temp_dir = write_temp_dir("recordit-validate-model-file-whisperkit");
+        let model_file = temp_dir.join("model.bin");
+        File::create(&model_file).unwrap();
+
+        env::set_current_dir(&temp_dir).unwrap();
+        unsafe {
+            env::remove_var("RECORDIT_ASR_MODEL");
+        }
+
+        let mut config = TranscribeConfig::default();
+        config.asr_backend = AsrBackend::WhisperKit;
+        config.asr_model = model_file;
+        let err = validate_model_path_for_backend(&config).unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("expects a model directory path"),
+            "expected directory-path error, got: {message}"
+        );
+
+        restore_env_state(original_cwd, original_env);
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn validate_model_accepts_file_for_whispercpp() {
+        let _guard = env_lock().lock().unwrap();
+        let original_cwd = env::current_dir().unwrap();
+        let original_env = env::var("RECORDIT_ASR_MODEL").ok();
+        let temp_dir = write_temp_dir("recordit-validate-model-file-whispercpp");
+        let model_file = temp_dir.join("ggml-tiny.en.bin");
+        File::create(&model_file).unwrap();
+
+        env::set_current_dir(&temp_dir).unwrap();
+        unsafe {
+            env::remove_var("RECORDIT_ASR_MODEL");
+        }
+
+        let mut config = TranscribeConfig::default();
+        config.asr_backend = AsrBackend::WhisperCpp;
+        config.asr_model = model_file.clone();
+        let resolved = validate_model_path_for_backend(&config).unwrap();
+        assert_eq!(resolved.path, model_file);
+
+        restore_env_state(original_cwd, original_env);
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn validate_model_accepts_directory_for_whisperkit() {
+        let _guard = env_lock().lock().unwrap();
+        let original_cwd = env::current_dir().unwrap();
+        let original_env = env::var("RECORDIT_ASR_MODEL").ok();
+        let temp_dir = write_temp_dir("recordit-validate-model-dir-whisperkit");
+        let model_dir = temp_dir.join("whisperkit-model");
+        fs::create_dir_all(&model_dir).unwrap();
+
+        env::set_current_dir(&temp_dir).unwrap();
+        unsafe {
+            env::remove_var("RECORDIT_ASR_MODEL");
+        }
+
+        let mut config = TranscribeConfig::default();
+        config.asr_backend = AsrBackend::WhisperKit;
+        config.asr_model = model_dir.clone();
+        let resolved = validate_model_path_for_backend(&config).unwrap();
+        assert_eq!(resolved.path, model_dir);
+
+        restore_env_state(original_cwd, original_env);
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn model_resolution_error_lists_checked_candidates() {
+        let _guard = env_lock().lock().unwrap();
+        let original_cwd = env::current_dir().unwrap();
+        let original_env = env::var("RECORDIT_ASR_MODEL").ok();
+        let temp_dir = write_temp_dir("recordit-model-no-candidates");
+
+        env::set_current_dir(&temp_dir).unwrap();
+        unsafe {
+            env::remove_var("RECORDIT_ASR_MODEL");
+        }
+
+        let config = TranscribeConfig::default();
+        let err = resolve_model_path(&config).unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("Precedence"),
+            "error should describe resolution precedence, got: {message}"
+        );
+        assert!(
+            message.contains("Checked"),
+            "error should list checked candidates, got: {message}"
+        );
+        assert!(
+            message.contains("Remediation"),
+            "error should include remediation guidance, got: {message}"
+        );
+
+        restore_env_state(original_cwd, original_env);
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn resolve_backend_program_falls_back_to_bare_helper_name() {
+        let _guard = env_lock().lock().unwrap();
+        let original_env = env::var("RECORDIT_WHISPERCPP_CLI_PATH").ok();
+        unsafe {
+            env::remove_var("RECORDIT_WHISPERCPP_CLI_PATH");
+        }
+
+        let temp_dir = write_temp_dir("recordit-backend-program-bare-fallback");
+        let model_dir = temp_dir.join("empty-models");
+        fs::create_dir_all(&model_dir).unwrap();
+        let model_path = model_dir.join("ggml.bin");
+        File::create(&model_path).unwrap();
+
+        let resolved = resolve_backend_program(AsrBackend::WhisperCpp, &model_path);
+        assert_eq!(
+            resolved, "whisper-cli",
+            "expected bare helper name fallback, got: {resolved}"
+        );
+
+        restore_optional_env("RECORDIT_WHISPERCPP_CLI_PATH", original_env);
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
     fn final_event(segment_id: &str, channel: &str, text: &str) -> TranscriptEvent {
         TranscriptEvent {
             event_type: "final",
@@ -8218,6 +8478,61 @@ mod tests {
             writer.write_sample(-sample).unwrap(); // system audio
         }
         writer.finalize().unwrap();
+    }
+
+    #[test]
+    fn validate_output_path_allows_session_paths_inside_canonical_root() {
+        let _guard = env_lock().lock().unwrap();
+        let original_policy = env::var(storage_roots::APP_MANAGED_STORAGE_POLICY_ENV).ok();
+        let original_root = env::var(storage_roots::STORAGE_DATA_ROOT_ENV).ok();
+        let data_root = write_temp_dir("output-policy-allow");
+
+        unsafe {
+            env::set_var(storage_roots::APP_MANAGED_STORAGE_POLICY_ENV, "1");
+            env::set_var(storage_roots::STORAGE_DATA_ROOT_ENV, &data_root);
+        }
+
+        let allowed = data_root
+            .join("artifacts")
+            .join("packaged-beta")
+            .join("sessions")
+            .join("20260305")
+            .join("session.manifest.json");
+        let result = validate_output_path("--out-manifest", &allowed);
+
+        restore_optional_env(
+            storage_roots::APP_MANAGED_STORAGE_POLICY_ENV,
+            original_policy,
+        );
+        restore_optional_env(storage_roots::STORAGE_DATA_ROOT_ENV, original_root);
+        assert!(result.is_ok(), "expected in-root path to pass: {result:?}");
+    }
+
+    #[test]
+    fn validate_output_path_rejects_paths_outside_canonical_sessions_root() {
+        let _guard = env_lock().lock().unwrap();
+        let original_policy = env::var(storage_roots::APP_MANAGED_STORAGE_POLICY_ENV).ok();
+        let original_root = env::var(storage_roots::STORAGE_DATA_ROOT_ENV).ok();
+        let data_root = write_temp_dir("output-policy-reject");
+
+        unsafe {
+            env::set_var(storage_roots::APP_MANAGED_STORAGE_POLICY_ENV, "1");
+            env::set_var(storage_roots::STORAGE_DATA_ROOT_ENV, &data_root);
+        }
+
+        let outside = data_root.join("unmanaged").join("session.jsonl");
+        let err = validate_output_path("--out-jsonl", &outside)
+            .expect_err("out-of-policy path should be rejected");
+
+        restore_optional_env(
+            storage_roots::APP_MANAGED_STORAGE_POLICY_ENV,
+            original_policy,
+        );
+        restore_optional_env(storage_roots::STORAGE_DATA_ROOT_ENV, original_root);
+        assert!(
+            err.to_string().contains("outside canonical sessions root"),
+            "unexpected error: {err}"
+        );
     }
 
     fn write_temp_dir(prefix: &str) -> PathBuf {

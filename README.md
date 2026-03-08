@@ -20,8 +20,10 @@ Sequoia Capture is a macOS 15+ Rust project that records:
 - `src/bin/sck_probe.rs`: engineering probe binary (stream/output/timestamp inspection)
 - `src/bin/sequoia_capture.rs`: WAV recorder binary
 - `src/bin/transcribe_live.rs`: transcription CLI contract and config validation entrypoint
-- `packaging/Info.plist`: bundle metadata and privacy usage descriptions
-- `packaging/entitlements.plist`: sandbox and privacy entitlements
+- `Recordit.xcodeproj`: macOS app project containing the `RecorditApp` target/scheme
+- `app/RecorditApp/`: SwiftUI `@main` app entrypoint and initial window scene
+- `app/RecorditApp/Info.plist`: Recordit.app bundle metadata and privacy usage descriptions
+- `packaging/entitlements.plist`: Recordit.app signing entitlements for the current v1 release posture (empty/unsandboxed for v1)
 - `docs/research.md`: API/TCC/platform research
 - `docs/architecture.md`: real-time pipeline and interleave spec
 - `docs/state-machine.md`: executable state-machine single source of truth (CLI/runtime/capture/queue/lifecycle)
@@ -29,36 +31,39 @@ Sequoia Capture is a macOS 15+ Rust project that records:
 - `docs/adr-001-backend-decision.md`: backend decision and explicit fallback triggers
 - `docs/adr-002-lock-free-transport.md`: callback transport architecture decision
 - `docs/adr-003-cleanup-boundary-policy.md`: cleanup isolation and policy decision
-- `docs/adr-004-packaged-entrypoint.md`: packaged beta entrypoint decision and rationale
-- `docs/beads-governance.md`: issue decomposition and traceability governance
+- `docs/adr-004-packaged-entrypoint.md`: historical packaged entrypoint decision (superseded for user-facing default policy)
+- `docs/adr-005-recordit-default-entrypoint.md`: canonical user-facing default entrypoint policy (`Recordit.app`) and fallback boundary
+- `docs/bd-dk69-product-contract-matrix.md`: spec-clause product contract matrix with implementation/app-validation/release-evidence obligations
+- `docs/bd-1nqb-build-system-strategy.md`: accepted build-system strategy decision for `Recordit.app` (`xcodebuild`/Xcode app-target first)
+- `docs/bd-3vwh-recordit-app-target.md`: evidence doc for `Recordit.xcodeproj` + `@main` app-target creation/build/launch
+- `docs/bd-1gx5-recordit-makefile-packaging.md`: Makefile packaging cutover evidence for Recordit-first build/bundle/sign/verify targets
+- `docs/bd-1msp-packaged-gate-retarget.md`: packaged gate retarget evidence for Recordit-default launch semantics + runtime compatibility checks
+- `docs/bd-yu7n-recordit-signing-notary-paths.md`: signing/notarization/gatekeeper path retarget evidence for `Recordit.app`
+- `docs/bd-1vo3-gatekeeper-notarization-expectations.md`: canonical local ad-hoc vs notarized release validation expectations and exact Gatekeeper/notary checks
+- `docs/bd-14y4-sequoiatranscribe-fallback-policy.md`: strict non-default fallback policy for legacy `SequoiaTranscribe` usage
+- `docs/bd-k993-coverage-claim-policy.md`: canonical terminology policy for truthful coverage/readiness claims
+- `docs/bd-2gw4-release-posture-and-build-context-parity.md`: canonical guide to which dev, packaged, and release contexts are authoritative for which claims
+- `docs/bd-1ff5-xctest-xcuitest-retained-artifact-contract.md`: concrete retained-artifact contract for XCTest/XCUITest/app-launched evidence lanes
+- `docs/bd-2j49-cross-lane-e2e-evidence-standard.md`: project-wide standard tying shell, packaged, XCTest, XCUITest, and app-launched retained evidence together
+- `docs/bd-1ngy-cross-lane-evidence-index-and-triage-map.md`: practical triage map showing where to start and which retained artifacts to inspect for common failure classes
+- `docs/beads-governance.md`: issue decomposition, traceability governance, and evidence-linking workflow
 
 ## Commands
 
 ### Operator Quickstart (canonical)
-Use the short happy path in [docs/operator-quickstart.md](docs/operator-quickstart.md).
+Canonical default is the GUI-first `Recordit.app` user journey. Follow [docs/operator-quickstart.md](docs/operator-quickstart.md) for the full install/launch/first-run validation flow.
 
-New machine (one-time permission bootstrap on macOS):
-1. Run a short probe to trigger TCC prompts:
+Minimal GUI-first sequence:
 ```bash
-make probe CAPTURE_SECS=3
-```
-2. Grant permissions when prompted:
-   - Screen Recording (or Screen & System Audio Recording on newer macOS UI)
-   - Microphone
-3. If macOS does not auto-prompt, open System Settings and enable access for the terminal app you use (`Terminal`, `iTerm`, `Warp`, etc.), then re-run the probe command.
-
-Fast path:
-```bash
-make setup-whispercpp-model
-cargo run --bin recordit -- preflight --mode live --json
-cargo run --bin recordit -- run --mode live --model artifacts/bench/models/whispercpp/ggml-tiny.en.bin --json
-cargo run --bin recordit -- replay --jsonl <session-root>/session.jsonl --format json
+make create-recordit-dmg RECORDIT_DMG_NAME=Recordit-local.dmg RECORDIT_DMG_VOLNAME='Recordit'
+open dist/Recordit-local.dmg
 ```
 
-Deterministic local fallback:
-```bash
-cargo run --bin recordit -- run --mode offline --input-wav artifacts/bench/corpus/gate_c/tts_phrase_stereo.wav --model artifacts/bench/models/whispercpp/ggml-tiny.en.bin --json
-```
+Then drag `Recordit.app` to `Applications`, launch it, complete onboarding (permissions + model setup), and validate first live start/stop in-window.
+
+Fallback diagnostics are non-default and should be labeled as compatibility/support workflows:
+- `make run-transcribe-app ...` (`SequoiaTranscribe.app` compatibility lane)
+- direct CLI commands (`cargo run --bin recordit -- ...`)
 
 ### Build
 ```bash
@@ -66,11 +71,56 @@ make build
 ```
 Builds debug binaries.
 
+`Recordit.app` builds use a two-stage runtime handoff:
+- `scripts/prepare_recordit_runtime_inputs.sh` performs the Rust build/staging step outside Xcode and writes prebuilt runtime inputs under `.build/recordit-runtime-inputs/<Configuration>/...`.
+- Xcode's `Embed Runtime Binaries` phase (`scripts/embed_recordit_runtime_binaries.sh`) is copy-only and consumes those prebuilt inputs via `RECORDIT_RUNTIME_INPUT_DIR` (defaulting to the same `.build` path).
+
+`make build-recordit-app` runs both stages in order, with explicit stage-prefixed logs:
+- `[recordit-app][rust-build] ...`
+- `[recordit-app][xcodebuild] ...`
+
+Embedded runtime paths inside `Recordit.app`:
+- `Recordit.app/Contents/Resources/runtime/bin/recordit`
+- `Recordit.app/Contents/Resources/runtime/bin/sequoia_capture`
+
+Runtime resolution contract:
+- app runtime resolution expects bundled executables in `Contents/Resources/runtime/bin` (plus explicit absolute-path overrides via `RECORDIT_RUNTIME_BINARY` / `SEQUOIA_CAPTURE_BINARY` when intentionally set)
+- implicit PATH fallback is disabled by default for startup/readiness so missing bundled payloads fail explicitly
+
+This keeps the GUI-first flow terminal-free for end users (no external PATH setup required).
+
 ### Contract/Schema Enforcement Suite
 ```bash
 make contracts-ci
 ```
 Runs the machine-readable contract/schema enforcement suite used by CI (`scripts/ci_contracts.sh`).
+
+### XCTest/XCUITest Evidence Lane (CI/Local)
+```bash
+scripts/ci_recordit_xctest_evidence.sh
+```
+Runs app-level `xcodebuild` test lanes, captures per-step logs + `.xcresult` bundles, and writes deterministic status summaries under:
+- `artifacts/ci/xctest_evidence/<stamp>/status.csv`
+- `artifacts/ci/xctest_evidence/<stamp>/summary.csv`
+- `artifacts/ci/xctest_evidence/<stamp>/responsiveness_budget_summary.csv` (app-level responsiveness gate evidence)
+- `artifacts/ci/xctest_evidence/<stamp>/contracts/xctest/evidence_contract.json`
+- `artifacts/ci/xctest_evidence/<stamp>/contracts/xcuitest/evidence_contract.json`
+- `artifacts/ci/xctest_evidence/<stamp>/contracts/lane_matrix.json`
+
+See `docs/bd-1ff5-xctest-xcuitest-retained-artifact-contract.md` for the truthful retained-artifact contract, including the current rule that app-launched verification is represented through the `xcuitest-evidence` lane. See `docs/bd-2j49-cross-lane-e2e-evidence-standard.md` for the cross-lane summary-surface and traceability standard shared with shell and packaged evidence lanes.
+
+Relevant controls:
+- `XCTEST_EVIDENCE_STAMP` (artifact folder name)
+- `XCTEST_DESTINATION` (default: `platform=macOS`)
+- `CI_STRICT_UI_TESTS` (`1` makes UI-test execution failures required-fail; lane script default is `0`, CI workflow pins this to `1`)
+- `XCTEST_RESPONSIVENESS_SUMMARY_PATH` (override path for responsiveness gate key/value artifact)
+
+`summary.csv` includes responsiveness threshold rows emitted from app-level XCTest gating:
+- `threshold_first_stable_transcript_budget_ok`
+- `threshold_stop_to_summary_budget_ok`
+- `responsiveness_gate_pass`
+
+GitHub Actions workflow: `.github/workflows/recordit-xctest-evidence.yml`.
 
 ### Probe (debug)
 ```bash
@@ -209,33 +259,106 @@ Runs deterministic cold/warm near-live checks plus backlog/trust checks and writ
 ```bash
 make gate-packaged-live-smoke
 ```
-Runs the signed transcribe app executable in `--live-stream` mode with deterministic fake capture input and writes machine-readable evidence under:
+Runs the packaged smoke gate with two layers of validation:
+- `Recordit.app` remains the GUI-default packaged launch path (`run-recordit-app` plan semantics)
+- signed compatibility runtime (`SequoiaTranscribe.app`) still satisfies live-stream artifact/trust/timing contracts
+
+Machine-readable evidence is written under:
 
 - `~/Library/Containers/com.recordit.sequoiatranscribe/Data/artifacts/packaged-beta/gates/gate_packaged_live_smoke/<timestamp>/summary.csv`
 - `~/Library/Containers/com.recordit.sequoiatranscribe/Data/artifacts/packaged-beta/gates/gate_packaged_live_smoke/<timestamp>/status.txt`
+- `~/Library/Containers/com.recordit.sequoiatranscribe/Data/artifacts/packaged-beta/gates/gate_packaged_live_smoke/<timestamp>/recordit_run_plan.log`
 
 Key packaged live checks:
+- `recordit_launch_semantics_ok=true`: default packaged launch plan resolves to `dist/Recordit.app` via `run-recordit-app`
 - `runtime_first_stable_emit_ok=true`: first stable transcript evidence is present during active runtime
 - `runtime_transcript_surface_ok=true`: manifest/JSONL transcript surfaces are populated
+- `runtime_manifest_out_wav_match_ok=true`: manifest `session_summary.artifacts.out_wav` matches the canonical runtime `out_wav` path
+- `runtime_manifest_out_jsonl_match_ok=true`: manifest `session_summary.artifacts.out_jsonl` matches the canonical runtime JSONL path
 - `runtime_terminal_live_mode_ok=true`: terminal contract stayed in live mode without replay fallback
 - `gate_pass=true`: packaged live-stream operator path satisfies the current acceptance bar
 
 Reference: `docs/gate-packaged-live-smoke.md`.
 Post-implementation verification checklist and evidence index: `docs/post-implementation-verification-checklist.md`.
 
-### Run Packaged Beta Entrypoint (signed app mode, recommended)
+### Build Recordit DMG (Drag-to-Applications UX)
+```bash
+make create-recordit-dmg
+```
+Builds `dist/Recordit.dmg` from `dist/Recordit.app` and stages an `Applications` alias/symlink in the DMG root so install UX is explicit.
+
+### Inspect Release Artifacts (Xcode + dist + DMG evidence bundle)
+```bash
+make inspect-recordit-release-artifacts
+```
+Builds or reuses the current packaged artifacts and writes a retained evidence bundle under:
+
+- `artifacts/ops/release-artifact-inspection/<timestamp>/summary.csv`
+- `artifacts/ops/release-artifact-inspection/<timestamp>/dist_release_context/summary.csv`
+- `artifacts/ops/release-artifact-inspection/<timestamp>/artifacts/xcode_bundle_inventory.json`
+- `artifacts/ops/release-artifact-inspection/<timestamp>/artifacts/dmg_root_inventory.json`
+
+This is the canonical automated inspection path for the current v1 release posture: it captures Xcode-built app inventory, nested `dist/Recordit.app` release-context verification, DMG metadata/checksum/mounted contents, and runtime-payload parity across those artifact layers.
+
+Optional overrides:
+- `RECORDIT_DMG_NAME` (default: `Recordit.dmg`)
+- `RECORDIT_DMG_VOLNAME` (default: `Recordit`)
+
+### Verify DMG Install Surface (Mount/Layout/Copy/Open)
+```bash
+make gate-dmg-install-open
+```
+Runs retained install-surface verification for `Recordit.dmg` with standardized e2e evidence output:
+
+- optional app/DMG build steps (`make sign-recordit-app`, DMG creation)
+- DMG attach + layout checks (`Recordit.app` presence, `Applications` link target)
+- copy/install to an explicit destination root
+- launch attempt of the installed app (`open -n`) and deterministic launch diagnostics
+- explicit detach cleanup
+
+Evidence root default:
+- `artifacts/ops/gate_dmg_install_open/<timestamp>/`
+
+Key retained outputs:
+- `evidence_contract.json`
+- `summary.csv`
+- `summary.json`
+- `status.txt`
+- `logs/<phase>.log|stdout|stderr`
+- `artifacts/dmg_attach.plist`
+- `artifacts/dmg_layout_report.txt`
+- `artifacts/install_copy_report.txt`
+- `artifacts/open_launch_report.txt`
+
+Useful overrides:
+- `OUT_DIR`
+- `RECORDIT_DMG_NAME`
+- `RECORDIT_DMG_VOLNAME`
+- `SKIP_BUILD=1` (reuse existing `dist/Recordit.app`)
+- `SKIP_DMG_BUILD=1` (reuse an existing DMG path)
+- `INSTALL_DESTINATION=<path>`
+- `OPEN_WAIT_SEC=<seconds>`
+
+Reference: `docs/gate-dmg-install-open.md`.
+
+### Run Packaged Beta Entrypoint (signed app mode, compatibility/fallback)
 ```bash
 make run-transcribe-app ASR_MODEL=models/ggml-base.en.bin
 ```
+Superseded-default context:
+- `docs/adr-005-recordit-default-entrypoint.md` makes `Recordit.app` the canonical user-facing default.
+- this `run-transcribe-app` / `SequoiaTranscribe.app` path remains a legacy compatibility and fallback lane for internal runtime continuity while cutover work completes.
+- fallback policy guardrails (scope/escalation/timeline): `docs/bd-14y4-sequoiatranscribe-fallback-policy.md`
+
 Builds/signs `dist/SequoiaTranscribe.app` (signed app mode for `transcribe-live`).
 Default packaged runs launch via `open -W`; live selectors such as `--live-stream` and `--live-chunked` run the signed executable directly so terminal transcript output remains attached to the invoking shell.
 For those attached live runs, the explicit `--asr-model` asset is staged into the app container before launch so the signed runtime can read it under sandbox rules.
-This is the recommended packaged beta launch path and should be treated as the primary operator entrypoint.
+This is a compatibility/fallback packaged launch path, not the primary user-facing default.
 The target prints absolute container-scoped artifact destinations before launch and prints a concise post-run session summary after the signed app exits.
 
 For packaged diagnostics on the same path, use `make run-transcribe-preflight-app`.
 For engineering-only development flows, keep using debug targets such as `make transcribe-live`, `make capture-transcribe`, and direct `cargo run`.
-Decision record: `docs/adr-004-packaged-entrypoint.md`.
+Decision records: `docs/adr-005-recordit-default-entrypoint.md` (current default policy), `docs/adr-004-packaged-entrypoint.md` (historical/superseded for default policy).
 
 Packaged artifact destination defaults:
 - root: `~/Library/Containers/com.recordit.sequoiatranscribe/Data/artifacts/packaged-beta/`
@@ -290,7 +413,8 @@ make run-transcribe-model-doctor-app \
   ASR_MODEL=models/ggml-base.en.bin \
   TRANSCRIBE_ARGS=--live-stream
 ```
-Use this path for live-mode readiness checks; `--preflight` remains intentionally incompatible with `--live-stream`.
+Use this path for live-mode readiness checks when you want backend/model diagnostics only.  
+Canonical policy: `--preflight` is compatible with `--live-stream` and `--live-chunked`; use `--replay-jsonl` for post-run replay and keep it separate.
 
 ### Bundle + Sign
 ```bash
@@ -403,8 +527,8 @@ cargo run --bin transcribe-live -- [--asr-model <local-model-path>] [flags...]
   - for representative modes, materialized according to the mode-specific input/output semantics described in the manifest
   - runtime manifest records `out_wav_materialized` and `out_wav_bytes` so artifact truth does not depend on reading the filesystem out-of-band
 - backend values:
-  - `whispercpp` (primary)
-  - `whisperkit` (fallback)
+  - `whispercpp` (primary and the only standard v1 setup path for `Recordit.app`)
+  - `whisperkit` (advanced/manual compatibility path until packaged parity exists)
   - `moonshine` (placeholder; adapter not wired yet)
 - model resolution precedence:
   - `--asr-model <path>` (explicit override, highest priority)
@@ -429,8 +553,8 @@ cargo run --bin transcribe-live -- [--asr-model <local-model-path>] [flags...]
     | Taxonomy mode | Current selector | `runtime_mode` artifact value | Primary operator intent | Transcript timing expectation | `--replay-jsonl` compatibility | `--preflight` compatibility |
     |---|---|---|---|---|---|---|
     | `representative-offline` | `<default>` | `representative-offline` | deterministic offline transcript contract validation | stable transcript lines are primarily end-of-run surfaces | compatible | compatible |
-    | `representative-chunked` | `--live-chunked` | `live-chunked` | near-live queue/scheduler behavior validation on captured WAV | runtime stable lines emit as boundaries close; summary closes out full session | incompatible | incompatible |
-    | `live-stream` | `--live-stream` | `live-stream` | true concurrent capture + transcription while recording | transcript emission starts after warmup enters `active` and continues during capture | incompatible | incompatible |
+    | `representative-chunked` | `--live-chunked` | `live-chunked` | near-live queue/scheduler behavior validation on captured WAV | runtime stable lines emit as boundaries close; summary closes out full session | incompatible | compatible |
+    | `live-stream` | `--live-stream` | `live-stream` | true concurrent capture + transcription while recording | transcript emission starts after warmup enters `active` and continues during capture | incompatible | compatible |
 
   - `--live-chunked` prepares runtime input via the shared in-process live capture runtime (`recordit::live_capture`) and then runs a rolling near-live scheduler over the captured WAV
   - rolling scheduler semantics: `2s` default window, `0.5s` default stride, deterministic chunk segment IDs, and tail-aligned final window coverage
@@ -446,7 +570,8 @@ cargo run --bin transcribe-live -- [--asr-model <local-model-path>] [flags...]
   - channel-slice temp WAVs default to `retain-on-failure` cleanup; add `--keep-temp-audio` to retain them on success for debugging
   - chunk tuning flags require `--live-chunked` or `--live-stream`
   - `--live-stream` and `--live-chunked` are mutually exclusive selectors
-  - `--live-chunked` and `--live-stream` are incompatible with `--replay-jsonl` and `--preflight`
+  - `--live-chunked` and `--live-stream` are incompatible with `--replay-jsonl`
+  - `--preflight` is compatible with both live selectors and should be used as a readiness diagnostic lane before live runtime execution
   - selector naming/deprecation guidance lives in [`docs/live-chunked-migration.md`](docs/live-chunked-migration.md)
 - mode/degradation artifact policy:
   - runtime manifest records both `channel_mode_requested` and active `channel_mode`

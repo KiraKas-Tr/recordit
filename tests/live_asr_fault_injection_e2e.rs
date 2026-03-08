@@ -132,7 +132,9 @@ impl LiveAsrExecutor for DeterministicFaultExecutor {
                 notify.notify_all();
             }
             while !state.released {
-                state = notify.wait(state).expect("gate wait should not be poisoned");
+                state = notify
+                    .wait(state)
+                    .expect("gate wait should not be poisoned");
             }
         }
 
@@ -288,31 +290,19 @@ fn fault_injection_queue_pressure_preserves_final_priority_and_breadcrumbs() {
     }
 
     assert!(
-        by_job
-            .get(&1)
-            .expect("job 1 result should exist")
-            .success(),
+        by_job.get(&1).expect("job 1 result should exist").success(),
         "scenario={scenario} expected initial partial to complete successfully; rows={rows:#?}; invocations={invocations:#?}"
     );
     assert!(
-        by_job
-            .get(&4)
-            .expect("job 4 result should exist")
-            .success(),
+        by_job.get(&4).expect("job 4 result should exist").success(),
         "scenario={scenario} expected final job to survive queue pressure; rows={rows:#?}; invocations={invocations:#?}"
     );
     assert!(
-        !by_job
-            .get(&2)
-            .expect("job 2 result should exist")
-            .success(),
+        !by_job.get(&2).expect("job 2 result should exist").success(),
         "scenario={scenario} expected second partial to be evicted under pressure; rows={rows:#?}; invocations={invocations:#?}"
     );
     assert!(
-        by_job
-            .get(&3)
-            .expect("job 3 result should exist")
-            .success(),
+        by_job.get(&3).expect("job 3 result should exist").success(),
         "scenario={scenario} expected reconcile to survive while final evicts partial first; rows={rows:#?}; invocations={invocations:#?}"
     );
 
@@ -444,7 +434,11 @@ fn fault_injection_temp_audio_safety_paths_are_retained_for_triage() {
         let target = write_temp_audio_file(&dir, "symlink-target.wav");
         let link = dir.join("temp-symlink.wav");
         symlink(&target, &link).expect("symlink temp-audio path should be created");
-        (Some(build_job(22, LiveAsrJobClass::Reconcile, link.clone())), Some(link), Some(target))
+        (
+            Some(build_job(22, LiveAsrJobClass::Reconcile, link.clone())),
+            Some(link),
+            Some(target),
+        )
     };
     #[cfg(not(unix))]
     let (symlink_job, symlink_path, symlink_target): (
@@ -460,7 +454,12 @@ fn fault_injection_temp_audio_safety_paths_are_retained_for_triage() {
     service.close();
 
     let expected_results = if symlink_path.is_some() { 2 } else { 1 };
-    let results = collect_results(&mut service, expected_results, Duration::from_secs(5), scenario);
+    let results = collect_results(
+        &mut service,
+        expected_results,
+        Duration::from_secs(5),
+        scenario,
+    );
     service.join();
 
     let telemetry = service.telemetry();

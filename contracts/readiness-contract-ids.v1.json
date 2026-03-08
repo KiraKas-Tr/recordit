@@ -1,0 +1,152 @@
+{
+  "contract": "recordit-readiness-ids",
+  "version": "v1",
+  "published": true,
+  "owner": "recordit-app-boundary",
+  "purpose": "Canonical readiness vocabulary shared across Rust preflight/runtime outputs and SwiftUI gating/mapping.",
+  "preflight_check_ids": [
+    {
+      "id": "model_path",
+      "class": "blocking",
+      "domain": "backend_model",
+      "source": "rust_preflight",
+      "notes": "Model path resolution and backend-kind compatibility."
+    },
+    {
+      "id": "out_wav",
+      "class": "blocking",
+      "domain": "runtime_preflight",
+      "source": "rust_preflight",
+      "notes": "Writable output target for canonical session WAV artifact."
+    },
+    {
+      "id": "out_jsonl",
+      "class": "blocking",
+      "domain": "runtime_preflight",
+      "source": "rust_preflight",
+      "notes": "Writable output target for runtime JSONL artifact."
+    },
+    {
+      "id": "out_manifest",
+      "class": "blocking",
+      "domain": "runtime_preflight",
+      "source": "rust_preflight",
+      "notes": "Writable output target for manifest artifact."
+    },
+    {
+      "id": "sample_rate",
+      "class": "warn_ack_required",
+      "domain": "runtime_preflight",
+      "source": "rust_preflight",
+      "notes": "Non-default sample-rate warning lane."
+    },
+    {
+      "id": "screen_capture_access",
+      "class": "blocking",
+      "domain": "tcc_capture",
+      "source": "rust_preflight",
+      "notes": "ScreenCaptureKit permission/access check."
+    },
+    {
+      "id": "microphone_access",
+      "class": "blocking",
+      "domain": "tcc_capture",
+      "source": "rust_preflight",
+      "notes": "Microphone stream availability/readiness check."
+    },
+    {
+      "id": "backend_runtime",
+      "class": "warn_ack_required",
+      "domain": "backend_runtime",
+      "source": "rust_preflight",
+      "notes": "Backend binary/runtime availability and invocation diagnostics."
+    }
+  ],
+  "diagnostic_only_check_ids": [
+    {
+      "id": "model_readability",
+      "domain": "diagnostic_only",
+      "source": "rust_model_doctor",
+      "notes": "Currently model-doctor diagnostics only; not part of live preflight gating."
+    }
+  ],
+  "preflight_check_domains": [
+    "tcc_capture",
+    "backend_model",
+    "runtime_preflight",
+    "backend_runtime",
+    "diagnostic_only"
+  ],
+  "preflight_status_values": [
+    "PASS",
+    "WARN",
+    "FAIL"
+  ],
+  "swift_preflight_policy_classes": [
+    "blockOnFail",
+    "warnRequiresAcknowledgement",
+    "informational"
+  ],
+  "startup_binary_readiness": {
+    "statuses": [
+      "ready",
+      "missing",
+      "not_executable",
+      "invalid_override"
+    ],
+    "binary_names": [
+      "recordit",
+      "sequoia_capture"
+    ],
+    "override_env_keys": [
+      "RECORDIT_RUNTIME_BINARY",
+      "SEQUOIA_CAPTURE_BINARY"
+    ]
+  },
+  "app_error_codes_used_for_readiness_mapping": [
+    "preflightFailed",
+    "permissionDenied",
+    "modelUnavailable",
+    "runtimeUnavailable"
+  ],
+  "authoritative_live_readiness_payload": {
+    "preflight_manifest_kind": "transcribe-live-preflight",
+    "preflight_manifest_schema_version": "1",
+    "lanes": {
+      "tcc_capture_check_ids": [
+        "screen_capture_access",
+        "microphone_access"
+      ],
+      "backend_model_check_ids": [
+        "model_path"
+      ],
+      "runtime_preflight_check_ids": [
+        "out_wav",
+        "out_jsonl",
+        "out_manifest",
+        "sample_rate"
+      ],
+      "backend_runtime_check_ids": [
+        "backend_runtime"
+      ]
+    },
+    "startup_binary_readiness_statuses": [
+      "ready",
+      "missing",
+      "not_executable",
+      "invalid_override"
+    ]
+  },
+  "fallback_policy": {
+    "record_only_allowed_when_live_blocked": true,
+    "notes": "Live-readiness failure must not remove Record Only where capture-only path remains viable."
+  },
+  "change_policy": {
+    "breaking_change_requires_new_version": true,
+    "examples_of_breaking_changes": [
+      "rename or remove a preflight_check_id",
+      "change class of an existing check ID (blocking vs warning) without version bump",
+      "remove a startup readiness status value"
+    ]
+  }
+}

@@ -16,6 +16,9 @@ STABLE_TRANSCRIPT_EVENT_TYPES = {"final", "llm_final", "reconciled_final"}
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--recordit-plan-exit-code", required=True, type=int)
+    parser.add_argument("--recordit-run-plan", required=True, type=Path)
+    parser.add_argument("--recordit-app-bundle", required=True, type=Path)
     parser.add_argument("--doctor-exit-code", required=True, type=int)
     parser.add_argument("--doctor-stdout", required=True, type=Path)
     parser.add_argument("--runtime-exit-code", required=True, type=int)
@@ -69,8 +72,11 @@ def path_within_root(path: Path, root: Path) -> bool:
 def load_json(path: Path) -> dict[str, Any]:
     if not path.is_file():
         return {}
-    with path.open(encoding="utf-8") as handle:
-        payload = json.load(handle)
+    try:
+        with path.open(encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except json.JSONDecodeError:
+        return {}
     if isinstance(payload, dict):
         return payload
     return {}
@@ -80,13 +86,14 @@ def load_jsonl(path: Path) -> list[dict[str, Any]]:
     if not path.is_file():
         return []
     rows: list[dict[str, Any]] = []
+    decoder = json.JSONDecoder()
     with path.open(encoding="utf-8") as handle:
         for raw in handle:
             line = raw.strip()
             if not line:
                 continue
             try:
-                payload = json.loads(line)
+                payload = decoder.decode(line)
             except json.JSONDecodeError:
                 continue
             if isinstance(payload, dict):
@@ -152,6 +159,27 @@ def first_emit_analysis(events: list[dict[str, Any]]) -> dict[str, Any]:
 
 def main() -> None:
     args = parse_args()
+
+    recordit_run_plan = (
+        args.recordit_run_plan.read_text(encoding="utf-8")
+        if args.recordit_run_plan.is_file()
+        else ""
+    )
+    recordit_plan_exit_ok = args.recordit_plan_exit_code == 0
+    recordit_app_bundle_exists = args.recordit_app_bundle.is_dir()
+    recordit_launch_command_ok = 'open -W "dist/Recordit.app"' in recordit_run_plan
+    recordit_sign_command_ok = (
+        'codesign --force --deep --options runtime' in recordit_run_plan
+        and '"dist/Recordit.app"' in recordit_run_plan
+    )
+    recordit_launch_semantics_ok = all(
+        [
+            recordit_plan_exit_ok,
+            recordit_app_bundle_exists,
+            recordit_launch_command_ok,
+            recordit_sign_command_ok,
+        ]
+    )
 
     doctor_stdout = args.doctor_stdout.read_text(encoding="utf-8") if args.doctor_stdout.is_file() else ""
     runtime_stderr = args.runtime_stderr.read_text(encoding="utf-8") if args.runtime_stderr.is_file() else ""
@@ -222,6 +250,8 @@ def main() -> None:
     if not isinstance(session_artifacts, dict):
         session_artifacts = {}
     manifest_jsonl_path = Path(str(runtime_manifest.get("jsonl_path", "")))
+    manifest_out_wav_path = Path(str(session_artifacts.get("out_wav", "")))
+    manifest_out_jsonl_path = Path(str(session_artifacts.get("out_jsonl", "")))
     manifest_out_manifest_path = Path(str(session_artifacts.get("out_manifest", "")))
     artifact_root_ok = all(
         [
@@ -230,10 +260,14 @@ def main() -> None:
             path_within_root(args.runtime_jsonl, args.expected_artifact_root),
             path_within_root(out_wav, args.expected_artifact_root),
             path_within_root(manifest_jsonl_path, args.expected_artifact_root),
+            path_within_root(manifest_out_wav_path, args.expected_artifact_root),
+            path_within_root(manifest_out_jsonl_path, args.expected_artifact_root),
             path_within_root(manifest_out_manifest_path, args.expected_artifact_root),
         ]
     )
     manifest_jsonl_match_ok = manifest_jsonl_path == args.runtime_jsonl
+    manifest_out_wav_match_ok = manifest_out_wav_path == out_wav
+    manifest_out_jsonl_match_ok = manifest_out_jsonl_path == args.runtime_jsonl
     manifest_out_manifest_match_ok = manifest_out_manifest_path == args.runtime_manifest
 
     event_counts = runtime_manifest.get("event_counts")
@@ -264,6 +298,7 @@ def main() -> None:
 
     gate_pass = all(
         [
+            recordit_launch_semantics_ok,
             doctor_exit_ok,
             doctor_banner_ok,
             runtime_exit_ok,
@@ -281,6 +316,8 @@ def main() -> None:
             degradation_surface_ok,
             artifact_root_ok,
             manifest_jsonl_match_ok,
+            manifest_out_wav_match_ok,
+            manifest_out_jsonl_match_ok,
             manifest_out_manifest_match_ok,
             transcript_surface_ok,
         ]
@@ -292,6 +329,14 @@ def main() -> None:
         writer.writerow(["key", "value"])
         writer.writerow(["generated_at_utc", datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")])
         writer.writerow(["artifact_track", "gate_packaged_live_smoke"])
+        writer.writerow(["recordit_plan_exit_code", args.recordit_plan_exit_code])
+        writer.writerow(["recordit_plan_exit_ok", bool_text(recordit_plan_exit_ok)])
+        writer.writerow(["recordit_run_plan_path", str(args.recordit_run_plan)])
+        writer.writerow(["recordit_app_bundle_path", str(args.recordit_app_bundle)])
+        writer.writerow(["recordit_app_bundle_exists", bool_text(recordit_app_bundle_exists)])
+        writer.writerow(["recordit_launch_command_ok", bool_text(recordit_launch_command_ok)])
+        writer.writerow(["recordit_sign_command_ok", bool_text(recordit_sign_command_ok)])
+        writer.writerow(["recordit_launch_semantics_ok", bool_text(recordit_launch_semantics_ok)])
         writer.writerow(["doctor_exit_code", args.doctor_exit_code])
         writer.writerow(["doctor_exit_ok", bool_text(doctor_exit_ok)])
         writer.writerow(["doctor_banner_ok", bool_text(doctor_banner_ok)])
@@ -349,6 +394,12 @@ def main() -> None:
         writer.writerow(["runtime_degradation_surface_ok", bool_text(degradation_surface_ok)])
         writer.writerow(["runtime_manifest_jsonl_path", str(manifest_jsonl_path)])
         writer.writerow(["runtime_manifest_jsonl_match_ok", bool_text(manifest_jsonl_match_ok)])
+        writer.writerow(["runtime_manifest_out_wav_path", str(manifest_out_wav_path)])
+        writer.writerow(["runtime_manifest_out_wav_match_ok", bool_text(manifest_out_wav_match_ok)])
+        writer.writerow(["runtime_manifest_out_jsonl_path", str(manifest_out_jsonl_path)])
+        writer.writerow(
+            ["runtime_manifest_out_jsonl_match_ok", bool_text(manifest_out_jsonl_match_ok)]
+        )
         writer.writerow(["runtime_manifest_out_manifest_path", str(manifest_out_manifest_path)])
         writer.writerow(
             ["runtime_manifest_out_manifest_match_ok", bool_text(manifest_out_manifest_match_ok)]

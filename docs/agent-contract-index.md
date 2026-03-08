@@ -28,6 +28,7 @@ All canonical contract files live under `contracts/`:
 | Runtime JSONL schema | `contracts/runtime-jsonl.schema.v1.json` | `recordit inspect-contract jsonl-schema --format json` | JSON Schema for each `session.jsonl` line object. |
 | Session/preflight manifest schema | `contracts/session-manifest.schema.v1.json` | `recordit inspect-contract manifest-schema --format json` | JSON Schema covering both runtime and preflight manifest kinds. |
 | Exit-code/failure-class contract | `contracts/recordit-exit-code-contract.v1.json` | `recordit inspect-contract exit-codes --format json` | Exit code classes and degraded-success interpretation rules. |
+| Readiness ID vocabulary contract | `contracts/readiness-contract-ids.v1.json` | _file contract_ | Canonical readiness IDs/classes shared by Rust preflight and SwiftUI mapping. |
 
 ## 3. Schema-to-Artifact Mapping
 

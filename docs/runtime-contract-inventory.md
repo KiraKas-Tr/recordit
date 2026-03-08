@@ -3,6 +3,13 @@
 Date: 2026-03-02  
 Status: Phase A contract inventory baseline for `recordit`
 
+Superseded-context note (ADR-005): this inventory contains historical and
+compatibility surfaces that include `SequoiaTranscribe.app` wrappers. Canonical
+user-facing default entrypoint policy now points to `Recordit.app`
+(`docs/adr-005-recordit-default-entrypoint.md`). Legacy packaged wrapper
+entries below should be interpreted as fallback/compatibility contracts unless
+explicitly re-promoted by a future ADR.
+
 ## 1. Purpose and Scope
 
 This inventory captures externally-consumed surfaces that currently behave like contracts for operators, automation, packaged runs, and CI/gates.
@@ -101,7 +108,7 @@ Source of truth: `HELP_TEXT` and parse/validation in `src/bin/transcribe_live/ap
 | `--live-stream` and `--live-chunked` are mutually exclusive | S0 |
 | chunk tuning flags require a live selector (`--live-chunked` or `--live-stream`) | S0 |
 | live selectors are incompatible with `--replay-jsonl` | S0 |
-| live selectors are incompatible with `--preflight` | S0 |
+| live selectors are compatible with `--preflight` | S0 |
 
 ## 5. Runtime Mode Labels and Compatibility Matrix
 

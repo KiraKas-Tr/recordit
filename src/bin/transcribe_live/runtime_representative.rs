@@ -217,6 +217,7 @@ pub(super) fn run_standard_pipeline(config: &TranscribeConfig) -> Result<LiveRun
         backend_id,
         benchmark_track(channel_plan.active_mode),
         &wall_ms_runs,
+        config.out_manifest.parent(),
     )?;
     if config.live_stream {
         materialize_out_wav(&config.input_wav, &config.out_wav)?;

@@ -3,10 +3,14 @@
 Date: 2026-02-27  
 Scope: model bootstrap, signing/entitlements verification, TCC reset workflow, preflight troubleshooting
 
-Packaged entrypoint policy: operator runs should use signed `SequoiaTranscribe.app` via
-`make run-transcribe-app`, with `make run-transcribe-preflight-app` and
-`make run-transcribe-model-doctor-app` as the diagnostics companions.
-Debug commands in this runbook are troubleshooting/development surfaces, not the packaged default.
+Superseded-context note (ADR-005): user-facing default entrypoint policy is now
+`Recordit.app` (`docs/adr-005-recordit-default-entrypoint.md`). References in this
+runbook to signed `SequoiaTranscribe.app` / `make run-transcribe-app` are retained
+for fallback diagnostics, migration compatibility, and engineering validation only.
+They are not the canonical product-default launch path.
+
+Support escalation companion:
+- `docs/support-troubleshooting-matrix.md` (deterministic user-safe remediation + escalation triggers for Recordit.app lane)
 
 ## Bundle IDs and Paths
 

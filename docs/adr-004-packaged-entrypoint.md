@@ -1,7 +1,8 @@
 # ADR-004: Packaged Beta Entrypoint and Bundle Strategy
 
 - Date: 2026-02-28
-- Status: Accepted
+- Status: Superseded by ADR-005 (2026-03-05)
+- Superseded by: `docs/adr-005-recordit-default-entrypoint.md`
 - Related bead: `bd-4d9`
 
 ## Context
@@ -55,7 +56,7 @@ Argument plumbing plan:
 - live selector is forwarded via `TRANSCRIBE_ARGS=--live-stream`
 - packaged live mode also needs an explicit container-scoped capture input path:
   - proposed default: `$(TRANSCRIBE_APP_ARTIFACT_ROOT)/$(TRANSCRIBE_APP_SESSION_STEM).input.wav`
-- packaged preflight/model-doctor flows stay on the same entrypoint family and continue to reject incompatible selectors (`--preflight`, `--replay-jsonl`) exactly as the debug CLI does
+- packaged preflight/model-doctor flows stay on the same entrypoint family and continue to enforce debug-CLI selector rules (`--replay-jsonl` remains incompatible with live selectors, while `--preflight` stays compatible)
 
 Artifact destination plan:
 

@@ -568,9 +568,9 @@ fn default_model_candidates(backend: AsrBackend) -> Vec<(PathBuf, String)> {
 }
 
 fn sandbox_model_root() -> Option<PathBuf> {
-    env::var("HOME").ok().map(|home| {
-        PathBuf::from(home).join("Library/Containers/com.recordit.sequoiatranscribe/Data/models")
-    })
+    recordit::storage_roots::resolve_canonical_storage_roots()
+        .ok()
+        .map(|roots| roots.models_root)
 }
 
 pub(super) fn absolutize_candidate(path: PathBuf) -> PathBuf {
@@ -845,5 +845,116 @@ mod tests {
         let _ = fs::remove_file(&path);
         let _ = fs::remove_file(&target);
         let _ = reset_pcm_scratch_context_for_test();
+    }
+
+    #[test]
+    fn bundled_backend_program_uses_helpers_dir_when_resources_bin_missing() {
+        let temp_dir = env::temp_dir().join(format!(
+            "recordit-helpers-fallback-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let exe_path = temp_dir
+            .join("App.app")
+            .join("Contents")
+            .join("MacOS")
+            .join("App");
+        fs::create_dir_all(exe_path.parent().unwrap()).unwrap();
+        fs::File::create(&exe_path).unwrap();
+
+        let helpers_dir = temp_dir
+            .join("App.app")
+            .join("Contents")
+            .join("Helpers");
+        fs::create_dir_all(&helpers_dir).unwrap();
+        let helper_path = helpers_dir.join("whisper-cli");
+        fs::File::create(&helper_path).unwrap();
+
+        let resolved =
+            bundled_backend_program_from_exe(AsrBackend::WhisperCpp, &exe_path).unwrap();
+        assert_eq!(resolved, helper_path.to_string_lossy().to_string());
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn bundled_backend_program_returns_none_when_no_helper_present() {
+        let temp_dir = env::temp_dir().join(format!(
+            "recordit-no-helper-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let exe_path = temp_dir
+            .join("App.app")
+            .join("Contents")
+            .join("MacOS")
+            .join("App");
+        fs::create_dir_all(exe_path.parent().unwrap()).unwrap();
+        fs::File::create(&exe_path).unwrap();
+
+        let result = bundled_backend_program_from_exe(AsrBackend::WhisperCpp, &exe_path);
+        assert!(result.is_none(), "expected None when no helper binary exists");
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn bundled_backend_program_resolves_whisperkit_helper() {
+        let temp_dir = env::temp_dir().join(format!(
+            "recordit-whisperkit-helper-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let exe_path = temp_dir
+            .join("App.app")
+            .join("Contents")
+            .join("MacOS")
+            .join("App");
+        fs::create_dir_all(exe_path.parent().unwrap()).unwrap();
+        fs::File::create(&exe_path).unwrap();
+
+        let resources_bin = temp_dir
+            .join("App.app")
+            .join("Contents")
+            .join("Resources")
+            .join("bin");
+        fs::create_dir_all(&resources_bin).unwrap();
+        let helper_path = resources_bin.join("whisperkit-cli");
+        fs::File::create(&helper_path).unwrap();
+
+        let resolved =
+            bundled_backend_program_from_exe(AsrBackend::WhisperKit, &exe_path).unwrap();
+        assert_eq!(resolved, helper_path.to_string_lossy().to_string());
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn absolutize_candidate_preserves_absolute_path() {
+        let path = PathBuf::from("/absolute/model.bin");
+        let result = absolutize_candidate(path.clone());
+        assert_eq!(result, path);
+    }
+
+    #[test]
+    fn absolutize_candidate_prepends_cwd_to_relative_path() {
+        let relative = PathBuf::from("models/ggml-tiny.en.bin");
+        let result = absolutize_candidate(relative.clone());
+        assert!(
+            result.is_absolute(),
+            "expected absolute path, got: {}",
+            result.display()
+        );
+        assert!(
+            result.ends_with("models/ggml-tiny.en.bin"),
+            "expected path to end with relative suffix, got: {}",
+            result.display()
+        );
     }
 }

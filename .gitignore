@@ -1,7 +1,19 @@
 /target
 /dist
-/artifacts
+/artifacts/*
+# Whitelist vendored model for Git LFS
+!/artifacts/bench/
+/artifacts/bench/*
+!/artifacts/bench/models/
+/artifacts/bench/models/*
+!/artifacts/bench/models/whispercpp/
+/artifacts/bench/models/whispercpp/*
+!/artifacts/bench/models/whispercpp/ggml-tiny.en.bin
 
 # bv (beads viewer) local config and caches
 .bv/
 __pycache__
+.build/
+.tmp/
+build/
+tests/

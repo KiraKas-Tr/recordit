@@ -4,7 +4,7 @@ use super::{
     build_terminal_render_actions, display_path, input_wav_semantics, model_checksum_info,
     reconstruct_transcript_per_channel, BackpressureTransitionReason, ChannelPressureSnapshot,
     LiveRunReport, ResolvedModelPath, TerminalRenderActionKind, TerminalRenderMode,
-    TranscriptEvent, TranscribeConfig, OUT_WAV_SEMANTICS, OVERLAP_WINDOW_MS,
+    TranscribeConfig, TranscriptEvent, OUT_WAV_SEMANTICS, OVERLAP_WINDOW_MS,
 };
 
 pub(super) fn stable_terminal_summary_lines(events: &[TranscriptEvent]) -> Vec<String> {
@@ -61,11 +61,19 @@ pub(super) fn runtime_failure_breadcrumbs(
         report.hot_path_diagnostics.transport.path_requests,
         report.hot_path_diagnostics.transport.pcm_window_requests,
         report.hot_path_diagnostics.scratch.write_attempts_estimate,
-        report.hot_path_diagnostics.scratch.reuse_overwrites_estimate,
+        report
+            .hot_path_diagnostics
+            .scratch
+            .reuse_overwrites_estimate,
         report.hot_path_diagnostics.scratch.retained_for_review_hint,
         report.hot_path_diagnostics.backpressure.mode.as_str(),
         report.hot_path_diagnostics.backpressure.transition_count,
-        backpressure_reason_label(report.hot_path_diagnostics.backpressure.last_transition_reason),
+        backpressure_reason_label(
+            report
+                .hot_path_diagnostics
+                .backpressure
+                .last_transition_reason
+        ),
         report.hot_path_diagnostics.backpressure.pending_jobs,
         report.hot_path_diagnostics.backpressure.pending_final_jobs,
         report.hot_path_diagnostics.pump.chunk_decisions,
@@ -215,23 +223,36 @@ pub(super) fn build_live_close_summary_lines(
                 .scratch
                 .worker_scratch_paths_upper_bound,
             report.hot_path_diagnostics.scratch.write_attempts_estimate,
-            report.hot_path_diagnostics.scratch.reuse_overwrites_estimate,
+            report
+                .hot_path_diagnostics
+                .scratch
+                .reuse_overwrites_estimate,
             report.hot_path_diagnostics.scratch.retained_for_review_hint
         ),
         format!(
             "diagnostics_backpressure=mode:{} transitions:{} last_reason:{} pending_jobs:{} pending_final_jobs:{} per_channel:{}",
             report.hot_path_diagnostics.backpressure.mode.as_str(),
             report.hot_path_diagnostics.backpressure.transition_count,
-            backpressure_reason_label(report.hot_path_diagnostics.backpressure.last_transition_reason),
+            backpressure_reason_label(
+                report
+                    .hot_path_diagnostics
+                    .backpressure
+                    .last_transition_reason
+            ),
             report.hot_path_diagnostics.backpressure.pending_jobs,
             report.hot_path_diagnostics.backpressure.pending_final_jobs,
-            channel_pressure_snapshots_csv(&report.hot_path_diagnostics.backpressure.channel_snapshots)
+            channel_pressure_snapshots_csv(
+                &report.hot_path_diagnostics.backpressure.channel_snapshots
+            )
         ),
         format!(
             "diagnostics_pump=chunk_decisions:{} forced_decisions:{} forced_capture_event_triggers:{} forced_shutdown_triggers:{}",
             report.hot_path_diagnostics.pump.chunk_decisions,
             report.hot_path_diagnostics.pump.forced_decisions,
-            report.hot_path_diagnostics.pump.forced_capture_event_triggers,
+            report
+                .hot_path_diagnostics
+                .pump
+                .forced_capture_event_triggers,
             report.hot_path_diagnostics.pump.forced_shutdown_triggers
         ),
         format!(
@@ -441,14 +462,22 @@ pub(super) fn print_live_report(
             .scratch
             .worker_scratch_paths_upper_bound,
         report.hot_path_diagnostics.scratch.write_attempts_estimate,
-        report.hot_path_diagnostics.scratch.reuse_overwrites_estimate,
+        report
+            .hot_path_diagnostics
+            .scratch
+            .reuse_overwrites_estimate,
         report.hot_path_diagnostics.scratch.retained_for_review_hint
     );
     println!(
         "  hot_path_backpressure: mode={} transitions={} last_reason={} pending_jobs={} pending_final_jobs={}",
         report.hot_path_diagnostics.backpressure.mode.as_str(),
         report.hot_path_diagnostics.backpressure.transition_count,
-        backpressure_reason_label(report.hot_path_diagnostics.backpressure.last_transition_reason),
+        backpressure_reason_label(
+            report
+                .hot_path_diagnostics
+                .backpressure
+                .last_transition_reason
+        ),
         report.hot_path_diagnostics.backpressure.pending_jobs,
         report.hot_path_diagnostics.backpressure.pending_final_jobs
     );
@@ -477,7 +506,10 @@ pub(super) fn print_live_report(
         "  hot_path_pump: chunk_decisions={} forced_decisions={} forced_capture_event_triggers={} forced_shutdown_triggers={}",
         report.hot_path_diagnostics.pump.chunk_decisions,
         report.hot_path_diagnostics.pump.forced_decisions,
-        report.hot_path_diagnostics.pump.forced_capture_event_triggers,
+        report
+            .hot_path_diagnostics
+            .pump
+            .forced_capture_event_triggers,
         report.hot_path_diagnostics.pump.forced_shutdown_triggers
     );
     println!(

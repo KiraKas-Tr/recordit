@@ -1,0 +1,64 @@
+{
+  "contract_name": "recordit-e2e-evidence",
+  "contract_version": "1",
+  "scenario_id": "recorditapp-xcuitest-happy-path",
+  "lane_type": "xcuitest-evidence",
+  "generated_at_utc": "2026-03-06T12:25:00Z",
+  "artifact_root_relpath": "artifacts",
+  "overall_status": "pass",
+  "paths_env_relpath": "paths.env",
+  "status_txt_relpath": "status.txt",
+  "summary_csv_relpath": "summary.csv",
+  "summary_json_relpath": "summary.json",
+  "phases": [
+    {
+      "phase_id": "build_for_testing",
+      "title": "Build UI tests",
+      "required": true,
+      "status": "pass",
+      "exit_classification": "success",
+      "started_at_utc": "2026-03-06T12:18:00Z",
+      "ended_at_utc": "2026-03-06T12:20:00Z",
+      "command_display": "xcodebuild -project Recordit.xcodeproj -scheme RecorditApp build-for-testing",
+      "command_argv": [
+        "xcodebuild",
+        "-project",
+        "Recordit.xcodeproj",
+        "-scheme",
+        "RecorditApp",
+        "build-for-testing"
+      ],
+      "log_relpath": "logs/build_for_testing.log",
+      "stdout_relpath": "logs/build_for_testing.stdout",
+      "stderr_relpath": "logs/build_for_testing.stderr",
+      "primary_artifact_relpath": "artifacts/build-for-testing-ui.txt"
+    },
+    {
+      "phase_id": "run_xcuitest",
+      "title": "Run onboarding UI test lane",
+      "required": true,
+      "status": "pass",
+      "exit_classification": "success",
+      "started_at_utc": "2026-03-06T12:20:05Z",
+      "ended_at_utc": "2026-03-06T12:24:30Z",
+      "command_display": "xcodebuild -project Recordit.xcodeproj -scheme RecorditApp test-without-building",
+      "command_argv": [
+        "xcodebuild",
+        "-project",
+        "Recordit.xcodeproj",
+        "-scheme",
+        "RecorditApp",
+        "test-without-building"
+      ],
+      "log_relpath": "logs/run_xcuitest.log",
+      "stdout_relpath": "logs/run_xcuitest.stdout",
+      "stderr_relpath": "logs/run_xcuitest.stderr",
+      "primary_artifact_relpath": "artifacts/xcuitest-summary.txt",
+      "extra_artifact_relpaths": [
+        "artifacts/xcuitest-report.json",
+        "artifacts/screenshots/onboarding-ready.png"
+      ],
+      "result_bundle_relpath": "bundles/RecorditAppUITests.xcresult"
+    }
+  ]
+}

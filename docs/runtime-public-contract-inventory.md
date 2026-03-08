@@ -35,6 +35,19 @@ Use these classes for all changes proposed after phase A:
 | `Additive-only` | Existing keys/values are frozen, but new sibling keys/rows/options may be added. | Add new optional fields, new optional flags, new docs. |
 | `Provisional/internal` | Useful today, but not the compatibility boundary for v1. | May refactor freely if frozen surfaces stay intact. |
 
+## SwiftUI↔Rust Readiness Boundary Contract
+
+Canonical readiness vocabulary is now tracked in:
+
+- `contracts/readiness-contract-ids.v1.json`
+- `docs/runtime-boundary-ownership-contract.md`
+
+Compatibility rule:
+
+- existing readiness IDs and their class semantics are `Frozen` within `v1`
+- adding new readiness IDs is `Additive-only` if existing IDs/classes keep their meaning
+- renaming/removing IDs or reclassifying existing IDs is breaking and requires a new versioned contract file
+
 ## Legacy CLI Contract
 
 Contract owner: `transcribe-live`
@@ -106,15 +119,15 @@ Compatibility rule:
 | Flags | Current meaning | Current default / notes | Class |
 |---|---|---|---|
 | `--model-doctor` | run model/backend diagnostics and exit | incompatible with `--replay-jsonl` | `Frozen` |
-| `--replay-jsonl` | replay readable transcript from prior JSONL | incompatible with live selectors and preflight | `Frozen` |
-| `--preflight` | run structured preflight diagnostics and write manifest | incompatible with live selectors and replay | `Frozen` |
+| `--replay-jsonl` | replay readable transcript from prior JSONL | incompatible with live selectors | `Frozen` |
+| `--preflight` | run structured preflight diagnostics and write manifest | compatible with live selectors; incompatible with replay | `Frozen` |
 | `-h`, `--help` | print contract help text | no positional args allowed | `Frozen` |
 
 ### Validation Rules That Are Part of the CLI Contract
 
 - `--live-stream` and `--live-chunked` are mutually exclusive.
 - `--live-stream` and `--live-chunked` are incompatible with `--replay-jsonl`.
-- `--live-stream` and `--live-chunked` are incompatible with `--preflight`.
+- `--live-stream` and `--live-chunked` are compatible with `--preflight`.
 - `--model-doctor` is incompatible with `--replay-jsonl`.
 - chunk-tuning flags are meaningful only for live selectors.
 - unknown flags and positional arguments fail with exit code `2` and point the user back to `--help`.

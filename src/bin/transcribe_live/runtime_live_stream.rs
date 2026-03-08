@@ -26,6 +26,14 @@ struct LiveStreamRuntimeExecution {
     pump_cadence: PumpCadenceController,
 }
 
+fn graceful_stop_request_path(config: &TranscribeConfig) -> Option<PathBuf> {
+    config
+        .out_manifest
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .map(|parent| parent.join("session.stop.request"))
+}
+
 #[derive(Debug, Default)]
 struct RuntimeChannelAudio {
     sample_rate_hz: u32,
@@ -618,6 +626,7 @@ pub(super) fn run_live_stream_pipeline(
         target_rate_hz: config.sample_rate_hz,
         mismatch_policy: LiveCaptureSampleRateMismatchPolicy::AdaptStreamRate,
         callback_contract_mode: LiveCaptureCallbackMode::Warn,
+        stop_request_path: graceful_stop_request_path(config),
     };
     let capture_result = run_streaming_capture_session(&live_capture_config, &mut runtime)
         .map_err(|err| CliError::new(format!("live capture session failed: {err}")))?;
@@ -751,6 +760,7 @@ pub(super) fn run_live_stream_pipeline(
         backend_id,
         benchmark_track(active_channel_mode),
         &wall_ms_runs,
+        config.out_manifest.parent(),
     )?;
 
     let report = LiveRunReport {
@@ -1060,5 +1070,25 @@ mod tests {
             !kill_switch_jobs.is_empty(),
             "expected partial/final job emission to remain available with kill-switch active"
         );
+    }
+    #[test]
+    fn graceful_stop_request_path_uses_manifest_parent() {
+        let mut config = TranscribeConfig::default();
+        config.out_manifest = PathBuf::from("artifacts/sessions/live-case/session.manifest.json");
+
+        let path = graceful_stop_request_path(&config)
+            .expect("manifest parent should produce stop marker path");
+        assert_eq!(
+            path,
+            PathBuf::from("artifacts/sessions/live-case/session.stop.request")
+        );
+    }
+
+    #[test]
+    fn graceful_stop_request_path_returns_none_without_parent() {
+        let mut config = TranscribeConfig::default();
+        config.out_manifest = PathBuf::from("session.manifest.json");
+
+        assert_eq!(graceful_stop_request_path(&config), None);
     }
 }

@@ -321,46 +321,48 @@ impl LiveAsrService {
             let exec = Arc::clone(&executor);
             let policy = config.temp_audio_policy;
             let retries = config.retries;
-            worker_handles.push(thread::spawn(move || loop {
-                let maybe_request = LiveAsrService::pop_next_job(&queue);
-                let Some(request) = maybe_request else {
-                    break;
-                };
+            worker_handles.push(thread::spawn(move || {
+                loop {
+                    let maybe_request = LiveAsrService::pop_next_job(&queue);
+                    let Some(request) = maybe_request else {
+                        break;
+                    };
 
-                let mut attempts = 0usize;
-                let (transcript, error) = loop {
-                    match exec.transcribe(&request) {
-                        Ok(text) => break (Some(text), None),
-                        Err(err) => {
-                            if attempts >= retries {
-                                break (None, Some(err));
+                    let mut attempts = 0usize;
+                    let (transcript, error) = loop {
+                        match exec.transcribe(&request) {
+                            Ok(text) => break (Some(text), None),
+                            Err(err) => {
+                                if attempts >= retries {
+                                    break (None, Some(err));
+                                }
+                                attempts += 1;
                             }
-                            attempts += 1;
                         }
-                    }
-                };
+                    };
 
-                let success = error.is_none();
-                let (retained, deleted) = request
-                    .audio_input
-                    .as_path()
-                    .map(|path| {
-                        finalize_temp_audio_path(
-                            path,
-                            request.audio_input.is_temp_audio(),
-                            success,
-                            policy,
-                        )
-                    })
-                    .unwrap_or((false, false));
-                let _ = tx.send(LiveAsrJobResult {
-                    job: request.into_result_job(),
-                    transcript_text: transcript,
-                    error,
-                    retry_attempts: attempts,
-                    temp_audio_retained: retained,
-                    temp_audio_deleted: deleted,
-                });
+                    let success = error.is_none();
+                    let (retained, deleted) = request
+                        .audio_input
+                        .as_path()
+                        .map(|path| {
+                            finalize_temp_audio_path(
+                                path,
+                                request.audio_input.is_temp_audio(),
+                                success,
+                                policy,
+                            )
+                        })
+                        .unwrap_or((false, false));
+                    let _ = tx.send(LiveAsrJobResult {
+                        job: request.into_result_job(),
+                        transcript_text: transcript,
+                        error,
+                        retry_attempts: attempts,
+                        temp_audio_retained: retained,
+                        temp_audio_deleted: deleted,
+                    });
+                }
             }));
         }
         drop(result_tx);
@@ -663,14 +665,14 @@ fn finalize_temp_audio_path(
 #[cfg(test)]
 mod tests {
     use super::{
-        run_live_asr_pool, LiveAsrAudioInput, LiveAsrExecutor, LiveAsrJob, LiveAsrJobClass,
-        LiveAsrPoolConfig, LiveAsrRequest, LiveAsrService, QueueEnqueueOutcome, ServiceQueueState,
-        TempAudioPolicy,
+        LiveAsrAudioInput, LiveAsrExecutor, LiveAsrJob, LiveAsrJobClass, LiveAsrPoolConfig,
+        LiveAsrRequest, LiveAsrService, QueueEnqueueOutcome, ServiceQueueState, TempAudioPolicy,
+        run_live_asr_pool,
     };
     use std::fs;
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::thread;
     use std::time::Duration;
 
@@ -1042,11 +1044,13 @@ mod tests {
             assert_eq!(evicted.job.job_id, 100);
             assert_eq!(evicted.job.class, LiveAsrJobClass::Partial);
             assert!(!evicted.success());
-            assert!(evicted
-                .error
-                .as_deref()
-                .unwrap_or_default()
-                .contains("evicted partial job in favor of final"));
+            assert!(
+                evicted
+                    .error
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("evicted partial job in favor of final")
+            );
 
             let final_result = final_result.expect("expected final result after eviction path");
             assert!(final_result.success());
@@ -1260,11 +1264,13 @@ mod tests {
         assert_eq!(telemetry.failed, 1);
         assert_eq!(telemetry.temp_audio_retained, 1);
         assert_eq!(telemetry.temp_audio_deleted, 0);
-        assert!(results[0]
-            .error
-            .as_deref()
-            .unwrap_or_default()
-            .contains("prewarm failed"));
+        assert!(
+            results[0]
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("prewarm failed")
+        );
         assert!(tmp.exists());
         let _ = fs::remove_file(tmp);
     }
@@ -1362,11 +1368,13 @@ mod tests {
 
         let result = service.recv_result_timeout(Duration::from_millis(100));
         assert!(result.is_some());
-        assert!(result
-            .as_ref()
-            .and_then(|r| r.error.as_ref())
-            .map(|msg| msg.contains("closed"))
-            .unwrap_or(false));
+        assert!(
+            result
+                .as_ref()
+                .and_then(|r| r.error.as_ref())
+                .map(|msg| msg.contains("closed"))
+                .unwrap_or(false)
+        );
         let telemetry = service.telemetry();
         assert_eq!(telemetry.failed, 1);
         assert_eq!(telemetry.temp_audio_retained, 1);
