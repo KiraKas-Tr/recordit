@@ -362,6 +362,8 @@ reset-perms:
 	tccutil reset Microphone com.recordit.sequoiatranscribe || true
 	tccutil reset ScreenCapture com.recordit.sequoiacapture || true
 	tccutil reset Microphone com.recordit.sequoiacapture || true
+	tccutil reset ScreenCapture com.recordit.app || true
+	tccutil reset Microphone com.recordit.app || true
 
 clean:
 	rm -rf dist artifacts
