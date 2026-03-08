@@ -1,0 +1,149 @@
+name: recordit-build-release-dmg
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  RECORDIT_XCODE_CONFIGURATION: Release
+  RECORDIT_DMG_VOLNAME: Recordit
+
+jobs:
+  build-release-dmg:
+    runs-on: macos-14
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout (with LFS)
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust build cache
+        uses: Swatinem/rust-cache@v2
+
+      # ── Signing certificate (conditional) ──────────────────────────
+      - name: Import signing certificate
+        if: env.APPLE_CERTIFICATE_BASE64 != ''
+        env:
+          APPLE_CERTIFICATE_BASE64: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          CERT_PATH="$RUNNER_TEMP/certificate.p12"
+          KEYCHAIN_PATH="$RUNNER_TEMP/app-signing.keychain-db"
+          KEYCHAIN_PASSWORD="$(openssl rand -hex 24)"
+
+          echo "$APPLE_CERTIFICATE_BASE64" | base64 --decode -o "$CERT_PATH"
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+          security import "$CERT_PATH" \
+            -P "$APPLE_CERTIFICATE_PASSWORD" \
+            -A -t cert -f pkcs12 \
+            -k "$KEYCHAIN_PATH"
+
+          security set-key-partition-list \
+            -S apple-tool:,apple: \
+            -k "$KEYCHAIN_PASSWORD" \
+            "$KEYCHAIN_PATH"
+
+          security list-keychains -d user -s "$KEYCHAIN_PATH" login.keychain-db
+          security default-keychain -s "$KEYCHAIN_PATH"
+
+          echo "SIGN_IDENTITY=${{ secrets.APPLE_SIGNING_IDENTITY }}" >> "$GITHUB_ENV"
+
+      - name: Set ad-hoc signing fallback
+        if: env.APPLE_CERTIFICATE_BASE64 == ''
+        env:
+          APPLE_CERTIFICATE_BASE64: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
+        run: |
+          echo "SIGN_IDENTITY=-" >> "$GITHUB_ENV"
+          echo "::notice::No signing certificate configured — using ad-hoc signing"
+
+      # ── Build pipeline ─────────────────────────────────────────────
+      - name: Build runtime inputs (Rust binaries + model + manifest)
+        run: make prepare-recordit-runtime-inputs
+
+      - name: Build Recordit.app (xcodebuild)
+        run: make build-recordit-app
+
+      - name: Bundle into dist/
+        run: make bundle-recordit-app
+
+      - name: Sign Recordit.app
+        run: |
+          make sign-recordit-app SIGN_IDENTITY="$SIGN_IDENTITY"
+
+      - name: Verify bundled payload
+        run: make verify-recordit-app
+
+      - name: Create DMG
+        run: make create-recordit-dmg
+
+      # ── Notarization (conditional) ─────────────────────────────────
+      - name: Setup notarization credentials
+        if: env.APPLE_API_KEY_BASE64 != ''
+        env:
+          APPLE_API_KEY_BASE64: ${{ secrets.APPLE_API_KEY_BASE64 }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+        run: |
+          mkdir -p ~/private_keys
+          echo "$APPLE_API_KEY_BASE64" | base64 --decode -o ~/private_keys/AuthKey_${APPLE_API_KEY_ID}.p8
+
+          xcrun notarytool store-credentials "NOTARY_PROFILE" \
+            --key ~/private_keys/AuthKey_${APPLE_API_KEY_ID}.p8 \
+            --key-id "$APPLE_API_KEY_ID" \
+            --issuer "$APPLE_API_ISSUER_ID"
+
+          echo "NOTARY_PROFILE=NOTARY_PROFILE" >> "$GITHUB_ENV"
+
+      - name: Notarize and staple DMG
+        if: env.NOTARY_PROFILE != ''
+        run: |
+          make notarize-recordit-dmg \
+            SIGN_IDENTITY="$SIGN_IDENTITY" \
+            NOTARY_PROFILE="$NOTARY_PROFILE" \
+            SKIP_DMG_BUILD=1 \
+            ALLOW_SPCTL_FAILURE=0
+
+      # ── Artifacts ──────────────────────────────────────────────────
+      - name: Upload DMG artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Recordit-${{ github.sha }}
+          path: dist/Recordit.dmg
+          if-no-files-found: error
+
+      - name: Create GitHub Release
+        if: github.ref == 'refs/heads/main'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: Build ${{ github.run_number }}
+          body: |
+            Automated release from merge to main.
+
+            **Commit:** ${{ github.sha }}
+            **Signing:** ${{ env.SIGN_IDENTITY == '-' && 'Ad-hoc (not notarized)' || 'Developer ID (notarized)' }}
+          files: dist/Recordit.dmg
+          draft: false
+          prerelease: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # ── Cleanup ────────────────────────────────────────────────────
+      - name: Cleanup keychain
+        if: always()
+        run: |
+          KEYCHAIN_PATH="$RUNNER_TEMP/app-signing.keychain-db"
+          if [ -f "$KEYCHAIN_PATH" ]; then
+            security delete-keychain "$KEYCHAIN_PATH" || true
+          fi
