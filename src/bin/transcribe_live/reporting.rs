@@ -164,8 +164,9 @@ pub(super) fn build_live_close_summary_lines(
         format!("channel_mode_requested={}", report.channel_mode),
         format!("channel_mode_active={}", report.active_channel_mode),
         format!(
-            "transcript_events=partial:{} final:{} llm_final:{} reconciled_final:{}",
+            "transcript_events=partial:{} stable_partial:{} final:{} llm_final:{} reconciled_final:{}",
             transcript_event_count(&report.events, "partial"),
+            transcript_event_count(&report.events, "stable_partial"),
             transcript_event_count(&report.events, "final"),
             transcript_event_count(&report.events, "llm_final"),
             transcript_event_count(&report.events, "reconciled_final"),

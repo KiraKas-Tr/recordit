@@ -251,7 +251,7 @@ impl LiveTerminalStream {
                 let _ = stdout.flush();
                 self.partial_visible = true;
             }
-            "final" | "llm_final" | "reconciled_final" => {
+            "stable_partial" | "final" | "llm_final" | "reconciled_final" => {
                 self.last_partial_by_segment
                     .remove(&(event.channel.clone(), event.segment_id.clone()));
                 let Some(line) = format_stable_transcript_line(event) else {
@@ -614,8 +614,7 @@ pub(super) fn run_live_stream_pipeline(
     let started_at = Instant::now();
     let resolved_model = validate_model_path_for_backend(config)?;
     let generated_at_utc = runtime_timestamp_utc();
-    let stamp = command_stdout("date", &["-u", "+%Y%m%dT%H%M%SZ"])
-        .unwrap_or_else(|_| "unknown".to_string());
+    let stamp = preflight::utc_compact_stamp();
     let backend_id = backend_id_for_asr_backend(config.asr_backend);
 
     let mut runtime = LiveStreamRuntimeExecution::new(config, &resolved_model.path, &stamp)?;

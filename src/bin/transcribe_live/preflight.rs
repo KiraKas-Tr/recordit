@@ -27,10 +27,8 @@ const PREFLIGHT_WARN_ACK_CHECK_IDS: [&str; 2] = [CHECK_ID_SAMPLE_RATE, CHECK_ID_
 const MODEL_DOCTOR_DIAGNOSTIC_ONLY_CHECK_IDS: [&str; 1] = [CHECK_ID_MODEL_READABILITY];
 
 #[cfg(test)]
-const PREFLIGHT_TCC_CAPTURE_CHECK_IDS: [&str; 2] = [
-    CHECK_ID_SCREEN_CAPTURE_ACCESS,
-    CHECK_ID_MICROPHONE_ACCESS,
-];
+const PREFLIGHT_TCC_CAPTURE_CHECK_IDS: [&str; 2] =
+    [CHECK_ID_SCREEN_CAPTURE_ACCESS, CHECK_ID_MICROPHONE_ACCESS];
 
 #[cfg(test)]
 const PREFLIGHT_BACKEND_MODEL_CHECK_IDS: [&str; 1] = [CHECK_ID_MODEL_PATH];
@@ -78,8 +76,7 @@ pub(super) fn run_model_doctor(config: &TranscribeConfig) -> Result<PreflightRep
         }
     }
 
-    let generated_at_utc = command_stdout("date", &["-u", "+%Y-%m-%dT%H:%M:%SZ"])
-        .unwrap_or_else(|_| "unknown".to_string());
+    let generated_at_utc = utc_timestamp_string();
 
     Ok(PreflightReport {
         generated_at_utc,
@@ -149,8 +146,7 @@ pub(super) fn run_preflight(config: &TranscribeConfig) -> Result<PreflightReport
     checks.push(check_microphone_stream(config.sample_rate_hz));
     checks.push(check_backend_runtime(config.asr_backend));
 
-    let generated_at_utc = command_stdout("date", &["-u", "+%Y-%m-%dT%H:%M:%SZ"])
-        .unwrap_or_else(|_| "unknown".to_string());
+    let generated_at_utc = utc_timestamp_string();
 
     Ok(PreflightReport {
         generated_at_utc,
@@ -234,6 +230,78 @@ fn check_sample_rate(sample_rate_hz: u32) -> PreflightCheck {
     )
 }
 
+/// Cross-platform UTC timestamp, formatted as ISO-8601.
+fn utc_timestamp_string() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    utc_timestamp_from_secs(secs)
+}
+
+/// Convert Unix epoch seconds to an ISO-8601 timestamp string (no external deps).
+pub(super) fn utc_timestamp_from_secs(ts: u64) -> String {
+    let (y, mo, d, h, mi, s) = secs_to_date_parts(ts);
+    format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{s:02}Z")
+}
+
+/// Compact UTC stamp for use in file names: `YYYYMMDDTHHMMSSz`.
+pub(super) fn utc_compact_stamp() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let (y, mo, d, h, mi, s) = secs_to_date_parts(secs);
+    format!("{y:04}{mo:02}{d:02}T{h:02}{mi:02}{s:02}Z")
+}
+
+fn secs_to_date_parts(ts: u64) -> (u32, u32, u32, u32, u32, u32) {
+    let s = (ts % 60) as u32;
+    let total_minutes = ts / 60;
+    let mi = (total_minutes % 60) as u32;
+    let total_hours = total_minutes / 60;
+    let h = (total_hours % 24) as u32;
+    let mut days = (total_hours / 24) as u32; // days since 1970-01-01
+                                              // Gregorian calendar computation (days since epoch).
+    let mut y = 1970u32;
+    loop {
+        let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+        let days_in_year = if leap { 366 } else { 365 };
+        if days < days_in_year {
+            break;
+        }
+        days -= days_in_year;
+        y += 1;
+    }
+    let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+    let month_days: [u32; 12] = [
+        31,
+        if leap { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ];
+    let mut mo = 1u32;
+    for &md in &month_days {
+        if days < md {
+            break;
+        }
+        days -= md;
+        mo += 1;
+    }
+    (y, mo, days + 1, h, mi, s)
+}
+
+#[cfg(target_os = "macos")]
 fn check_screen_capture_access() -> PreflightCheck {
     let content = match SCShareableContent::get() {
         Ok(content) => content,
@@ -264,6 +332,45 @@ fn check_screen_capture_access() -> PreflightCheck {
     )
 }
 
+#[cfg(target_os = "windows")]
+fn check_screen_capture_access() -> PreflightCheck {
+    use recordit::win_capture::check_audio_capture_access;
+    match check_audio_capture_access() {
+        Ok((_mic_name, sys_name)) => PreflightCheck::pass(
+            CHECK_ID_SCREEN_CAPTURE_ACCESS,
+            format!("Windows WASAPI audio capture access OK; render device: {sys_name}"),
+        ),
+        Err(err) => {
+            let detail = format!("Windows audio capture access check failed: {err}");
+            // Produce a specific remediation hint based on what the error message contains.
+            let remediation = if err.to_string().to_lowercase().contains("microphone") {
+                "Go to Settings → Privacy & Security → Microphone and allow this app to access the microphone."
+            } else if err.to_string().to_lowercase().contains("render")
+                || err.to_string().to_lowercase().contains("output")
+                || err.to_string().to_lowercase().contains("speaker")
+            {
+                "No audio output device found. Connect speakers or headphones, then re-run preflight. \
+                 Check Device Manager → Sound, video and game controllers for disabled/missing devices."
+            } else {
+                "Ensure a sound output device is present and enabled in Device Manager \
+                 (Control Panel → Hardware and Sound → Device Manager → Sound, video and game controllers). \
+                 If no device is shown, install audio drivers from your hardware manufacturer."
+            };
+            PreflightCheck::fail(CHECK_ID_SCREEN_CAPTURE_ACCESS, detail, remediation)
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn check_screen_capture_access() -> PreflightCheck {
+    PreflightCheck::fail(
+        CHECK_ID_SCREEN_CAPTURE_ACCESS,
+        "audio capture is not supported on this platform".to_string(),
+        "Run on macOS or Windows.",
+    )
+}
+
+#[cfg(target_os = "macos")]
 fn check_microphone_stream(sample_rate_hz: u32) -> PreflightCheck {
     let content = match SCShareableContent::get() {
         Ok(content) => content,
@@ -368,6 +475,43 @@ fn check_microphone_stream(sample_rate_hz: u32) -> PreflightCheck {
     }
 }
 
+#[cfg(target_os = "windows")]
+fn check_microphone_stream(_sample_rate_hz: u32) -> PreflightCheck {
+    use recordit::win_capture::check_audio_capture_access;
+    match check_audio_capture_access() {
+        Ok((mic_name, _sys_name)) => PreflightCheck::pass(
+            CHECK_ID_MICROPHONE_ACCESS,
+            format!("Windows WASAPI microphone capture access OK; device: {mic_name}"),
+        ),
+        Err(err) => {
+            let detail = format!("Windows microphone access check failed: {err}");
+            let remediation = if err.to_string().to_lowercase().contains("microphone")
+                || err.to_string().to_lowercase().contains("input")
+                || err.to_string().to_lowercase().contains("capture")
+            {
+                "Go to Settings → Privacy & Security → Microphone and enable microphone access for this app. \
+                 Also check that a microphone is connected and not disabled in Device Manager."
+            } else {
+                "Ensure a microphone is present, not muted, and enabled: \
+                 (1) Settings → System → Sound → Input — select an input device; \
+                 (2) Device Manager → Audio inputs and outputs — enable the microphone; \
+                 (3) Settings → Privacy & Security → Microphone — allow this app. \
+                 Re-run preflight after making changes."
+            };
+            PreflightCheck::fail(CHECK_ID_MICROPHONE_ACCESS, detail, remediation)
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn check_microphone_stream(_sample_rate_hz: u32) -> PreflightCheck {
+    PreflightCheck::fail(
+        CHECK_ID_MICROPHONE_ACCESS,
+        "microphone capture is not supported on this platform".to_string(),
+        "Run on macOS or Windows.",
+    )
+}
+
 fn check_backend_runtime(backend: AsrBackend) -> PreflightCheck {
     let tool_name = match backend {
         AsrBackend::WhisperCpp => "whisper-cli",
@@ -375,16 +519,48 @@ fn check_backend_runtime(backend: AsrBackend) -> PreflightCheck {
         AsrBackend::Moonshine => "moonshine",
     };
 
-    match command_stdout("which", &[tool_name]) {
+    // First: check sibling of current exe (matches asr_backend.rs resolution order).
+    if let Ok(current_exe) = std::env::current_exe() {
+        use super::asr_backend::bundled_backend_program_from_exe;
+        if let Some(path) = bundled_backend_program_from_exe(backend, &current_exe) {
+            return PreflightCheck::pass(
+                CHECK_ID_BACKEND_RUNTIME,
+                format!("detected backend helper binary `{tool_name}` at {path}"),
+            );
+        }
+    }
+
+    // Fallback: check PATH via `where` (Windows) or `which` (macOS/Linux).
+    #[cfg(target_os = "windows")]
+    let which_cmd = "where";
+    #[cfg(not(target_os = "windows"))]
+    let which_cmd = "which";
+
+    match command_stdout(which_cmd, &[tool_name]) {
         Ok(path) => PreflightCheck::pass(
             CHECK_ID_BACKEND_RUNTIME,
             format!("detected backend helper binary `{tool_name}` at {path}"),
         ),
-        Err(_) => PreflightCheck::warn(
-            CHECK_ID_BACKEND_RUNTIME,
-            format!("backend helper binary `{tool_name}` not found in PATH"),
-            "Install backend tooling or keep using Rust-native integration once wired.",
-        ),
+        Err(_) => {
+            #[cfg(target_os = "windows")]
+            let remediation = format!(
+                "Backend helper `{tool_name}.exe` not found in PATH or next to this executable. \
+                 Place `{tool_name}.exe` in the same directory as `transcribe-live.exe` \
+                 (or a `bin\\` subdirectory next to it), or add it to PATH. \
+                 Download the helper from the project release page."
+            );
+            #[cfg(not(target_os = "windows"))]
+            let remediation = format!(
+                "Backend helper `{tool_name}` not found in PATH or next to this executable. \
+                 Install backend tooling or place `{tool_name}` in the same directory as \
+                 `transcribe-live` (or a `bin/` subdirectory next to it)."
+            );
+            PreflightCheck::warn(
+                CHECK_ID_BACKEND_RUNTIME,
+                format!("backend helper binary `{tool_name}` not found in PATH"),
+                remediation.as_str(),
+            )
+        }
     }
 }
 
@@ -813,6 +989,110 @@ mod tests {
         assert_eq!(
             all_gating, all_domains,
             "gating check ID set must equal the union of all domain ID sets"
+        );
+    }
+
+    // ── Windows-specific preflight branch tests ─────────────────────────────
+
+    /// On Windows, check_screen_capture_access maps to audio capture (WASAPI),
+    /// not ScreenCaptureKit.  The check_id must still be "screen_capture_access"
+    /// so downstream gating contracts remain stable.
+    #[test]
+    fn windows_screen_capture_check_id_matches_contract() {
+        // The constant must remain "screen_capture_access" regardless of platform.
+        assert_eq!(
+            CHECK_ID_SCREEN_CAPTURE_ACCESS, "screen_capture_access",
+            "screen capture check ID must be stable across platforms"
+        );
+        // Must be a blocking gating ID.
+        assert!(
+            PREFLIGHT_BLOCKING_CHECK_IDS.contains(&CHECK_ID_SCREEN_CAPTURE_ACCESS),
+            "screen_capture_access must be a blocking check"
+        );
+        // Must belong to tcc_capture domain (same semantic domain on both platforms).
+        assert!(
+            PREFLIGHT_TCC_CAPTURE_CHECK_IDS.contains(&CHECK_ID_SCREEN_CAPTURE_ACCESS),
+            "screen_capture_access must belong to the tcc_capture domain"
+        );
+    }
+
+    /// On Windows, microphone access maps to WASAPI endpoint; check_id is stable.
+    #[test]
+    fn windows_microphone_check_id_matches_contract() {
+        assert_eq!(
+            CHECK_ID_MICROPHONE_ACCESS, "microphone_access",
+            "microphone access check ID must be stable across platforms"
+        );
+        assert!(
+            PREFLIGHT_BLOCKING_CHECK_IDS.contains(&CHECK_ID_MICROPHONE_ACCESS),
+            "microphone_access must be a blocking check"
+        );
+        assert!(
+            PREFLIGHT_TCC_CAPTURE_CHECK_IDS.contains(&CHECK_ID_MICROPHONE_ACCESS),
+            "microphone_access must belong to the tcc_capture domain"
+        );
+    }
+
+    /// backend_runtime check uses `where` on Windows and `which` on macOS/Linux;
+    /// the gating classification must remain identical.
+    #[test]
+    fn windows_backend_runtime_check_id_and_gating_are_stable() {
+        assert_eq!(
+            CHECK_ID_BACKEND_RUNTIME, "backend_runtime",
+            "backend_runtime check ID must be stable across platforms"
+        );
+        assert!(
+            PREFLIGHT_WARN_ACK_CHECK_IDS.contains(&CHECK_ID_BACKEND_RUNTIME),
+            "backend_runtime must be warn_ack (not blocking) on all platforms"
+        );
+        assert!(
+            PREFLIGHT_BACKEND_RUNTIME_CHECK_IDS.contains(&CHECK_ID_BACKEND_RUNTIME),
+            "backend_runtime must belong to the backend_runtime domain"
+        );
+    }
+
+    /// A simulated Windows preflight report with audio-capture fail should
+    /// gate as Fail and carry remediation text.
+    #[test]
+    fn windows_audio_capture_fail_gates_as_fail_with_remediation() {
+        let checks = with_override(
+            all_check_ids_pass(),
+            "screen_capture_access",
+            CheckStatus::Fail,
+        );
+        let report = scenario_report(checks);
+        assert!(
+            matches!(report.overall_status(), CheckStatus::Fail),
+            "audio capture failure should gate as Fail on Windows path"
+        );
+        let check = report
+            .checks
+            .iter()
+            .find(|c| c.id == "screen_capture_access")
+            .unwrap();
+        assert!(
+            check.remediation.is_some(),
+            "audio capture fail should carry remediation text"
+        );
+    }
+
+    /// A simulated Windows preflight report with mic fail should gate as Fail.
+    #[test]
+    fn windows_mic_fail_gates_as_fail_with_remediation() {
+        let checks = with_override(all_check_ids_pass(), "microphone_access", CheckStatus::Fail);
+        let report = scenario_report(checks);
+        assert!(
+            matches!(report.overall_status(), CheckStatus::Fail),
+            "microphone failure should gate as Fail"
+        );
+        let check = report
+            .checks
+            .iter()
+            .find(|c| c.id == "microphone_access")
+            .unwrap();
+        assert!(
+            check.remediation.is_some(),
+            "microphone fail should carry remediation text"
         );
     }
 }

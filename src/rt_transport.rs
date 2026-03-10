@@ -1,6 +1,6 @@
-use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TryRecvError, TrySendError, bounded};
-use std::sync::Arc;
+use crossbeam_channel::{bounded, Receiver, RecvTimeoutError, Sender, TryRecvError, TrySendError};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 #[derive(Debug, Default)]
@@ -15,7 +15,7 @@ struct TransportStats {
     dequeued: AtomicU64,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TransportStatsSnapshot {
     pub capacity: u64,
     pub ready_depth_high_water: u64,
@@ -178,7 +178,7 @@ impl<T> PreallocatedConsumer<T> {
 
 #[cfg(test)]
 mod tests {
-    use super::{TransportStatsSnapshot, preallocated_spsc};
+    use super::{preallocated_spsc, TransportStatsSnapshot};
     use std::time::Duration;
 
     #[test]

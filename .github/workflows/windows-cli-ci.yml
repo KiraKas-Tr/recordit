@@ -1,0 +1,113 @@
+name: windows-cli-ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - "src/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/windows-cli-ci.yml"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ── Wave 1: compile gate ────────────────────────────────────────────────────
+  windows-compile:
+    name: Windows compile gate (MSVC x64)
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (stable + MSVC target)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Rust build cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-msvc-x64
+
+      - name: cargo check — recordit + transcribe-live (MSVC x64)
+        run: >
+          cargo check
+          --target x86_64-pc-windows-msvc
+          --bin recordit
+          --bin transcribe-live
+        shell: pwsh
+
+      - name: cargo test --lib (Windows, no hardware required)
+        run: >
+          cargo test
+          --target x86_64-pc-windows-msvc
+          --lib
+          -- --nocapture
+        shell: pwsh
+
+  # ── Wave 4: artifact lane (nightly + main) ──────────────────────────────────
+  windows-artifact:
+    name: Windows CLI artifact (zip)
+    runs-on: windows-latest
+    timeout-minutes: 45
+    # Only produce artifacts on main or manual dispatch, not every PR
+    if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
+    needs: windows-compile
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (stable + MSVC target)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Rust build cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-msvc-x64-release
+
+      - name: Build release binaries
+        run: >
+          cargo build
+          --release
+          --target x86_64-pc-windows-msvc
+          --bin recordit
+          --bin transcribe-live
+        shell: pwsh
+
+      - name: Stage artifact layout
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path dist\windows-cli\bin -Force
+          Copy-Item target\x86_64-pc-windows-msvc\release\recordit.exe        dist\windows-cli\bin\
+          Copy-Item target\x86_64-pc-windows-msvc\release\transcribe-live.exe dist\windows-cli\bin\
+
+      - name: Smoke — recordit --help
+        shell: pwsh
+        run: dist\windows-cli\bin\recordit.exe --help
+
+      - name: Smoke — transcribe-live --help
+        shell: pwsh
+        run: dist\windows-cli\bin\transcribe-live.exe --help
+
+      - name: Package zip
+        shell: pwsh
+        run: |
+          $version = "$(git rev-parse --short HEAD)"
+          Compress-Archive -Path dist\windows-cli\* -DestinationPath "dist\recordit-windows-cli-${version}.zip"
+          Write-Host "Artifact: dist\recordit-windows-cli-${version}.zip"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: recordit-windows-cli-${{ github.sha }}
+          path: dist/recordit-windows-cli-*.zip
+          if-no-files-found: error

@@ -1,11 +1,11 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use crossbeam_channel::RecvTimeoutError;
-use recordit::rt_transport::{PreallocatedProducer, preallocated_spsc};
+use recordit::rt_transport::{preallocated_spsc, PreallocatedProducer};
 use screencapturekit::prelude::*;
 use std::collections::VecDeque;
 use std::env;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone)]

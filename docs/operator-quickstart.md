@@ -86,3 +86,58 @@ Policy references:
 - `docs/bd-14y4-sequoiatranscribe-fallback-policy.md`
 
 When documenting user guidance, always present `Recordit.app` as default and label fallback lanes explicitly as compatibility/diagnostic only.
+
+
+---
+
+## Windows CLI Lane
+
+> **Platform boundary:** macOS is the primary platform with a full GUI (`Recordit.app`).
+> Windows supports the CLI tools only (`recordit.exe`, `transcribe-live.exe`).
+
+### Prerequisites
+
+- Windows 10 22H2+ or Windows 11 (x64)
+- Rust stable + MSVC target:
+  ```powershell
+  rustup target add x86_64-pc-windows-msvc
+  ```
+- Visual Studio Build Tools ("Desktop development with C++" workload)
+- Microphone and audio output device present and enabled
+
+### Build
+
+```powershell
+cargo build --release --target x86_64-pc-windows-msvc --bin recordit --bin transcribe-live
+```
+
+### Preflight
+
+```powershell
+.\target\x86_64-pc-windows-msvc\release\transcribe-live.exe preflight
+```
+
+All three of `screen_capture_access`, `microphone_access`, and `backend_runtime` should be `pass` or `warn` (no `fail`) before starting a live session.
+
+### Run
+
+```powershell
+.\target\x86_64-pc-windows-msvc\release\recordit.exe run --mode live --duration-sec 30 --out-wav session.wav --out-jsonl session.jsonl
+```
+
+### CI / Release artifact
+
+The GitHub Actions workflow `.github/workflows/windows-cli-ci.yml` produces a zip artifact on every push to `main`:
+
+```
+recordit-windows-cli-<sha>.zip
+  bin\
+    recordit.exe
+    transcribe-live.exe
+```
+
+Place backend helper binaries (e.g. `whisper-cli.exe`) alongside `transcribe-live.exe` or in the `bin\` directory to enable transcription.
+
+### Support boundary
+
+Windows CLI is fully supported. Windows GUI (`Recordit.app` equivalent) is **not** in scope for this project. For GUI usage, use macOS.

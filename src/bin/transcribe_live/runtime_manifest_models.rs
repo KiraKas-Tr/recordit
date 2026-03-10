@@ -269,6 +269,7 @@ pub(crate) struct RuntimeEventCounts {
     pub(crate) vad_boundary: usize,
     pub(crate) transcript: usize,
     pub(crate) partial: usize,
+    pub(crate) stable_partial: usize,
     #[serde(rename = "final")]
     pub(crate) final_count: usize,
     pub(crate) llm_final: usize,
@@ -295,6 +296,7 @@ pub(crate) struct RuntimeSessionSummary {
 #[serde(deny_unknown_fields)]
 pub(crate) struct RuntimeSessionTranscriptEvents {
     pub(crate) partial: usize,
+    pub(crate) stable_partial: usize,
     #[serde(rename = "final")]
     pub(crate) final_count: usize,
     pub(crate) llm_final: usize,

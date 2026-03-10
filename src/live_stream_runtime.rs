@@ -1382,7 +1382,11 @@ fn frames_to_millis(frame_count: usize, sample_rate_hz: u32) -> u64 {
     }
     let rounded = (frame_count as u128 * 1_000) + (sample_rate_hz as u128 / 2);
     let ms = (rounded / sample_rate_hz as u128) as u64;
-    if ms == 0 { 1 } else { ms }
+    if ms == 0 {
+        1
+    } else {
+        ms
+    }
 }
 
 fn average_abs_level_per_mille(samples: &[f32]) -> u16 {
@@ -1802,11 +1806,9 @@ mod tests {
             summary.backpressure_transitions[0].reason,
             BackpressureTransitionReason::PendingJobsSustained
         );
-        assert!(
-            summary.backpressure_transitions[0]
-                .detail
-                .contains("entered pressure mode")
-        );
+        assert!(summary.backpressure_transitions[0]
+            .detail
+            .contains("entered pressure mode"));
     }
 
     #[test]
@@ -2461,11 +2463,9 @@ mod tests {
         assert_eq!(reconciles[0].segment_id, "microphone-seg-0001");
         assert_eq!(reconciles[0].segment_ord, 1);
         assert_eq!(reconciles[0].window_ord, 2);
-        assert!(
-            scheduler
-                .on_phase_change(LiveRuntimePhase::Active)
-                .is_empty()
-        );
+        assert!(scheduler
+            .on_phase_change(LiveRuntimePhase::Active)
+            .is_empty());
     }
 
     #[test]

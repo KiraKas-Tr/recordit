@@ -1,14 +1,31 @@
 # Sequoia Capture
 
-Sequoia Capture is a macOS 15+ Rust project that records:
-- system audio from ScreenCaptureKit
-- microphone audio from ScreenCaptureKit `captureMicrophone`
-- a stereo WAV with channel mapping `L=mic`, `R=system`
+Sequoia Capture is a Rust project that records system audio and microphone audio, producing a stereo WAV with channel mapping `L=mic`, `R=system`, plus live transcription via pluggable ASR backends.
+
+## Platform Support
+
+| Platform | Mode | Status |
+|----------|------|--------|
+| **macOS 15+ (Apple Silicon)** | GUI app (`Recordit.app`) + CLI | ✅ Primary — full feature set |
+| **Windows 10/11 (x64)** | CLI only (`recordit.exe`, `transcribe-live.exe`) | ✅ Supported — see [Windows CLI Quickstart](#windows-cli-quickstart) |
+| Other | — | ❌ Not supported |
+
+**macOS** is the primary platform. The `Recordit.app` SwiftUI application, signing/notarization, and packaged GUI flow are macOS-only.
+
+**Windows** supports the full CLI capture and transcription pipeline via WASAPI. No GUI application is provided on Windows.
 
 ## Requirements
+
+### macOS
 - macOS 15+
 - Xcode command line tools
 - Rust toolchain
+
+### Windows
+- Windows 10 22H2+ or Windows 11 (x64)
+- Rust toolchain with MSVC target: `rustup target add x86_64-pc-windows-msvc`
+- Visual Studio Build Tools (MSVC, Windows SDK)
+- A microphone + audio output device enabled in Device Manager
 
 ## Capture Model
 - Capture source is ScreenCaptureKit only.
@@ -811,3 +828,88 @@ For automation, use both layers:
 - Not an unconstrained low-latency stream processor with unbounded buffering.
 - Not a "best effort but opaque" transcription tool; this project favors explicit contracts and telemetry.
 - Not tied to one ASR backend implementation strategy; backend selection is modular and policy-driven.
+
+---
+
+## Windows CLI Quickstart
+
+> **Scope:** Windows supports the `recordit` + `transcribe-live` CLI pipeline only.
+> The `Recordit.app` GUI, DMG packaging, notarization, and Xcode project are macOS-only.
+
+### 1. Install Rust + MSVC target
+
+```powershell
+# Install Rust from https://rustup.rs
+rustup target add x86_64-pc-windows-msvc
+```
+
+Also install **Visual Studio Build Tools** with the "Desktop development with C++" workload (includes MSVC + Windows SDK).
+
+### 2. Build CLI binaries
+
+```powershell
+cargo build --release --target x86_64-pc-windows-msvc --bin recordit --bin transcribe-live
+```
+
+Binaries are produced at:
+```
+target\x86_64-pc-windows-msvc\release\recordit.exe
+target\x86_64-pc-windows-msvc\release\transcribe-live.exe
+```
+
+### 3. Canonical release layout
+
+For a portable release, use this layout:
+
+```
+release\
+  bin\
+    recordit.exe
+    transcribe-live.exe
+    whisper-cli.exe        ← ASR helper (whisper.cpp backend)
+```
+
+The helper binaries are resolved in this order:
+1. Environment variable override (`RECORDIT_WHISPER_CLI`, etc.)
+2. Sibling of the `.exe` — `bin\whisper-cli.exe`
+3. `bin\` subdirectory next to the `.exe`
+4. PATH (`where whisper-cli`)
+
+### 4. Run preflight check
+
+```powershell
+.\bin\transcribe-live.exe preflight
+```
+
+Expected output:
+```
+screen_capture_access   pass    Windows WASAPI audio capture access OK; render device: Speakers (Realtek)
+microphone_access       pass    Windows WASAPI microphone capture access OK; device: Microphone Array
+backend_runtime         warn    backend helper binary `whisper-cli` not found in PATH
+```
+
+### 5. Start a live capture session
+
+```powershell
+.\bin\recordit.exe run --mode live --duration-sec 30 --out-wav session.wav --out-jsonl session.jsonl
+```
+
+### Troubleshooting
+
+| Symptom | Remediation |
+|---------|-------------|
+| `screen_capture_access` FAIL: no render device | Connect speakers/headphones; check Device Manager → Sound, video and game controllers |
+| `microphone_access` FAIL | Settings → Privacy & Security → Microphone → allow this app; check Device Manager → Audio inputs and outputs |
+| `backend_runtime` WARN: `whisper-cli.exe` not found | Place `whisper-cli.exe` next to `transcribe-live.exe` or in a `bin\` subfolder |
+| Build error: `windows` crate features missing | Ensure Visual Studio Build Tools + Windows SDK are installed via `rustup` |
+| `CoInitializeEx failed` | Rare COM threading conflict; restart the terminal session |
+
+### Windows support boundary
+
+| Supported | Not supported |
+|-----------|---------------|
+| `recordit.exe` CLI | `Recordit.app` SwiftUI GUI |
+| `transcribe-live.exe` CLI | DMG packaging / notarization |
+| WASAPI mic + loopback capture | ScreenCaptureKit (macOS-only) |
+| WAV + JSONL + manifest artifacts | Xcode project / app bundle |
+| Preflight diagnostics | macOS TCC permission flow |

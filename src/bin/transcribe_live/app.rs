@@ -18,6 +18,7 @@ use recordit::live_stream_runtime::{
     StreamingSchedulerConfig, StreamingVadConfig, StreamingVadScheduler,
 };
 use recordit::storage_roots::{self, ManagedStorageDomain};
+#[cfg(target_os = "macos")]
 use screencapturekit::prelude::*;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
@@ -58,7 +59,7 @@ const DEFAULT_CHUNK_WINDOW_MS: u64 = 2_000;
 const DEFAULT_CHUNK_STRIDE_MS: u64 = 500;
 const DEFAULT_CHUNK_QUEUE_CAP: usize = 4;
 const DEFAULT_LIVE_ASR_WORKERS: usize = 2;
-const JSONL_SYNC_EVERY_LINES: usize = 24;
+const JSONL_SYNC_EVERY_LINES: usize = 1;
 const LIVE_CAPTURE_INTERRUPTION_RECOVERED_CODE: &str = "live_capture_interruption_recovered";
 const LIVE_CAPTURE_CONTINUITY_UNVERIFIED_CODE: &str = "live_capture_continuity_unverified";
 const LIVE_CAPTURE_TRANSPORT_DEGRADED_CODE: &str = "live_capture_transport_degraded";
@@ -1519,6 +1520,7 @@ struct LiveStreamIncrementalJsonlWriter {
     channel_mode: ChannelMode,
     speaker_labels: SpeakerLabels,
     lifecycle_transition_index: usize,
+    display_reducer: runtime_events::LiveTranscriptDisplayReducer,
 }
 
 impl LiveStreamIncrementalJsonlWriter {
@@ -1529,6 +1531,7 @@ impl LiveStreamIncrementalJsonlWriter {
             channel_mode: config.channel_mode,
             speaker_labels: config.speaker_labels.clone(),
             lifecycle_transition_index: 0,
+            display_reducer: runtime_events::LiveTranscriptDisplayReducer::default(),
         })
     }
 
@@ -1555,8 +1558,13 @@ impl LiveStreamIncrementalJsonlWriter {
                 ) else {
                     return Ok(());
                 };
-                self.stream
-                    .write_line(&jsonl_transcript_event_line(&event, self.backend_id, 0))?;
+                for event in self.display_reducer.process_event(event) {
+                    self.stream.write_line(&jsonl_transcript_event_line(
+                        &event,
+                        self.backend_id,
+                        0,
+                    ))?;
+                }
             }
             RuntimeOutputEvent::CaptureEvent { .. } | RuntimeOutputEvent::AsrQueued { .. } => {}
         }
@@ -3520,6 +3528,9 @@ fn parse_replay_transcript_event(
         contracts_models::runtime_jsonl::RuntimeJsonlEvent::Partial(payload) => {
             ("partial", payload)
         }
+        contracts_models::runtime_jsonl::RuntimeJsonlEvent::StablePartial(payload) => {
+            ("stable_partial", payload)
+        }
         contracts_models::runtime_jsonl::RuntimeJsonlEvent::Final(payload) => ("final", payload),
         contracts_models::runtime_jsonl::RuntimeJsonlEvent::LlmFinal(payload) => {
             ("llm_final", payload)
@@ -3788,7 +3799,13 @@ fn clean_field(value: &str) -> String {
 }
 
 fn runtime_timestamp_utc() -> String {
-    command_stdout("date", &["-u", "+%Y-%m-%dT%H:%M:%SZ"]).unwrap_or_else(|_| "unknown".to_string())
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    // Minimal ISO-8601 formatter (avoids pulling in chrono).
+    preflight::utc_timestamp_from_secs(secs)
 }
 
 fn command_stdout(program: &str, args: &[&str]) -> Result<String, CliError> {
@@ -3830,10 +3847,9 @@ mod tests {
         run_streaming_capture_session, runtime_mode_compatibility_matrix,
         select_runtime_execution_branch, transcript_events_from_runtime_output_events,
         validate_model_path_for_backend, validate_output_path, write_preflight_manifest,
-        write_runtime_jsonl,
-        write_runtime_manifest, AsrBackend, AsrWorkClass, AsrWorkItem, BenchmarkSummary,
-        CaptureChunk, CaptureEvent, CaptureSink, ChannelMode, ChannelVadBoundary, CheckStatus,
-        CleanupAttemptOutcome, CleanupQueueTelemetry, CleanupTaskStatus,
+        write_runtime_jsonl, write_runtime_manifest, AsrBackend, AsrWorkClass, AsrWorkItem,
+        BenchmarkSummary, CaptureChunk, CaptureEvent, CaptureSink, ChannelMode, ChannelVadBoundary,
+        CheckStatus, CleanupAttemptOutcome, CleanupQueueTelemetry, CleanupTaskStatus,
         CollectingRuntimeOutputSink, FinalBufferingTelemetry, HotPathDiagnostics,
         IncrementalVadTracker, LiveAsrExecutor, LiveAsrJob, LiveAsrJobClass, LiveAsrPoolConfig,
         LiveAsrPoolTelemetry, LiveAsrRequest, LiveCaptureCallbackMode, LiveCaptureConfig,
@@ -7253,6 +7269,10 @@ mod tests {
             .and_then(Value::as_object)
             .unwrap();
         assert_eq!(event_counts.get("partial").and_then(Value::as_u64), Some(0));
+        assert_eq!(
+            event_counts.get("stable_partial").and_then(Value::as_u64),
+            Some(0)
+        );
         assert_eq!(event_counts.get("final").and_then(Value::as_u64), Some(1));
         assert_eq!(
             event_counts.get("llm_final").and_then(Value::as_u64),
@@ -7280,6 +7300,12 @@ mod tests {
             .get("transcript_events")
             .and_then(Value::as_object)
             .unwrap();
+        assert_eq!(
+            transcript_events
+                .get("stable_partial")
+                .and_then(Value::as_u64),
+            Some(0)
+        );
         assert_eq!(
             transcript_events.get("final").and_then(Value::as_u64),
             Some(1)
@@ -8166,6 +8192,7 @@ mod tests {
         let _ = fs::remove_dir_all(temp_dir);
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn bundled_backend_program_resolution_prefers_resources_bin() {
         let temp_dir = write_temp_dir("recordit-bundled-backend-program");

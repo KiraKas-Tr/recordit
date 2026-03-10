@@ -1,8 +1,6 @@
-use std::{
-    env,
-    path::Path,
-    process::{Command, ExitCode},
-};
+#[cfg(target_os = "macos")]
+use std::process::Command;
+use std::{env, path::Path, process::ExitCode};
 
 #[path = "transcribe_live/app.rs"]
 mod app;

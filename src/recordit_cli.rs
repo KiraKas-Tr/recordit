@@ -3,7 +3,7 @@ use std::env;
 use std::fmt::{self, Display};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode};
+use std::process::ExitCode;
 
 #[cfg(not(test))]
 #[path = "bin/transcribe_live/app.rs"]
@@ -56,6 +56,10 @@ Run:
   --profile <profile>     Maps to transcribe-live --asr-profile
   --language <tag>        Maps to transcribe-live --asr-language
   --model <path-or-id>    Maps to transcribe-live --asr-model
+  --chunk-window-ms <ms>  Maps to transcribe-live --chunk-window-ms
+  --chunk-stride-ms <ms>  Maps to transcribe-live --chunk-stride-ms
+  --vad-min-speech-ms <ms>   Maps to transcribe-live --vad-min-speech-ms
+  --vad-min-silence-ms <ms>  Maps to transcribe-live --vad-min-silence-ms
   --json                  Append a machine-readable summary envelope after command execution
 
 Doctor:
@@ -164,6 +168,10 @@ struct RunCommand {
     profile: Option<String>,
     language: Option<String>,
     model: Option<String>,
+    chunk_window_ms: Option<u64>,
+    chunk_stride_ms: Option<u64>,
+    vad_min_speech_ms: Option<u32>,
+    vad_min_silence_ms: Option<u32>,
     json_output: bool,
 }
 
@@ -249,6 +257,10 @@ fn parse_run_command(mut args: impl Iterator<Item = String>) -> Result<RecorditC
     let mut profile = None;
     let mut language = None;
     let mut model = None;
+    let mut chunk_window_ms = None;
+    let mut chunk_stride_ms = None;
+    let mut vad_min_speech_ms = None;
+    let mut vad_min_silence_ms = None;
     let mut json_output = false;
 
     while let Some(arg) = args.next() {
@@ -281,6 +293,30 @@ fn parse_run_command(mut args: impl Iterator<Item = String>) -> Result<RecorditC
             }
             "--model" => {
                 model = Some(read_value(&mut args, "--model")?);
+            }
+            "--chunk-window-ms" => {
+                chunk_window_ms = Some(parse_u64(
+                    &read_value(&mut args, "--chunk-window-ms")?,
+                    "--chunk-window-ms",
+                )?);
+            }
+            "--chunk-stride-ms" => {
+                chunk_stride_ms = Some(parse_u64(
+                    &read_value(&mut args, "--chunk-stride-ms")?,
+                    "--chunk-stride-ms",
+                )?);
+            }
+            "--vad-min-speech-ms" => {
+                vad_min_speech_ms = Some(parse_u32(
+                    &read_value(&mut args, "--vad-min-speech-ms")?,
+                    "--vad-min-speech-ms",
+                )?);
+            }
+            "--vad-min-silence-ms" => {
+                vad_min_silence_ms = Some(parse_u32(
+                    &read_value(&mut args, "--vad-min-silence-ms")?,
+                    "--vad-min-silence-ms",
+                )?);
             }
             "--json" => {
                 json_output = true;
@@ -322,6 +358,10 @@ fn parse_run_command(mut args: impl Iterator<Item = String>) -> Result<RecorditC
         profile,
         language,
         model,
+        chunk_window_ms,
+        chunk_stride_ms,
+        vad_min_speech_ms,
+        vad_min_silence_ms,
         json_output,
     }))
 }
@@ -531,6 +571,12 @@ fn parse_u64(value: &str, flag: &str) -> Result<u64, CliError> {
         .map_err(|_| CliError::new(format!("`{flag}` expects an integer, got `{value}`")))
 }
 
+fn parse_u32(value: &str, flag: &str) -> Result<u32, CliError> {
+    value
+        .parse::<u32>()
+        .map_err(|_| CliError::new(format!("`{flag}` expects an integer, got `{value}`")))
+}
+
 fn read_value(args: &mut impl Iterator<Item = String>, flag: &str) -> Result<String, CliError> {
     args.next()
         .ok_or_else(|| CliError::new(format!("`{flag}` requires a value")))
@@ -639,6 +685,10 @@ fn map_run_command(command: &RunCommand) -> Result<MappedInvocation, CliError> {
         command.profile.as_deref(),
         command.language.as_deref(),
         command.model.as_deref(),
+        command.chunk_window_ms,
+        command.chunk_stride_ms,
+        command.vad_min_speech_ms,
+        command.vad_min_silence_ms,
     );
 
     Ok(MappedInvocation {
@@ -719,6 +769,10 @@ fn append_shared_runtime_args(
     profile: Option<&str>,
     language: Option<&str>,
     model: Option<&str>,
+    chunk_window_ms: Option<u64>,
+    chunk_stride_ms: Option<u64>,
+    vad_min_speech_ms: Option<u32>,
+    vad_min_silence_ms: Option<u32>,
 ) {
     if let Some(profile) = profile {
         legacy_args.push("--asr-profile".to_string());
@@ -731,6 +785,22 @@ fn append_shared_runtime_args(
     if let Some(model) = model {
         legacy_args.push("--asr-model".to_string());
         legacy_args.push(model.to_string());
+    }
+    if let Some(chunk_window_ms) = chunk_window_ms {
+        legacy_args.push("--chunk-window-ms".to_string());
+        legacy_args.push(chunk_window_ms.to_string());
+    }
+    if let Some(chunk_stride_ms) = chunk_stride_ms {
+        legacy_args.push("--chunk-stride-ms".to_string());
+        legacy_args.push(chunk_stride_ms.to_string());
+    }
+    if let Some(vad_min_speech_ms) = vad_min_speech_ms {
+        legacy_args.push("--vad-min-speech-ms".to_string());
+        legacy_args.push(vad_min_speech_ms.to_string());
+    }
+    if let Some(vad_min_silence_ms) = vad_min_silence_ms {
+        legacy_args.push("--vad-min-silence-ms".to_string());
+        legacy_args.push(vad_min_silence_ms.to_string());
     }
 }
 
@@ -924,19 +994,51 @@ fn default_session_root(mode: RunMode) -> Result<PathBuf, CliError> {
 }
 
 fn timestamp_utc(format: &str) -> Result<String, CliError> {
-    let output = Command::new("date")
-        .args(["-u", format])
-        .output()
-        .map_err(|err| CliError::new(format!("failed to invoke `date`: {err}")))?;
-    if !output.status.success() {
-        return Err(CliError::new(format!(
-            "`date` exited with status {} while building session paths",
-            output.status
-        )));
-    }
-    String::from_utf8(output.stdout)
-        .map(|value| value.trim().to_string())
-        .map_err(|err| CliError::new(format!("`date` returned non-utf8 output: {err}")))
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|err| CliError::new(format!("system clock error: {err}")))?
+        .as_secs();
+
+    // Manual UTC decomposition (no external crate needed).
+    let mut remaining = secs;
+    let secs_of_day = remaining % 86400;
+    remaining /= 86400;
+
+    let hour = secs_of_day / 3600;
+    let minute = (secs_of_day % 3600) / 60;
+    let second = secs_of_day % 60;
+
+    // Compute year/month/day from days-since-epoch (civil calendar).
+    // Algorithm: http://howardhinnant.github.io/date_algorithms.html
+    let z = remaining as i64 + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if month <= 2 { y + 1 } else { y };
+
+    // Build output matching the two formats used by callers:
+    //   "+%Y%m%dT%H%M%SZ"   -> "20260309T112345Z"
+    //   "+%Y-%m-%dT%H:%M:%SZ" -> "2026-03-09T11:23:45Z"
+    let result = if format.contains('-') {
+        format!(
+            "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+            year, month, day, hour, minute, second
+        )
+    } else {
+        format!(
+            "{:04}{:02}{:02}T{:02}{:02}{:02}Z",
+            year, month, day, hour, minute, second
+        )
+    };
+
+    Ok(result)
 }
 
 fn json_escape(value: &str) -> String {

@@ -17,6 +17,7 @@ pub(crate) mod runtime_jsonl {
     pub(crate) const EVENT_TYPE_CHUNK_QUEUE: &str = "chunk_queue";
     pub(crate) const EVENT_TYPE_CLEANUP_QUEUE: &str = "cleanup_queue";
     pub(crate) const EVENT_TYPE_PARTIAL: &str = "partial";
+    pub(crate) const EVENT_TYPE_STABLE_PARTIAL: &str = "stable_partial";
     pub(crate) const EVENT_TYPE_FINAL: &str = "final";
     pub(crate) const EVENT_TYPE_LLM_FINAL: &str = "llm_final";
     pub(crate) const EVENT_TYPE_RECONCILED_FINAL: &str = "reconciled_final";
@@ -31,6 +32,7 @@ pub(crate) mod runtime_jsonl {
         EVENT_TYPE_CHUNK_QUEUE,
         EVENT_TYPE_CLEANUP_QUEUE,
         EVENT_TYPE_PARTIAL,
+        EVENT_TYPE_STABLE_PARTIAL,
         EVENT_TYPE_FINAL,
         EVENT_TYPE_LLM_FINAL,
         EVENT_TYPE_RECONCILED_FINAL,
@@ -38,6 +40,7 @@ pub(crate) mod runtime_jsonl {
 
     pub(crate) const TRANSCRIPT_EVENT_TYPES: &[&str] = &[
         EVENT_TYPE_PARTIAL,
+        EVENT_TYPE_STABLE_PARTIAL,
         EVENT_TYPE_FINAL,
         EVENT_TYPE_LLM_FINAL,
         EVENT_TYPE_RECONCILED_FINAL,
@@ -288,6 +291,8 @@ pub(crate) mod runtime_jsonl {
         CleanupQueue(CleanupQueueEventModel),
         #[serde(rename = "partial")]
         Partial(TranscriptArtifactEventModel),
+        #[serde(rename = "stable_partial")]
+        StablePartial(TranscriptArtifactEventModel),
         #[serde(rename = "final")]
         Final(TranscriptArtifactEventModel),
         #[serde(rename = "llm_final")]
@@ -308,6 +313,7 @@ pub(crate) mod runtime_jsonl {
                 Self::ChunkQueue(_) => EVENT_TYPE_CHUNK_QUEUE,
                 Self::CleanupQueue(_) => EVENT_TYPE_CLEANUP_QUEUE,
                 Self::Partial(_) => EVENT_TYPE_PARTIAL,
+                Self::StablePartial(_) => EVENT_TYPE_STABLE_PARTIAL,
                 Self::Final(_) => EVENT_TYPE_FINAL,
                 Self::LlmFinal(_) => EVENT_TYPE_LLM_FINAL,
                 Self::ReconciledFinal(_) => EVENT_TYPE_RECONCILED_FINAL,
@@ -449,6 +455,10 @@ pub(crate) mod runtime_jsonl {
                 (
                     EVENT_TYPE_PARTIAL,
                     r#"{"event_type":"partial","channel":"mic","segment_id":"mic-chunk-0000","source_final_segment_id":null,"start_ms":0,"end_ms":500,"text":"hello","asr_backend":"whispercpp","vad_boundary_count":1}"#,
+                ),
+                (
+                    EVENT_TYPE_STABLE_PARTIAL,
+                    r#"{"event_type":"stable_partial","channel":"mic","segment_id":"mic-chunk-0000","source_final_segment_id":null,"start_ms":0,"end_ms":700,"text":"hello there","asr_backend":"whispercpp","vad_boundary_count":1}"#,
                 ),
                 (
                     EVENT_TYPE_FINAL,

@@ -61,6 +61,10 @@ pub(super) fn jsonl_transcript_event_line(
             serde_json::to_string(&runtime_jsonl::RuntimeJsonlEvent::Partial(payload))
                 .expect("runtime jsonl transcript serialization")
         }
+        runtime_jsonl::EVENT_TYPE_STABLE_PARTIAL => {
+            serde_json::to_string(&runtime_jsonl::RuntimeJsonlEvent::StablePartial(payload))
+                .expect("runtime jsonl transcript serialization")
+        }
         runtime_jsonl::EVENT_TYPE_FINAL => {
             serde_json::to_string(&runtime_jsonl::RuntimeJsonlEvent::Final(payload))
                 .expect("runtime jsonl transcript serialization")
@@ -342,6 +346,8 @@ fn build_runtime_manifest_model(
         .unwrap_or(false);
     let out_wav_bytes = out_wav_metadata.map(|metadata| metadata.len()).unwrap_or(0);
     let partial_count = transcript_event_count(&report.events, runtime_jsonl::EVENT_TYPE_PARTIAL);
+    let stable_partial_count =
+        transcript_event_count(&report.events, runtime_jsonl::EVENT_TYPE_STABLE_PARTIAL);
     let final_count = transcript_event_count(&report.events, runtime_jsonl::EVENT_TYPE_FINAL);
     let llm_final_count =
         transcript_event_count(&report.events, runtime_jsonl::EVENT_TYPE_LLM_FINAL);
@@ -576,6 +582,7 @@ fn build_runtime_manifest_model(
             vad_boundary: report.vad_boundaries.len(),
             transcript: report.events.len(),
             partial: partial_count,
+            stable_partial: stable_partial_count,
             final_count,
             llm_final: llm_final_count,
             reconciled_final: reconciled_final_count,
@@ -587,6 +594,7 @@ fn build_runtime_manifest_model(
             channel_mode_active: report.active_channel_mode.to_string(),
             transcript_events: manifest_models::RuntimeSessionTranscriptEvents {
                 partial: partial_count,
+                stable_partial: stable_partial_count,
                 final_count,
                 llm_final: llm_final_count,
                 reconciled_final: reconciled_final_count,

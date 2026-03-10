@@ -131,18 +131,63 @@ pub(super) fn bundled_backend_program_from_exe(
     current_exe: &Path,
 ) -> Option<String> {
     let helper_name = backend_helper_program_label(backend);
-    let macos_dir = current_exe.parent()?;
-    let contents_dir = macos_dir.parent()?;
-    let candidates = [
-        contents_dir.join("Resources").join("bin").join(helper_name),
-        contents_dir.join("Helpers").join(helper_name),
-    ];
 
-    for candidate in candidates {
-        if candidate.is_file() {
-            return Some(candidate.to_string_lossy().to_string());
+    #[cfg(target_os = "macos")]
+    {
+        // macOS .app bundle layout:
+        //   MyApp.app/Contents/MacOS/recordit-transcribe-live   ← current_exe
+        //   MyApp.app/Contents/Resources/bin/whisper-cli        ← Resources candidate
+        //   MyApp.app/Contents/Helpers/whisper-cli              ← Helpers candidate
+        let macos_dir = current_exe.parent()?;
+        let contents_dir = macos_dir.parent()?;
+        let candidates = [
+            contents_dir.join("Resources").join("bin").join(helper_name),
+            contents_dir.join("Helpers").join(helper_name),
+        ];
+        for candidate in candidates {
+            if candidate.is_file() {
+                return Some(candidate.to_string_lossy().to_string());
+            }
         }
     }
+
+    // Windows (and other platforms): look for the helper next to the exe or in
+    // a sibling `bin/` folder.  On Windows also try the `.exe` suffix.
+    //
+    // Canonical Windows CLI release layout:
+    //   <release-dir>/
+    //     bin/
+    //       recordit.exe
+    //       transcribe-live.exe
+    //       whisper-cli.exe          ← ASR helper (whisper-cpp backend)
+    //       whisperkit-cli.exe       ← ASR helper (whisperkit backend, if used)
+    //       moonshine.exe            ← ASR helper (moonshine backend, if used)
+    //
+    // Resolution order (first match wins):
+    //   1. ENV override (RECORDIT_WHISPER_CLI / RECORDIT_WHISPERKIT_CLI / RECORDIT_MOONSHINE)
+    //   2. Sibling of current exe: <exe-dir>/<helper>     (no suffix, then .exe)
+    //   3. Nested bin/:            <exe-dir>/bin/<helper>  (no suffix, then .exe)
+    //   4. Sibling of model:       <model-parent>/<helper>
+    //   5. Fallback to PATH name (bare name, `where` will find it if in PATH)
+    let exe_dir = current_exe.parent()?;
+    #[cfg(not(target_os = "windows"))]
+    let candidates_base: &[&str] = &[helper_name];
+    #[cfg(target_os = "windows")]
+    let helper_exe = format!("{helper_name}.exe");
+    #[cfg(target_os = "windows")]
+    let candidates_base: &[&str] = &[helper_name, helper_exe.as_str()];
+
+    for name in candidates_base {
+        let sibling = exe_dir.join(name);
+        if sibling.is_file() {
+            return Some(sibling.to_string_lossy().to_string());
+        }
+        let bin_nested = exe_dir.join("bin").join(name);
+        if bin_nested.is_file() {
+            return Some(bin_nested.to_string_lossy().to_string());
+        }
+    }
+
     None
 }
 
@@ -226,10 +271,12 @@ impl AsrAdapter for WhisperCppAdapter {
     }
 }
 
+#[cfg(target_os = "macos")]
 struct WhisperKitAdapter {
     program: String,
 }
 
+#[cfg(target_os = "macos")]
 impl AsrAdapter for WhisperKitAdapter {
     fn transcribe(&self, request: &AsrRequest<'_>) -> Result<String, CliError> {
         let audio_path = request.audio_path()?;
@@ -274,7 +321,14 @@ impl AsrAdapter for WhisperKitAdapter {
 fn select_adapter(backend: AsrBackend, program: String) -> Result<Box<dyn AsrAdapter>, CliError> {
     match backend {
         AsrBackend::WhisperCpp => Ok(Box::new(WhisperCppAdapter { program })),
-        AsrBackend::WhisperKit => Ok(Box::new(WhisperKitAdapter { program })),
+        AsrBackend::WhisperKit => {
+            #[cfg(target_os = "macos")]
+            return Ok(Box::new(WhisperKitAdapter { program }));
+            #[cfg(not(target_os = "macos"))]
+            return Err(CliError::new(
+                "whisperkit is only supported on macOS; use `--asr-backend whispercpp` on Windows",
+            ));
+        }
         AsrBackend::Moonshine => Err(CliError::new(
             "moonshine adapter is not wired in this phase; use `--asr-backend whispercpp` or `--asr-backend whisperkit`",
         )),
@@ -847,6 +901,7 @@ mod tests {
         let _ = reset_pcm_scratch_context_for_test();
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn bundled_backend_program_uses_helpers_dir_when_resources_bin_missing() {
         let temp_dir = env::temp_dir().join(format!(
@@ -864,21 +919,18 @@ mod tests {
         fs::create_dir_all(exe_path.parent().unwrap()).unwrap();
         fs::File::create(&exe_path).unwrap();
 
-        let helpers_dir = temp_dir
-            .join("App.app")
-            .join("Contents")
-            .join("Helpers");
+        let helpers_dir = temp_dir.join("App.app").join("Contents").join("Helpers");
         fs::create_dir_all(&helpers_dir).unwrap();
         let helper_path = helpers_dir.join("whisper-cli");
         fs::File::create(&helper_path).unwrap();
 
-        let resolved =
-            bundled_backend_program_from_exe(AsrBackend::WhisperCpp, &exe_path).unwrap();
+        let resolved = bundled_backend_program_from_exe(AsrBackend::WhisperCpp, &exe_path).unwrap();
         assert_eq!(resolved, helper_path.to_string_lossy().to_string());
 
         let _ = fs::remove_dir_all(temp_dir);
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn bundled_backend_program_returns_none_when_no_helper_present() {
         let temp_dir = env::temp_dir().join(format!(
@@ -897,11 +949,15 @@ mod tests {
         fs::File::create(&exe_path).unwrap();
 
         let result = bundled_backend_program_from_exe(AsrBackend::WhisperCpp, &exe_path);
-        assert!(result.is_none(), "expected None when no helper binary exists");
+        assert!(
+            result.is_none(),
+            "expected None when no helper binary exists"
+        );
 
         let _ = fs::remove_dir_all(temp_dir);
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn bundled_backend_program_resolves_whisperkit_helper() {
         let temp_dir = env::temp_dir().join(format!(
@@ -928,9 +984,152 @@ mod tests {
         let helper_path = resources_bin.join("whisperkit-cli");
         fs::File::create(&helper_path).unwrap();
 
-        let resolved =
-            bundled_backend_program_from_exe(AsrBackend::WhisperKit, &exe_path).unwrap();
+        let resolved = bundled_backend_program_from_exe(AsrBackend::WhisperKit, &exe_path).unwrap();
         assert_eq!(resolved, helper_path.to_string_lossy().to_string());
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    /// On Windows (and non-macOS platforms) the helper is looked up next to the
+    /// exe or inside a sibling `bin/` directory.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn bundled_backend_program_resolves_sibling_helper_on_non_macos() {
+        let temp_dir = env::temp_dir().join(format!(
+            "recordit-sibling-helper-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let exe_dir = temp_dir.join("bin_dir");
+        let exe_path = exe_dir.join("recordit-transcribe-live");
+        fs::create_dir_all(&exe_dir).unwrap();
+        fs::File::create(&exe_path).unwrap();
+
+        // Place whisper-cli next to the exe.
+        let helper_path = exe_dir.join("whisper-cli");
+        fs::File::create(&helper_path).unwrap();
+
+        let resolved = bundled_backend_program_from_exe(AsrBackend::WhisperCpp, &exe_path).unwrap();
+        assert_eq!(resolved, helper_path.to_string_lossy().to_string());
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    /// On Windows the helper lookup should find `whisper-cli.exe` (with .exe suffix)
+    /// placed next to the executable.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn bundled_backend_program_resolves_exe_suffix_sibling_on_windows() {
+        let temp_dir = env::temp_dir().join(format!(
+            "recordit-win-exe-sibling-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let exe_dir = temp_dir.join("bin_dir");
+        let exe_path = exe_dir.join("recordit.exe");
+        fs::create_dir_all(&exe_dir).unwrap();
+        fs::File::create(&exe_path).unwrap();
+
+        // Place whisper-cli.exe (Windows executable) next to the main exe.
+        let helper_path = exe_dir.join("whisper-cli.exe");
+        fs::File::create(&helper_path).unwrap();
+
+        let resolved = bundled_backend_program_from_exe(AsrBackend::WhisperCpp, &exe_path)
+            .expect("whisper-cli.exe sibling should be resolved on Windows");
+        assert_eq!(resolved, helper_path.to_string_lossy().to_string());
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    /// On Windows the helper lookup should also find `whisper-cli.exe` inside a
+    /// sibling `bin/` subdirectory.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn bundled_backend_program_resolves_exe_suffix_in_bin_subdir_on_windows() {
+        let temp_dir = env::temp_dir().join(format!(
+            "recordit-win-exe-bin-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let exe_dir = temp_dir.join("release");
+        let exe_path = exe_dir.join("recordit.exe");
+        fs::create_dir_all(&exe_dir).unwrap();
+        fs::File::create(&exe_path).unwrap();
+
+        // Place whisper-cli.exe inside a bin/ subfolder.
+        let bin_dir = exe_dir.join("bin");
+        fs::create_dir_all(&bin_dir).unwrap();
+        let helper_path = bin_dir.join("whisper-cli.exe");
+        fs::File::create(&helper_path).unwrap();
+
+        let resolved = bundled_backend_program_from_exe(AsrBackend::WhisperCpp, &exe_path)
+            .expect("whisper-cli.exe in bin/ should be resolved on Windows");
+        assert_eq!(resolved, helper_path.to_string_lossy().to_string());
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    /// On Windows, helper lookup should prefer the no-suffix name if present,
+    /// before falling back to the .exe-suffix name.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn bundled_backend_program_prefers_no_suffix_over_exe_suffix_on_windows() {
+        let temp_dir = env::temp_dir().join(format!(
+            "recordit-win-prefer-no-suffix-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let exe_dir = temp_dir.join("bin_dir");
+        let exe_path = exe_dir.join("recordit.exe");
+        fs::create_dir_all(&exe_dir).unwrap();
+        fs::File::create(&exe_path).unwrap();
+
+        // Place both whisper-cli AND whisper-cli.exe — no-suffix should win.
+        let plain_helper = exe_dir.join("whisper-cli");
+        let exe_helper = exe_dir.join("whisper-cli.exe");
+        fs::File::create(&plain_helper).unwrap();
+        fs::File::create(&exe_helper).unwrap();
+
+        let resolved = bundled_backend_program_from_exe(AsrBackend::WhisperCpp, &exe_path)
+            .expect("resolution should find a helper");
+        assert_eq!(
+            resolved,
+            plain_helper.to_string_lossy().to_string(),
+            "no-suffix binary should be preferred over .exe suffix"
+        );
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    /// Returns None when neither whisper-cli nor whisper-cli.exe exist next to exe.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn bundled_backend_program_returns_none_when_no_exe_helper_on_windows() {
+        let temp_dir = env::temp_dir().join(format!(
+            "recordit-win-no-helper-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let exe_dir = temp_dir.join("bin_dir");
+        let exe_path = exe_dir.join("recordit.exe");
+        fs::create_dir_all(&exe_dir).unwrap();
+        fs::File::create(&exe_path).unwrap();
+
+        let result = bundled_backend_program_from_exe(AsrBackend::WhisperCpp, &exe_path);
+        assert!(
+            result.is_none(),
+            "expected None when no helper binary exists on Windows"
+        );
 
         let _ = fs::remove_dir_all(temp_dir);
     }
@@ -956,5 +1155,86 @@ mod tests {
             "expected path to end with relative suffix, got: {}",
             result.display()
         );
+    }
+
+    // ── Canonical Windows CLI layout verification ──────────────────────────
+    // These tests validate the canonical Windows release layout:
+    //   <release-dir>/bin/recordit.exe
+    //   <release-dir>/bin/transcribe-live.exe
+    //   <release-dir>/bin/whisper-cli.exe      ← helper resolved from here
+    //
+    // The tests are cfg(not(target_os = "macos")) so they run on Windows CI
+    // and also on Linux (cross-platform sibling logic is shared).
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn canonical_windows_layout_bin_subdir_resolves_all_backends() {
+        // Simulate: <release>/bin/recordit.exe + <release>/bin/whisper-cli.exe
+        let temp_dir = env::temp_dir().join(format!(
+            "recordit-canonical-layout-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let bin_dir = temp_dir.join("bin");
+        fs::create_dir_all(&bin_dir).unwrap();
+
+        // Main exe lives in bin/.
+        let exe_path = bin_dir.join("recordit");
+        fs::File::create(&exe_path).unwrap();
+
+        // Place helpers in the same bin/ dir (canonical layout: sibling of exe).
+        for helper_name in &["whisper-cli", "moonshine"] {
+            let helper = bin_dir.join(helper_name);
+            fs::File::create(&helper).unwrap();
+        }
+
+        // Each backend should resolve from the canonical sibling position.
+        let whisper = bundled_backend_program_from_exe(AsrBackend::WhisperCpp, &exe_path)
+            .expect("whisper-cli should resolve from bin/ sibling");
+        assert!(
+            whisper.contains("whisper-cli"),
+            "resolved path should contain whisper-cli, got: {whisper}"
+        );
+
+        let moonshine = bundled_backend_program_from_exe(AsrBackend::Moonshine, &exe_path)
+            .expect("moonshine should resolve from bin/ sibling");
+        assert!(
+            moonshine.contains("moonshine"),
+            "resolved path should contain moonshine, got: {moonshine}"
+        );
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn canonical_windows_layout_nested_bin_resolves_helper() {
+        // Simulate: <release>/recordit.exe and helpers inside <release>/bin/whisper-cli
+        let temp_dir = env::temp_dir().join(format!(
+            "recordit-canonical-nested-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&temp_dir).unwrap();
+        let exe_path = temp_dir.join("recordit");
+        fs::File::create(&exe_path).unwrap();
+
+        let nested_bin = temp_dir.join("bin");
+        fs::create_dir_all(&nested_bin).unwrap();
+        let helper = nested_bin.join("whisper-cli");
+        fs::File::create(&helper).unwrap();
+
+        let resolved = bundled_backend_program_from_exe(AsrBackend::WhisperCpp, &exe_path)
+            .expect("whisper-cli should resolve from nested bin/");
+        assert!(
+            resolved.contains("whisper-cli"),
+            "resolved path should contain whisper-cli, got: {resolved}"
+        );
+
+        let _ = fs::remove_dir_all(temp_dir);
     }
 }

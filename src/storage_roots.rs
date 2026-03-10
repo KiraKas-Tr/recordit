@@ -4,6 +4,29 @@ use std::fmt::{self, Display};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+/// Returns the current user's home directory, cross-platform.
+/// On Unix reads `$HOME`; on Windows tries `$USERPROFILE` then `{HOMEDRIVE}{HOMEPATH}`.
+fn home_dir() -> Option<PathBuf> {
+    if let Ok(h) = env::var("HOME") {
+        if !h.is_empty() {
+            return Some(PathBuf::from(h));
+        }
+    }
+    // Windows fallback
+    if let Ok(p) = env::var("USERPROFILE") {
+        if !p.is_empty() {
+            return Some(PathBuf::from(p));
+        }
+    }
+    if let (Ok(drive), Ok(path)) = (env::var("HOMEDRIVE"), env::var("HOMEPATH")) {
+        let combined = format!("{drive}{path}");
+        if !combined.is_empty() {
+            return Some(PathBuf::from(combined));
+        }
+    }
+    None
+}
+
 pub const STORAGE_DATA_ROOT_ENV: &str = "RECORDIT_CONTAINER_DATA_ROOT";
 pub const APP_MANAGED_STORAGE_POLICY_ENV: &str = "RECORDIT_ENFORCE_APP_MANAGED_STORAGE_POLICY";
 pub const TRANSCRIBE_APP_CONTAINER_ID: &str = "com.recordit.sequoiatranscribe";
@@ -123,9 +146,8 @@ pub fn resolve_canonical_storage_roots() -> Result<CanonicalStorageRoots, Storag
             PathBuf::from(trimmed)
         }
         Err(_) => {
-            let home = env::var("HOME").map_err(|_| StorageRootError::MissingHomeEnv)?;
-            PathBuf::from(home)
-                .join("Library")
+            let home = home_dir().ok_or(StorageRootError::MissingHomeEnv)?;
+            home.join("Library")
                 .join("Containers")
                 .join(TRANSCRIBE_APP_CONTAINER_ID)
                 .join("Data")
@@ -217,8 +239,14 @@ mod tests {
     fn resolves_default_container_roots_from_home() {
         let _guard = env_lock().lock().unwrap();
         let original_override = env::var(STORAGE_DATA_ROOT_ENV).ok();
+        let original_home = env::var("HOME").ok();
+        let original_userprofile = env::var("USERPROFILE").ok();
         unsafe {
             env::remove_var(STORAGE_DATA_ROOT_ENV);
+            // Ensure a home dir is available on all platforms (Windows may lack $HOME).
+            if env::var("HOME").is_err() && env::var("USERPROFILE").is_err() {
+                env::set_var("HOME", env::temp_dir().to_string_lossy().as_ref());
+            }
         }
 
         let roots = resolve_canonical_storage_roots().expect("expected default root resolution");
@@ -229,6 +257,8 @@ mod tests {
         assert_eq!(roots.logs_root, packaged_root.join("logs"));
 
         restore_optional_env(STORAGE_DATA_ROOT_ENV, original_override);
+        restore_optional_env("HOME", original_home);
+        restore_optional_env("USERPROFILE", original_userprofile);
     }
 
     #[test]

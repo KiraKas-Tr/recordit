@@ -17,10 +17,11 @@ pub(super) fn merge_transcript_events(mut events: Vec<TranscriptEvent>) -> Vec<T
 pub(super) fn event_type_rank(event_type: &str) -> u8 {
     match event_type {
         "partial" => 0,
-        "final" => 1,
-        "reconciled_final" => 2,
-        "llm_final" => 3,
-        _ => 4,
+        "stable_partial" => 1,
+        "final" => 2,
+        "reconciled_final" => 3,
+        "llm_final" => 4,
+        _ => 5,
     }
 }
 
@@ -168,6 +169,7 @@ pub(super) fn terminal_render_mode() -> TerminalRenderMode {
 
 pub(super) fn stable_event_suffix(event_type: &str) -> &'static str {
     match event_type {
+        "stable_partial" => " [stable_partial]",
         "llm_final" => " [llm_final]",
         "reconciled_final" => " [reconciled_final]",
         _ => "",
@@ -204,7 +206,10 @@ pub(super) fn format_partial_transcript_line(event: &TranscriptEvent) -> Option<
 }
 
 pub(super) fn is_stable_terminal_event(event_type: &str) -> bool {
-    matches!(event_type, "final" | "llm_final" | "reconciled_final")
+    matches!(
+        event_type,
+        "stable_partial" | "final" | "llm_final" | "reconciled_final"
+    )
 }
 
 pub(super) fn build_terminal_render_actions(
@@ -240,7 +245,7 @@ pub(super) fn build_terminal_render_actions(
                             line,
                         });
                     }
-                    "final" | "llm_final" | "reconciled_final" => {
+                    "stable_partial" | "final" | "llm_final" | "reconciled_final" => {
                         last_partial_by_segment
                             .remove(&(event.channel.clone(), event.segment_id.clone()));
                         let Some(line) = format_stable_transcript_line(event) else {

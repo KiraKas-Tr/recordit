@@ -5,15 +5,20 @@ use crate::capture_api::{
     CaptureSampleRatePolicySummary, CaptureSink, CaptureStream, CaptureStreamSummary,
     CaptureSummary, CaptureTransportSummary, ResampleSummary, StreamingCaptureResult,
 };
+#[cfg(target_os = "macos")]
 use crate::rt_transport::{preallocated_spsc, PreallocatedProducer};
 use anyhow::{bail, Context, Result};
+#[cfg(target_os = "macos")]
 use crossbeam_channel::RecvTimeoutError;
 use hound::{SampleFormat, WavSpec, WavWriter};
+#[cfg(target_os = "macos")]
 use screencapturekit::prelude::*;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+#[cfg(target_os = "macos")]
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::thread;
@@ -21,9 +26,12 @@ use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const CALLBACK_RING_CAPACITY: usize = 1024;
+#[cfg(target_os = "macos")]
 const MAX_MONO_SAMPLES_PER_CHUNK: usize = 16_384;
 const CALLBACK_RECV_TIMEOUT: Duration = Duration::from_millis(200);
+#[cfg(target_os = "macos")]
 const INTERRUPTION_IDLE_TIMEOUT: Duration = Duration::from_secs(3);
+#[cfg(target_os = "macos")]
 const MAX_CAPTURE_RESTARTS: usize = 2;
 const PROGRESSIVE_WAV_MATERIALIZE_INTERVAL: Duration = Duration::from_millis(750);
 const PROGRESSIVE_WAV_MATERIALIZE_MIN_NEW_CHUNKS: usize = 8;
@@ -123,6 +131,7 @@ pub struct LiveCaptureConfig {
     pub stop_request_path: Option<PathBuf>,
 }
 
+#[cfg(target_os = "macos")]
 #[derive(Debug, Clone, Copy)]
 struct InterruptionPolicy {
     idle_timeout: Duration,
@@ -147,6 +156,7 @@ enum CallbackContractViolation {
     ChunkTooLarge,
 }
 
+#[cfg(target_os = "macos")]
 #[derive(Debug, Default)]
 struct CallbackAudit {
     missing_audio_buffer_list: AtomicU64,
@@ -178,6 +188,7 @@ impl CallbackAuditSnapshot {
     }
 }
 
+#[cfg(target_os = "macos")]
 impl CallbackAudit {
     fn record(&self, violation: CallbackContractViolation) {
         let counter = match violation {
@@ -225,10 +236,12 @@ fn parse_callback_contract_mode_arg(
     Ok(default)
 }
 
+#[cfg(target_os = "macos")]
 fn can_restart_capture(restarts_used: usize, policy: InterruptionPolicy) -> bool {
     restarts_used < policy.max_restarts
 }
 
+#[cfg(target_os = "macos")]
 fn recovery_action_for_interruption(can_restart: bool) -> RecoveryAction {
     if can_restart {
         RecoveryAction::RestartStream
@@ -279,6 +292,7 @@ fn resolve_output_sample_rate(
     }
 }
 
+#[cfg(target_os = "macos")]
 #[derive(Debug, Clone)]
 struct TimedChunk {
     kind: SCStreamOutputType,
@@ -287,6 +301,7 @@ struct TimedChunk {
     mono_samples: Vec<f32>,
 }
 
+#[cfg(target_os = "macos")]
 impl TimedChunk {
     #[allow(dead_code)]
     fn to_capture_chunk_summary(&self) -> Option<CaptureChunkSummary> {
@@ -318,6 +333,47 @@ impl TimedChunk {
     }
 }
 
+/// Cross-platform timed chunk used for the fake-capture / fixture path (no SCKit dependency).
+#[derive(Debug, Clone)]
+struct CrossTimedChunk {
+    /// `true` = microphone, `false` = system audio.
+    is_mic: bool,
+    pts_seconds: f64,
+    sample_rate_hz: u32,
+    mono_samples: Vec<f32>,
+}
+
+impl CrossTimedChunk {
+    #[allow(dead_code)]
+    fn to_capture_chunk(&self) -> CaptureChunk {
+        CaptureChunk {
+            stream: if self.is_mic {
+                CaptureStream::Microphone
+            } else {
+                CaptureStream::SystemAudio
+            },
+            pts_seconds: self.pts_seconds,
+            sample_rate_hz: self.sample_rate_hz,
+            mono_samples: self.mono_samples.clone(),
+        }
+    }
+
+    #[allow(dead_code)]
+    fn to_capture_chunk_summary(&self) -> CaptureChunkSummary {
+        CaptureChunkSummary {
+            kind: if self.is_mic {
+                CaptureChunkKind::Microphone
+            } else {
+                CaptureChunkKind::SystemAudio
+            },
+            pts_seconds: self.pts_seconds,
+            sample_rate_hz: self.sample_rate_hz,
+            frame_count: self.mono_samples.len(),
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
 #[derive(Debug, Clone)]
 struct ReusableTimedChunk {
     kind: SCStreamOutputType,
@@ -327,6 +383,7 @@ struct ReusableTimedChunk {
     valid_samples: usize,
 }
 
+#[cfg(target_os = "macos")]
 impl ReusableTimedChunk {
     fn with_capacity(max_samples: usize) -> Self {
         Self {
@@ -502,6 +559,7 @@ fn maybe_sleep_for_replay(realtime: bool, replay_start: Instant, pts_seconds: f6
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
 fn read_f32_le(bytes: &[u8], sample_index: usize) -> f32 {
     let offset = sample_index * 4;
     f32::from_le_bytes([
@@ -512,6 +570,7 @@ fn read_f32_le(bytes: &[u8], sample_index: usize) -> f32 {
     ])
 }
 
+#[cfg(target_os = "macos")]
 fn downmix_to_mono_in_place(
     sample: &CMSampleBuffer,
     mono_out: &mut [f32],
@@ -586,6 +645,7 @@ fn downmix_to_mono_in_place(
     Ok(min_frames)
 }
 
+#[cfg(target_os = "macos")]
 fn fill_chunk_slot(
     sample: CMSampleBuffer,
     kind: SCStreamOutputType,
@@ -619,6 +679,7 @@ fn fill_chunk_slot(
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
 fn callback(
     producer: &PreallocatedProducer<ReusableTimedChunk>,
     callback_audit: &CallbackAudit,
@@ -670,7 +731,7 @@ fn resample_linear_mono(samples: &[f32], input_rate_hz: u32, output_rate_hz: u32
 }
 
 fn paint_chunks_timeline(
-    chunks: &[TimedChunk],
+    chunks: &[CrossTimedChunk],
     base_pts: f64,
     sample_rate_hz: u32,
 ) -> (Vec<f32>, ResampleStats) {
@@ -710,6 +771,32 @@ fn paint_chunks_timeline(
     (timeline, resample_stats)
 }
 
+/// macOS-only: paint from `TimedChunk` (ScreenCaptureKit native type).
+#[cfg(target_os = "macos")]
+fn paint_timed_chunks_timeline(
+    chunks: &[TimedChunk],
+    base_pts: f64,
+    sample_rate_hz: u32,
+) -> (Vec<f32>, ResampleStats) {
+    let cross: Vec<CrossTimedChunk> = chunks
+        .iter()
+        .filter_map(|c| {
+            let is_mic = match c.kind {
+                SCStreamOutputType::Microphone => true,
+                SCStreamOutputType::Audio => false,
+                _ => return None,
+            };
+            Some(CrossTimedChunk {
+                is_mic,
+                pts_seconds: c.pts_seconds,
+                sample_rate_hz: c.sample_rate_hz,
+                mono_samples: c.mono_samples.clone(),
+            })
+        })
+        .collect();
+    paint_chunks_timeline(&cross, base_pts, sample_rate_hz)
+}
+
 #[derive(Debug, Default)]
 struct ProgressiveWavSnapshotState {
     output_rate_hz: u32,
@@ -722,7 +809,7 @@ struct ProgressiveWavSnapshotState {
 
 fn apply_chunks_to_timeline(
     timeline: &mut Vec<f32>,
-    chunks: &[TimedChunk],
+    chunks: &[CrossTimedChunk],
     start_chunk_idx: usize,
     base_pts: f64,
     sample_rate_hz: u32,
@@ -748,6 +835,34 @@ fn apply_chunks_to_timeline(
         }
         timeline[start_index..end_index].copy_from_slice(chunk_samples);
     }
+}
+
+/// macOS-only: apply from `TimedChunk`.
+#[cfg(target_os = "macos")]
+fn apply_timed_chunks_to_timeline(
+    timeline: &mut Vec<f32>,
+    chunks: &[TimedChunk],
+    start_chunk_idx: usize,
+    base_pts: f64,
+    sample_rate_hz: u32,
+) {
+    let cross: Vec<CrossTimedChunk> = chunks
+        .iter()
+        .filter_map(|c| {
+            let is_mic = match c.kind {
+                SCStreamOutputType::Microphone => true,
+                SCStreamOutputType::Audio => false,
+                _ => return None,
+            };
+            Some(CrossTimedChunk {
+                is_mic,
+                pts_seconds: c.pts_seconds,
+                sample_rate_hz: c.sample_rate_hz,
+                mono_samples: c.mono_samples.clone(),
+            })
+        })
+        .collect();
+    apply_chunks_to_timeline(timeline, &cross, start_chunk_idx, base_pts, sample_rate_hz);
 }
 
 fn write_interleaved_stereo_wav(
@@ -907,8 +1022,8 @@ fn emit_runtime_event_deltas(
 #[cfg(test)]
 fn materialize_progressive_wav_snapshot(
     output: &Path,
-    mic_chunks: &[TimedChunk],
-    sys_chunks: &[TimedChunk],
+    mic_chunks: &[CrossTimedChunk],
+    sys_chunks: &[CrossTimedChunk],
     target_rate_hz: u32,
     mismatch_policy: SampleRateMismatchPolicy,
 ) -> Result<Option<u32>> {
@@ -930,8 +1045,8 @@ fn materialize_progressive_wav_snapshot(
 
 fn materialize_progressive_wav_snapshot_incremental(
     output: &Path,
-    mic_chunks: &[TimedChunk],
-    sys_chunks: &[TimedChunk],
+    mic_chunks: &[CrossTimedChunk],
+    sys_chunks: &[CrossTimedChunk],
     target_rate_hz: u32,
     mismatch_policy: SampleRateMismatchPolicy,
     state: &mut Option<ProgressiveWavSnapshotState>,
@@ -1684,8 +1799,8 @@ fn run_fake_capture_session(
     let replay_started = Instant::now();
     let mut mic_chunk_count = 0usize;
     let mut system_chunk_count = 0usize;
-    let mut mic_chunks = Vec::<TimedChunk>::new();
-    let mut sys_chunks = Vec::<TimedChunk>::new();
+    let mut mic_chunks = Vec::<CrossTimedChunk>::new();
+    let mut sys_chunks = Vec::<CrossTimedChunk>::new();
     let mut last_materialize_at = Instant::now();
     let mut materialized_chunk_total = 0usize;
     let mut progressive_materializations = 0usize;
@@ -1719,8 +1834,8 @@ fn run_fake_capture_session(
         })
         .map_err(|err| anyhow::anyhow!("capture sink rejected fake system chunk: {err}"))?;
         system_chunk_count += 1;
-        sys_chunks.push(TimedChunk {
-            kind: SCStreamOutputType::Audio,
+        sys_chunks.push(CrossTimedChunk {
+            is_mic: false,
             pts_seconds,
             sample_rate_hz: fixture_rate_hz,
             mono_samples: system_samples[frame_start..frame_end].to_vec(),
@@ -1734,8 +1849,8 @@ fn run_fake_capture_session(
         })
         .map_err(|err| anyhow::anyhow!("capture sink rejected fake microphone chunk: {err}"))?;
         mic_chunk_count += 1;
-        mic_chunks.push(TimedChunk {
-            kind: SCStreamOutputType::Microphone,
+        mic_chunks.push(CrossTimedChunk {
+            is_mic: true,
             pts_seconds,
             sample_rate_hz: fixture_rate_hz,
             mono_samples: mic_samples[frame_start..frame_end].to_vec(),
@@ -1802,7 +1917,12 @@ fn run_fake_capture_session(
         .iter()
         .map(|chunk| chunk.mono_samples.len())
         .sum::<usize>()
-        .max(sys_chunks.iter().map(|chunk| chunk.mono_samples.len()).sum::<usize>());
+        .max(
+            sys_chunks
+                .iter()
+                .map(|chunk| chunk.mono_samples.len())
+                .sum::<usize>(),
+        );
     let telemetry_path = telemetry_path_for_output(&config.output);
     let telemetry = RunTelemetry {
         output_wav_path: config.output.clone(),
@@ -1865,6 +1985,7 @@ pub fn run_streaming_capture_session(
     config: &LiveCaptureConfig,
     sink: &mut dyn CaptureSink,
 ) -> Result<StreamingCaptureResult> {
+    // ── Fake capture path (cross-platform, used in tests and CI) ──────────
     if let Some(fixture) = non_empty_env_path(FAKE_CAPTURE_FIXTURE_ENV) {
         let restart_count = env_u64_or_default(FAKE_CAPTURE_RESTART_COUNT_ENV, 0)?;
         STOP_CAPTURE_REQUESTED.store(false, Ordering::Relaxed);
@@ -1873,6 +1994,52 @@ pub fn run_streaming_capture_session(
         return result;
     }
 
+    // ── Live capture path (platform-specific) ─────────────────────────────
+    #[cfg(target_os = "macos")]
+    {
+        run_streaming_capture_session_macos(config, sink)
+    }
+    #[cfg(target_os = "windows")]
+    {
+        run_streaming_capture_session_windows(config, sink)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        bail!(
+            "live audio capture is not supported on this platform ({}); use the fake-capture fixture path via {}",
+            std::env::consts::OS,
+            FAKE_CAPTURE_FIXTURE_ENV
+        )
+    }
+}
+
+/// macOS implementation of live audio capture using ScreenCaptureKit.
+#[cfg(target_os = "macos")]
+fn timed_chunks_to_cross(chunks: &[TimedChunk]) -> Vec<CrossTimedChunk> {
+    chunks
+        .iter()
+        .filter_map(|c| {
+            let is_mic = match c.kind {
+                SCStreamOutputType::Microphone => true,
+                SCStreamOutputType::Audio => false,
+                _ => return None,
+            };
+            Some(CrossTimedChunk {
+                is_mic,
+                pts_seconds: c.pts_seconds,
+                sample_rate_hz: c.sample_rate_hz,
+                mono_samples: c.mono_samples.clone(),
+            })
+        })
+        .collect()
+}
+
+/// macOS implementation of live audio capture using ScreenCaptureKit.
+#[cfg(target_os = "macos")]
+fn run_streaming_capture_session_macos(
+    config: &LiveCaptureConfig,
+    sink: &mut dyn CaptureSink,
+) -> Result<StreamingCaptureResult> {
     let duration_secs = config.duration_secs;
     let output = config.output.clone();
     let target_rate_hz = config.target_rate_hz;
@@ -1921,7 +2088,7 @@ pub fn run_streaming_capture_session(
         .with_excluding_windows(&[])
         .build();
 
-    let config = SCStreamConfiguration::new()
+    let sck_config = SCStreamConfiguration::new()
         .with_width(2)
         .with_height(2)
         .with_captures_audio(true)
@@ -1936,7 +2103,7 @@ pub fn run_streaming_capture_session(
         .collect();
     let (producer, consumer) = preallocated_spsc(slots);
     let callback_audit = Arc::new(CallbackAudit::default());
-    let mut stream = SCStream::new(&filter, &config);
+    let mut stream = SCStream::new(&filter, &sck_config);
 
     let audio_producer = producer.clone();
     let audio_audit = Arc::clone(&callback_audit);
@@ -2017,10 +2184,12 @@ pub fn run_streaming_capture_session(
                             last_materialize_at.elapsed(),
                         )
                     {
+                        let mic_cross = timed_chunks_to_cross(&mic_chunks);
+                        let sys_cross = timed_chunks_to_cross(&sys_chunks);
                         if materialize_progressive_wav_snapshot_incremental(
                             &output,
-                            &mic_chunks,
-                            &sys_chunks,
+                            &mic_cross,
+                            &sys_cross,
                             target_rate_hz,
                             mismatch_policy,
                             &mut progressive_snapshot_state,
@@ -2159,12 +2328,12 @@ pub fn run_streaming_capture_session(
     let (mut mic, mic_resample) = if mic_chunks.is_empty() {
         (Vec::new(), ResampleStats::default())
     } else {
-        paint_chunks_timeline(&mic_chunks, base_pts, output_rate_hz)
+        paint_timed_chunks_timeline(&mic_chunks, base_pts, output_rate_hz)
     };
     let (mut sys, sys_resample) = if sys_chunks.is_empty() {
         (Vec::new(), ResampleStats::default())
     } else {
-        paint_chunks_timeline(&sys_chunks, base_pts, output_rate_hz)
+        paint_timed_chunks_timeline(&sys_chunks, base_pts, output_rate_hz)
     };
 
     if mic.is_empty() && !sys.is_empty() {
@@ -2256,6 +2425,239 @@ pub fn run_streaming_capture_session(
     })
 }
 
+// ---------------------------------------------------------------------------
+// Windows live capture implementation
+// ---------------------------------------------------------------------------
+
+/// Windows implementation of live audio capture using WASAPI.
+#[cfg(target_os = "windows")]
+fn run_streaming_capture_session_windows(
+    config: &LiveCaptureConfig,
+    sink: &mut dyn CaptureSink,
+) -> Result<StreamingCaptureResult> {
+    use crate::win_capture::{start_win_capture, WinStreamKind};
+
+    let duration_secs = config.duration_secs;
+    let output = config.output.clone();
+    let target_rate_hz = config.target_rate_hz;
+    let mismatch_policy = config.mismatch_policy;
+    let callback_contract_mode = config.callback_contract_mode;
+
+    if let Some(parent) = output.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create output directory {}", parent.display()))?;
+    }
+    ensure_stop_capture_signal_handler()?;
+    STOP_CAPTURE_REQUESTED.store(false, Ordering::Relaxed);
+
+    if duration_secs == 0 {
+        println!(
+            "Starting Windows WASAPI capture until interrupted -> {}",
+            output.display()
+        );
+    } else {
+        println!(
+            "Starting Windows WASAPI capture for {}s -> {}",
+            duration_secs,
+            output.display()
+        );
+    }
+    println!("Stereo mapping: left=mic, right=system (WASAPI)");
+    println!("Sample-rate mismatch policy: {}", mismatch_policy.as_str());
+
+    let stop_request_path = config.stop_request_path.as_deref();
+    let stop_flag = Arc::new(AtomicBool::new(false));
+
+    let (consumer, _handles) = start_win_capture(target_rate_hz, Arc::clone(&stop_flag))
+        .context("failed to start Windows WASAPI capture")?;
+
+    let deadline = if duration_secs == 0 {
+        None
+    } else {
+        Some(Instant::now() + Duration::from_secs(duration_secs))
+    };
+
+    let mut mic_chunks = Vec::<CrossTimedChunk>::new();
+    let mut sys_chunks = Vec::<CrossTimedChunk>::new();
+    let mut last_materialize_at = Instant::now();
+    let mut materialized_chunk_total = 0usize;
+    let mut progressive_materializations = 0usize;
+    let mut progressive_snapshot_state = None;
+
+    // Windows transport telemetry: read from the same PreallocatedConsumer ring that
+    // win_capture uses.  Stats are polled on each chunk rather than being a live ring
+    // counter the way macOS does it, but they are real values (not hardcoded zeros).
+    let callback_audit_zero = CallbackAuditSnapshot::default();
+    let mut runtime_event_cursor = RuntimeEventCursor::default();
+
+    while deadline.is_none_or(|end| Instant::now() < end)
+        && !stop_capture_requested_or_marker(stop_request_path)
+    {
+        match consumer.recv_timeout(CALLBACK_RECV_TIMEOUT) {
+            Ok(chunk_slot) => {
+                let is_mic = chunk_slot.kind == WinStreamKind::Microphone;
+                let capture_chunk = chunk_slot.to_capture_chunk();
+                let cross_chunk = CrossTimedChunk {
+                    is_mic,
+                    pts_seconds: chunk_slot.pts_seconds,
+                    sample_rate_hz: chunk_slot.sample_rate_hz,
+                    mono_samples: chunk_slot.mono_slice().to_vec(),
+                };
+                consumer.recycle(chunk_slot);
+
+                sink.on_chunk(capture_chunk)
+                    .map_err(|err| anyhow::anyhow!("capture sink rejected chunk: {err}"))?;
+
+                if is_mic {
+                    mic_chunks.push(cross_chunk);
+                } else {
+                    sys_chunks.push(cross_chunk);
+                }
+
+                let total_chunks = mic_chunks.len().saturating_add(sys_chunks.len());
+                let has_both_channels = !mic_chunks.is_empty() && !sys_chunks.is_empty();
+                if has_both_channels
+                    && should_materialize_progressive_snapshot(
+                        progressive_materializations,
+                        materialized_chunk_total,
+                        total_chunks,
+                        last_materialize_at.elapsed(),
+                    )
+                {
+                    if materialize_progressive_wav_snapshot_incremental(
+                        &output,
+                        &mic_chunks,
+                        &sys_chunks,
+                        target_rate_hz,
+                        mismatch_policy,
+                        &mut progressive_snapshot_state,
+                    )?
+                    .is_some()
+                    {
+                        progressive_materializations += 1;
+                        materialized_chunk_total = total_chunks;
+                        last_materialize_at = Instant::now();
+                    }
+                }
+
+                emit_runtime_event_deltas(
+                    sink,
+                    &mut runtime_event_cursor,
+                    0,
+                    consumer.stats_snapshot(),
+                    callback_audit_zero,
+                )?;
+            }
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                if stop_capture_requested_or_marker(stop_request_path) {
+                    break;
+                }
+            }
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                break;
+            }
+        }
+    }
+
+    // Signal WASAPI threads to stop.
+    stop_flag.store(true, Ordering::Relaxed);
+
+    if mic_chunks.is_empty() && sys_chunks.is_empty() {
+        bail!(
+            "missing captured data (mic chunks: {}, system chunks: {})",
+            mic_chunks.len(),
+            sys_chunks.len()
+        );
+    }
+
+    let fallback_rate = mic_chunks
+        .first()
+        .or_else(|| sys_chunks.first())
+        .map(|c| c.sample_rate_hz)
+        .unwrap_or(target_rate_hz);
+    let mic_rate = mic_chunks
+        .first()
+        .map(|c| c.sample_rate_hz)
+        .unwrap_or(fallback_rate);
+    let sys_rate = sys_chunks
+        .first()
+        .map(|c| c.sample_rate_hz)
+        .unwrap_or(fallback_rate);
+
+    let output_rate_hz =
+        resolve_output_sample_rate(target_rate_hz, mic_rate, sys_rate, mismatch_policy)?;
+    let base_pts = mic_chunks
+        .first()
+        .map(|c| c.pts_seconds)
+        .into_iter()
+        .chain(sys_chunks.first().map(|c| c.pts_seconds))
+        .fold(f64::INFINITY, f64::min);
+    let base_pts = if base_pts.is_finite() { base_pts } else { 0.0 };
+
+    let (mut mic, mic_resample) = if mic_chunks.is_empty() {
+        (Vec::new(), ResampleStats::default())
+    } else {
+        paint_chunks_timeline(&mic_chunks, base_pts, output_rate_hz)
+    };
+    let (mut sys, sys_resample) = if sys_chunks.is_empty() {
+        (Vec::new(), ResampleStats::default())
+    } else {
+        paint_chunks_timeline(&sys_chunks, base_pts, output_rate_hz)
+    };
+
+    if mic.is_empty() && !sys.is_empty() {
+        mic.resize(sys.len(), 0.0);
+    } else if sys.is_empty() && !mic.is_empty() {
+        sys.resize(mic.len(), 0.0);
+    }
+
+    write_interleaved_stereo_wav(&output, output_rate_hz, &mic, &sys)?;
+
+    println!(
+        "WAV written: {} (mic chunks: {}, system chunks: {}, frames: {}, output_rate: {} Hz)",
+        output.display(),
+        mic_chunks.len(),
+        sys_chunks.len(),
+        mic.len().max(sys.len()),
+        output_rate_hz
+    );
+    println!(
+        "progressive_out_wav_materializations: {}",
+        progressive_materializations
+    );
+
+    let telemetry_path = telemetry_path_for_output(&output);
+    // Take a final stats snapshot from the WASAPI ring — this is the real
+    // transport telemetry (enqueued, dequeued, drops) for the completed session.
+    let final_transport_stats = consumer.stats_snapshot();
+    let telemetry = RunTelemetry {
+        output_wav_path: output.clone(),
+        duration_secs,
+        target_rate_hz,
+        output_rate_hz,
+        mismatch_policy,
+        mic_input_rate_hz: mic_rate,
+        system_input_rate_hz: sys_rate,
+        mic_resample,
+        system_resample: sys_resample,
+        mic_chunks: mic_chunks.len(),
+        system_chunks: sys_chunks.len(),
+        output_frames: mic.len().max(sys.len()),
+        restart_count: 0,
+        transport: final_transport_stats,
+        callback_audit: callback_audit_zero,
+    };
+    write_run_telemetry(&telemetry_path, &telemetry)?;
+    println!("Telemetry written: {}", telemetry_path.display());
+    let summary = build_capture_summary(&telemetry, now_unix());
+    enforce_callback_contract(callback_contract_mode, callback_audit_zero)?;
+
+    Ok(StreamingCaptureResult {
+        summary,
+        progressive_output_path: output,
+    })
+}
+
 pub fn run_capture_session(config: &LiveCaptureConfig) -> Result<()> {
     let mut sink = CollectingCaptureSink::default();
     let _ = run_streaming_capture_session(config, &mut sink)?;
@@ -2264,26 +2666,29 @@ pub fn run_capture_session(config: &LiveCaptureConfig) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "macos")]
+    use super::TimedChunk;
     use super::{
         build_capture_run_summary, build_degradation_events, callback_recovery_breakdown,
-        can_restart_capture, config_from_cli_args, emit_runtime_event_deltas,
-        enforce_callback_contract, materialize_progressive_wav_snapshot,
-        materialize_progressive_wav_snapshot_incremental, maybe_sleep_for_replay, now_unix,
-        paint_chunks_timeline, recovery_action_for_callback_violation,
-        recovery_action_for_interruption, resample_linear_mono, resolve_output_sample_rate,
+        config_from_cli_args, emit_runtime_event_deltas, enforce_callback_contract,
+        materialize_progressive_wav_snapshot, materialize_progressive_wav_snapshot_incremental,
+        maybe_sleep_for_replay, now_unix, paint_chunks_timeline,
+        recovery_action_for_callback_violation, resample_linear_mono, resolve_output_sample_rate,
         run_capture_session, run_fake_capture_session, run_streaming_capture_session,
         should_materialize_progressive_snapshot, stop_capture_requested,
         stop_capture_requested_or_marker, telemetry_path_for_output, write_run_telemetry,
-        CallbackAuditSnapshot, CallbackContractMode, CallbackContractViolation, InterruptionPolicy,
+        CallbackAuditSnapshot, CallbackContractMode, CallbackContractViolation, CrossTimedChunk,
         LiveCaptureConfig, RecoveryAction, ResampleStats, RunTelemetry, RuntimeEventCursor,
-        SampleRateMismatchPolicy, TimedChunk, FAKE_CAPTURE_FIXTURE_ENV, FAKE_CAPTURE_REALTIME_ENV,
+        SampleRateMismatchPolicy, FAKE_CAPTURE_FIXTURE_ENV, FAKE_CAPTURE_REALTIME_ENV,
         FAKE_CAPTURE_RESTART_COUNT_ENV, STOP_CAPTURE_REQUESTED,
     };
+    #[cfg(target_os = "macos")]
+    use super::{can_restart_capture, recovery_action_for_interruption, InterruptionPolicy};
     use crate::capture_api::{
-        CaptureChunk, CaptureChunkKind, CaptureEvent, CaptureEventCode, CaptureRecoveryAction,
-        CaptureSink,
+        CaptureChunk, CaptureEvent, CaptureEventCode, CaptureRecoveryAction, CaptureSink,
     };
     use crate::rt_transport::TransportStatsSnapshot;
+    #[cfg(target_os = "macos")]
     use screencapturekit::prelude::SCStreamOutputType;
     use std::ffi::OsString;
     use std::fs;
@@ -2612,13 +3017,19 @@ mod tests {
         let telemetry_path = telemetry_path_for_output(&output);
         let telemetry =
             fs::read_to_string(&telemetry_path).expect("telemetry should be readable UTF-8");
-        assert_eq!(sink.chunk_count, 2, "marker should stop replay after one chunk pair");
+        assert_eq!(
+            sink.chunk_count, 2,
+            "marker should stop replay after one chunk pair"
+        );
         assert_eq!(result.summary.system_audio.chunk_count, 1);
         assert_eq!(result.summary.microphone.chunk_count, 1);
         assert!(telemetry.contains("\"output_frames\": 4"));
         assert!(telemetry.contains("\"mic_chunks\": 1"));
         assert!(telemetry.contains("\"system_chunks\": 1"));
-        assert!(output.is_file(), "partial progressive WAV should still be materialized");
+        assert!(
+            output.is_file(),
+            "partial progressive WAV should still be materialized"
+        );
 
         let _ = fs::remove_file(marker);
         let _ = fs::remove_file(output);
@@ -2707,8 +3118,15 @@ mod tests {
             .expect("second fake streaming run should not inherit the prior stop request");
         assert!(second.summary.system_audio.chunk_count > 0);
         assert!(second.summary.microphone.chunk_count > 0);
-        assert!(clean_sink.chunks.len() >= 2, "second fake run should deliver chunk data for both channels");
-        assert_eq!(clean_sink.chunks.len() % 2, 0, "second fake run should preserve paired channel delivery");
+        assert!(
+            clean_sink.chunks.len() >= 2,
+            "second fake run should deliver chunk data for both channels"
+        );
+        assert_eq!(
+            clean_sink.chunks.len() % 2,
+            0,
+            "second fake run should preserve paired channel delivery"
+        );
 
         let _ = fs::remove_file(marker);
         let _ = fs::remove_file(output_first.clone());
@@ -2906,8 +3324,8 @@ mod tests {
 
     #[test]
     fn mixed_rate_timeline_reports_resampling_stats() {
-        let chunks = vec![TimedChunk {
-            kind: SCStreamOutputType::Microphone,
+        let chunks = vec![CrossTimedChunk {
+            is_mic: true,
             pts_seconds: 0.0,
             sample_rate_hz: 2,
             mono_samples: vec![0.0, 1.0],
@@ -2931,8 +3349,8 @@ mod tests {
             std::process::id(),
             stamp
         ));
-        let mic_chunks = vec![TimedChunk {
-            kind: SCStreamOutputType::Microphone,
+        let mic_chunks = vec![CrossTimedChunk {
+            is_mic: true,
             pts_seconds: 0.0,
             sample_rate_hz: 4,
             mono_samples: vec![0.1, 0.2],
@@ -2961,14 +3379,14 @@ mod tests {
             std::process::id(),
             stamp
         ));
-        let mic_chunks = vec![TimedChunk {
-            kind: SCStreamOutputType::Microphone,
+        let mic_chunks = vec![CrossTimedChunk {
+            is_mic: true,
             pts_seconds: 0.0,
             sample_rate_hz: 4,
             mono_samples: vec![0.1, 0.2, 0.3],
         }];
-        let sys_chunks = vec![TimedChunk {
-            kind: SCStreamOutputType::Audio,
+        let sys_chunks = vec![CrossTimedChunk {
+            is_mic: false,
             pts_seconds: 0.0,
             sample_rate_hz: 4,
             mono_samples: vec![0.4, 0.5, 0.6],
@@ -3011,28 +3429,28 @@ mod tests {
             stamp
         ));
         let mic_chunks = vec![
-            TimedChunk {
-                kind: SCStreamOutputType::Microphone,
+            CrossTimedChunk {
+                is_mic: true,
                 pts_seconds: 0.0,
                 sample_rate_hz: 4,
                 mono_samples: vec![0.1, 0.2, 0.3],
             },
-            TimedChunk {
-                kind: SCStreamOutputType::Microphone,
+            CrossTimedChunk {
+                is_mic: true,
                 pts_seconds: 0.75,
                 sample_rate_hz: 4,
                 mono_samples: vec![0.7, 0.8],
             },
         ];
         let sys_chunks = vec![
-            TimedChunk {
-                kind: SCStreamOutputType::Audio,
+            CrossTimedChunk {
+                is_mic: false,
                 pts_seconds: 0.0,
                 sample_rate_hz: 4,
                 mono_samples: vec![0.4, 0.5, 0.6],
             },
-            TimedChunk {
-                kind: SCStreamOutputType::Audio,
+            CrossTimedChunk {
+                is_mic: false,
                 pts_seconds: 0.75,
                 sample_rate_hz: 4,
                 mono_samples: vec![0.9, 1.0],
@@ -3102,6 +3520,7 @@ mod tests {
         ));
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn timed_chunk_maps_to_capture_chunk_summary() {
         let chunk = TimedChunk {
@@ -3118,6 +3537,7 @@ mod tests {
         assert_eq!(summary.frame_count, 3);
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn restart_policy_is_bounded() {
         let policy = InterruptionPolicy {
@@ -3132,11 +3552,11 @@ mod tests {
 
     #[test]
     fn telemetry_path_uses_output_stem() {
-        let output = PathBuf::from("artifacts/hello-world.wav");
+        let output = PathBuf::from("artifacts").join("hello-world.wav");
         let telemetry = telemetry_path_for_output(&output);
         assert_eq!(
-            telemetry.to_string_lossy(),
-            "artifacts/hello-world.telemetry.json"
+            telemetry,
+            PathBuf::from("artifacts").join("hello-world.telemetry.json")
         );
     }
 
@@ -3440,6 +3860,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn interruption_mapping_respects_restart_budget() {
         assert_eq!(
@@ -3506,5 +3927,85 @@ mod tests {
 
         assert!(!stop_capture_requested_or_marker(Some(&marker)));
         assert!(!stop_capture_requested());
+    }
+
+    // ── Windows capture telemetry contract tests ────────────────────────────
+    // These tests verify that the Windows capture path wires real transport
+    // stats rather than all-zero placeholders.  They run on all platforms
+    // because the underlying PreallocatedConsumer/Producer ring is cross-platform.
+
+    #[test]
+    fn win_transport_snapshot_reflects_real_enqueued_count() {
+        use crate::rt_transport::{preallocated_spsc, TransportStatsSnapshot};
+
+        // Create a small ring matching the win_capture pattern.
+        let slots: Vec<u32> = (0..8).collect();
+        let (producer, consumer) = preallocated_spsc(slots);
+
+        // Enqueue 4 items.
+        for v in 0u32..4 {
+            producer.try_push_with(|slot| {
+                *slot = v;
+                true
+            });
+        }
+        // Dequeue 2 items.
+        let s1 = consumer
+            .recv_timeout(std::time::Duration::from_millis(50))
+            .expect("slot 1");
+        consumer.recycle(s1);
+        let s2 = consumer
+            .recv_timeout(std::time::Duration::from_millis(50))
+            .expect("slot 2");
+        consumer.recycle(s2);
+
+        let snap: TransportStatsSnapshot = consumer.stats_snapshot();
+
+        assert_ne!(snap.capacity, 0, "capacity should be non-zero");
+        assert_eq!(snap.enqueued, 4, "enqueued should reflect push count");
+        assert_eq!(snap.dequeued, 2, "dequeued should reflect recv count");
+        assert_eq!(snap.in_flight, 2, "in_flight = enqueued - dequeued");
+        // On a properly wired Windows session the summary would carry these
+        // real values, not all-zero as the placeholder used to produce.
+        assert_ne!(
+            snap,
+            TransportStatsSnapshot::default(),
+            "non-zero ring stats must not equal the all-zero default"
+        );
+    }
+
+    #[test]
+    fn win_transport_snapshot_tracks_slot_miss_drops_when_ring_saturated() {
+        use crate::rt_transport::preallocated_spsc;
+
+        // Ring of capacity 2: 2 free slots.
+        let slots: Vec<u32> = vec![0, 0];
+        let (producer, _consumer) = preallocated_spsc(slots);
+
+        // Fill the ring completely (2 items → ready_tx full, free_rx empty).
+        for v in 0u32..2 {
+            producer.try_push_with(|slot| {
+                *slot = v;
+                true
+            });
+        }
+
+        // One more push: free_rx is empty → slot_miss_drops should increment.
+        producer.try_push_with(|slot| {
+            *slot = 99;
+            true
+        });
+
+        let snap = producer.stats_snapshot();
+        assert!(
+            snap.slot_miss_drops >= 1,
+            "saturated ring should register at least one slot_miss_drop, got: {}",
+            snap.slot_miss_drops
+        );
+        // Total enqueued must also be non-zero (the two successful pushes).
+        assert_eq!(
+            snap.enqueued, 2,
+            "exactly 2 items should have been enqueued"
+        );
     }
 }

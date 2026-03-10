@@ -33,8 +33,7 @@ pub(super) fn run_standard_pipeline(config: &TranscribeConfig) -> Result<LiveRun
     }
 
     let generated_at_utc = runtime_timestamp_utc();
-    let stamp = command_stdout("date", &["-u", "+%Y%m%dT%H%M%SZ"])
-        .unwrap_or_else(|_| "unknown".to_string());
+    let stamp = preflight::utc_compact_stamp();
     let backend_id = backend_id_for_asr_backend(config.asr_backend);
     let channel_plan = prepare_channel_inputs(config, &stamp)?;
     let refresh_channel_inputs_per_run =
