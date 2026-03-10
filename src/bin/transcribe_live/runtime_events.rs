@@ -1,5 +1,199 @@
 use super::*;
 
+/// Minimum character length for a stable-partial promotion.
+/// Setting this too low (e.g. 6) creates choppy, ultra-short transcript lines
+/// in the live GUI.  A higher threshold batches more text before committing,
+/// producing more natural reading-length chunks.  15 chars is roughly 2-3
+/// words — fast enough for realtime feedback without fragmentation.
+const STABLE_PARTIAL_MIN_CHARS: usize = 15;
+const STABLE_PARTIAL_MIN_OBSERVATIONS: usize = 2;
+const STABLE_PARTIAL_STABILITY_WINDOW_MS: u64 = 500;
+
+#[derive(Debug, Clone, Default)]
+struct StablePartialState {
+    promoted_prefix: String,
+    last_partial_text: String,
+    last_partial_end_ms: Option<u64>,
+}
+
+#[derive(Debug, Default)]
+pub(super) struct LiveTranscriptDisplayReducer {
+    state_by_segment: HashMap<(String, String), StablePartialState>,
+}
+
+fn stable_partial_key(event: &TranscriptEvent) -> (String, String) {
+    let lineage = event
+        .source_final_segment_id
+        .clone()
+        .unwrap_or_else(|| event.segment_id.clone());
+    (event.channel.clone(), lineage)
+}
+
+fn trim_to_word_boundary(text: &str) -> String {
+    let trimmed = text.trim_end();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    if trimmed
+        .chars()
+        .last()
+        .is_some_and(|ch| ch.is_whitespace() || matches!(ch, '.' | ',' | '!' | '?' | ';' | ':'))
+    {
+        return trimmed.to_string();
+    }
+    let mut boundary = 0usize;
+    for (idx, ch) in trimmed.char_indices() {
+        if ch.is_whitespace() || matches!(ch, '.' | ',' | '!' | '?' | ';' | ':') {
+            boundary = idx + ch.len_utf8();
+        }
+    }
+    trimmed[..boundary].trim_end().to_string()
+}
+
+fn longest_common_prefix(a: &str, b: &str) -> String {
+    let mut prefix_end = 0usize;
+    for ((a_idx, a_ch), (_, b_ch)) in a.char_indices().zip(b.char_indices()) {
+        if a_ch != b_ch {
+            break;
+        }
+        prefix_end = a_idx + a_ch.len_utf8();
+    }
+    a[..prefix_end].to_string()
+}
+
+fn trim_promoted_prefix(text: &str, promoted_prefix: &str) -> String {
+    if promoted_prefix.is_empty() {
+        return text.trim().to_string();
+    }
+    let trimmed_text = text.trim();
+    let trimmed_prefix = promoted_prefix.trim();
+    if let Some(stripped) = trimmed_text.strip_prefix(trimmed_prefix) {
+        return stripped.trim_start().to_string();
+    }
+    trimmed_text.to_string()
+}
+
+fn stable_prefix_candidate(state: &StablePartialState, current_text: &str) -> String {
+    let common_prefix = trim_to_word_boundary(&longest_common_prefix(
+        &state.last_partial_text,
+        current_text,
+    ));
+    if common_prefix.len() <= state.promoted_prefix.len() {
+        return String::new();
+    }
+    let previous_word_boundary = trim_to_word_boundary(&state.last_partial_text);
+    if previous_word_boundary.len() > state.promoted_prefix.len()
+        && current_text.starts_with(&previous_word_boundary)
+    {
+        return previous_word_boundary;
+    }
+    common_prefix
+}
+
+fn push_stable_partial_delta(
+    output: &mut Vec<TranscriptEvent>,
+    event: &TranscriptEvent,
+    state: &mut StablePartialState,
+    promoted_prefix: &str,
+) {
+    if promoted_prefix.len() <= state.promoted_prefix.len() {
+        return;
+    }
+    let delta = promoted_prefix[state.promoted_prefix.len()..].trim();
+    if delta.is_empty() {
+        state.promoted_prefix = promoted_prefix.to_string();
+        return;
+    }
+    output.push(TranscriptEvent {
+        event_type: "stable_partial",
+        channel: event.channel.clone(),
+        segment_id: event.segment_id.clone(),
+        start_ms: event.start_ms,
+        end_ms: event.end_ms,
+        text: delta.to_string(),
+        source_final_segment_id: event.source_final_segment_id.clone(),
+    });
+    state.promoted_prefix = promoted_prefix.to_string();
+}
+
+fn reduce_partial_event(
+    output: &mut Vec<TranscriptEvent>,
+    state: &mut StablePartialState,
+    event: TranscriptEvent,
+) {
+    let current_text = event.text.trim().to_string();
+    if current_text.is_empty() {
+        return;
+    }
+    if state.last_partial_text.is_empty() {
+        state.last_partial_text = current_text.clone();
+        state.last_partial_end_ms = Some(event.end_ms);
+        output.push(TranscriptEvent {
+            text: trim_promoted_prefix(&current_text, &state.promoted_prefix),
+            ..event
+        });
+        return;
+    }
+
+    let stable_prefix = stable_prefix_candidate(state, &current_text);
+    let stable_duration_ms = state
+        .last_partial_end_ms
+        .map(|last_end_ms| event.end_ms.saturating_sub(last_end_ms))
+        .unwrap_or(0);
+    if stable_prefix.len() >= STABLE_PARTIAL_MIN_CHARS
+        && (STABLE_PARTIAL_MIN_OBSERVATIONS <= 2
+            || stable_duration_ms >= STABLE_PARTIAL_STABILITY_WINDOW_MS)
+    {
+        push_stable_partial_delta(output, &event, state, &stable_prefix);
+    }
+
+    state.last_partial_text = current_text.clone();
+    state.last_partial_end_ms = Some(event.end_ms);
+    let suffix_text = trim_promoted_prefix(&current_text, &state.promoted_prefix);
+    if !suffix_text.is_empty() {
+        output.push(TranscriptEvent {
+            text: suffix_text,
+            ..event
+        });
+    }
+}
+
+fn reduce_stable_event(
+    output: &mut Vec<TranscriptEvent>,
+    state: &mut StablePartialState,
+    event: TranscriptEvent,
+) {
+    let suffix_text = trim_promoted_prefix(&event.text, &state.promoted_prefix);
+    if !suffix_text.is_empty() {
+        output.push(TranscriptEvent {
+            text: suffix_text,
+            ..event
+        });
+    }
+    *state = StablePartialState::default();
+}
+
+impl LiveTranscriptDisplayReducer {
+    pub(super) fn process_event(&mut self, event: TranscriptEvent) -> Vec<TranscriptEvent> {
+        let mut output = Vec::new();
+        match event.event_type {
+            "partial" => {
+                let key = stable_partial_key(&event);
+                let state = self.state_by_segment.entry(key).or_default();
+                reduce_partial_event(&mut output, state, event);
+            }
+            "final" | "reconciled_final" => {
+                let key = stable_partial_key(&event);
+                let state = self.state_by_segment.entry(key.clone()).or_default();
+                reduce_stable_event(&mut output, state, event);
+                self.state_by_segment.remove(&key);
+            }
+            _ => output.push(event),
+        }
+        output
+    }
+}
+
 pub(super) fn runtime_job_class_to_pool_job_class(class: RuntimeAsrJobClass) -> LiveAsrJobClass {
     match class {
         RuntimeAsrJobClass::Partial => LiveAsrJobClass::Partial,
@@ -225,7 +419,13 @@ pub(super) fn fallback_vad_boundaries_from_events(events: &[TranscriptEvent]) ->
 pub(super) fn merge_live_transcript_events_for_display(
     events: Vec<TranscriptEvent>,
 ) -> Vec<TranscriptEvent> {
-    events
+    let mut ordered = merge_transcript_events(events);
+    let mut reducer = LiveTranscriptDisplayReducer::default();
+    let mut output = Vec::new();
+    for event in ordered.drain(..) {
+        output.extend(reducer.process_event(event));
+    }
+    output
 }
 
 pub(super) fn live_stream_chunk_queue_telemetry(
@@ -306,5 +506,177 @@ pub(super) fn active_channel_mode_from_transcripts(
         ChannelMode::Separate
     } else {
         ChannelMode::Mixed
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn event(
+        event_type: &'static str,
+        segment_id: &str,
+        end_ms: u64,
+        text: &str,
+    ) -> TranscriptEvent {
+        TranscriptEvent {
+            event_type,
+            channel: "system".to_string(),
+            segment_id: segment_id.to_string(),
+            start_ms: 0,
+            end_ms,
+            text: text.to_string(),
+            source_final_segment_id: None,
+        }
+    }
+
+    #[test]
+    fn stable_partial_promotes_prefix_and_final_emits_only_suffix() {
+        let merged = merge_live_transcript_events_for_display(vec![
+            event(
+                "partial",
+                "seg-1",
+                1000,
+                "how we handled the project schedule for the quarter",
+            ),
+            event(
+                "partial",
+                "seg-1",
+                1300,
+                "how we handled the project schedule for the quarter tasks",
+            ),
+            event(
+                "partial",
+                "seg-1",
+                1600,
+                "how we handled the project schedule for the quarter tasks today",
+            ),
+            event(
+                "final",
+                "seg-1",
+                2200,
+                "how we handled the project schedule for the quarter tasks today",
+            ),
+        ]);
+
+        let rendered = merged
+            .iter()
+            .map(|evt| (evt.event_type, evt.text.as_str()))
+            .collect::<Vec<_>>();
+
+        assert!(rendered.iter().any(|(kind, text)| {
+            *kind == "stable_partial" && text.starts_with("how we handled")
+        }));
+        assert!(rendered
+            .iter()
+            .any(|(kind, text)| { *kind == "partial" && text.contains("tasks") }));
+        assert!(rendered
+            .iter()
+            .any(|(kind, text)| { *kind == "final" && text.contains("tasks") }));
+        assert!(!rendered.contains(&(
+            "final",
+            "how we handled the project schedule for the quarter tasks today"
+        )));
+    }
+
+    #[test]
+    fn stable_partial_never_commits_mid_word_prefix() {
+        let merged = merge_live_transcript_events_for_display(vec![
+            event(
+                "partial",
+                "seg-1",
+                1000,
+                "architectural visualization of the design concept under review",
+            ),
+            event(
+                "partial",
+                "seg-1",
+                1300,
+                "architectural visualization of the design concepts under review",
+            ),
+        ]);
+
+        // The common prefix "architectural visualization of the design concept" is long enough
+        // but "concept" vs "concepts" means the word-boundary trim should NOT commit "concept"
+        // partially (the word boundary would be "architectural visualization of the design ").
+        assert!(!merged
+            .iter()
+            .any(|evt| { evt.event_type == "stable_partial" && evt.text.contains("concept") }));
+    }
+
+    #[test]
+    fn stable_partial_state_is_isolated_per_segment() {
+        let merged = merge_live_transcript_events_for_display(vec![
+            event(
+                "partial",
+                "seg-a",
+                1000,
+                "hello there world this is a much longer partial for segment a",
+            ),
+            event(
+                "partial",
+                "seg-b",
+                1050,
+                "different stream entirely with a completely separate text body",
+            ),
+            event(
+                "partial",
+                "seg-a",
+                1300,
+                "hello there world this is a much longer partial for segment a again",
+            ),
+            event(
+                "final",
+                "seg-b",
+                1800,
+                "different stream entirely with a completely separate text body",
+            ),
+        ]);
+
+        assert!(merged.iter().any(|evt| {
+            evt.event_type == "stable_partial"
+                && evt.segment_id == "seg-a"
+                && evt.text.starts_with("hello there")
+        }));
+        assert!(merged.iter().any(|evt| {
+            evt.event_type == "final"
+                && evt.segment_id == "seg-b"
+                && evt.text.contains("different stream")
+        }));
+    }
+
+    #[test]
+    fn display_reducer_supports_incremental_live_path() {
+        let mut reducer = LiveTranscriptDisplayReducer::default();
+        let first = reducer.process_event(event(
+            "partial",
+            "seg-live",
+            1000,
+            "how we handled the project schedule for the quarter",
+        ));
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].event_type, "partial");
+
+        let second = reducer.process_event(event(
+            "partial",
+            "seg-live",
+            1300,
+            "how we handled the project schedule for the quarter tasks",
+        ));
+        assert_eq!(second.len(), 2);
+        assert_eq!(second[0].event_type, "stable_partial");
+        assert!(second[0].text.starts_with("how we handled"));
+        assert_eq!(second[1].event_type, "partial");
+        assert!(second[1].text.contains("tasks"));
+
+        let final_events = reducer.process_event(event(
+            "final",
+            "seg-live",
+            2000,
+            "how we handled the project schedule for the quarter tasks",
+        ));
+        assert_eq!(final_events.len(), 1);
+        assert_eq!(final_events[0].event_type, "final");
+        assert!(final_events[0].text.contains("tasks"));
     }
 }
